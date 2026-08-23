@@ -33,6 +33,30 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
     exe.root_module.link_libc = true;
 
+    // fx-grep: same dhall + libdatalog linkage, separate binary.
+    const grep = b.addExecutable(.{
+        .name = "fx-grep",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fx-grep.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "dhall", .module = dhall_mod },
+            },
+        }),
+    });
+    grep.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
+    grep.root_module.linkSystemLibrary("datalog", .{});
+    grep.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+    grep.root_module.link_libc = true;
+    b.installArtifact(grep);
+
+    const grep_run_step = b.step("run-grep", "Run fx-grep");
+    const grep_run_cmd = b.addRunArtifact(grep);
+    grep_run_step.dependOn(&grep_run_cmd.step);
+    grep_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| grep_run_cmd.addArgs(args);
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run fx-find");
@@ -41,11 +65,14 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    // Tests
+    // Tests (fx-find + fx-grep + dhall core)
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const grep_tests = b.addTest(.{ .root_module = grep.root_module });
+    const run_grep_tests = b.addRunArtifact(grep_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_grep_tests.step);
 
     // Also run the dhall-c core's own src test blocks (ast shift/subst/alpha_eq,
     // bignum, arena, sha256, ssrf) plus the nullary-union regression suite.
