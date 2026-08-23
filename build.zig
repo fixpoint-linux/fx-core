@@ -14,18 +14,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Shared FS-journal core (owned by fx record/history/diff).  It @cImports
-    // dl.h, so it needs the datalog include path and libc; the datalog C-FFI
-    // symbols come from libdatalog.so, linked at each consumer exe / test.
-    const journal_mod = b.createModule(.{
-        .root_source_file = b.path("src/fx-journal.zig"),
+    // fx-pipeline: pure Lens 3 type-checker (no engine, no I/O).  Imports only
+    // the dhall module for structural type equality (ast.alpha_eq).
+    const pipeline_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-pipeline.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+        },
     });
-    journal_mod.addIncludePath(b.path("../datalog-dafsa/src"));
-    journal_mod.linkSystemLibrary("datalog", .{});
-    journal_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
 
     const exe = b.addExecutable(.{
         .name = "fx-find",
@@ -78,48 +77,8 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    // fx-record / fx-history / fx-diff: journal commands, each imports the
-    // shared journal module (which carries the datalog C-FFI linkage).
-    const record = b.addExecutable(.{
-        .name = "fx-record",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/fx-record.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "fx-journal", .module = journal_mod },
-            },
-        }),
-    });
-    record.root_module.link_libc = true;
-    b.installArtifact(record);
-    const record_run_step = b.step("run-record", "Run fx-record");
-    const record_run_cmd = b.addRunArtifact(record);
-    record_run_step.dependOn(&record_run_cmd.step);
-    record_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| record_run_cmd.addArgs(args);
-
-    const history = b.addExecutable(.{
-        .name = "fx-history",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/fx-history.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "fx-journal", .module = journal_mod },
-            },
-        }),
-    });
-    history.root_module.link_libc = true;
-    b.installArtifact(history);
-    const history_run_step = b.step("run-history", "Run fx-history");
-    const history_run_cmd = b.addRunArtifact(history);
-    history_run_step.dependOn(&history_run_cmd.step);
-    history_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| history_run_cmd.addArgs(args);
-
+    // fx-diff: standalone Dhall-typed diff coreutil.  Pure libc file I/O + the
+    // dhall module for typed args — no datalog / journal linkage.
     const diff = b.addExecutable(.{
         .name = "fx-diff",
         .root_module = b.createModule(.{
@@ -128,7 +87,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "fx-journal", .module = journal_mod },
             },
         }),
     });
@@ -140,28 +98,27 @@ pub fn build(b: *std.Build) void {
     diff_run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| diff_run_cmd.addArgs(args);
 
-    // Tests (fx-find + fx-grep + journal commands + journal core + dhall core)
+    // Tests (fx-find + fx-grep + fx-diff + pipeline + dhall core)
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const grep_tests = b.addTest(.{ .root_module = grep.root_module });
     const run_grep_tests = b.addRunArtifact(grep_tests);
-    const record_tests = b.addTest(.{ .root_module = record.root_module });
-    const run_record_tests = b.addRunArtifact(record_tests);
-    const history_tests = b.addTest(.{ .root_module = history.root_module });
-    const run_history_tests = b.addRunArtifact(history_tests);
     const diff_tests = b.addTest(.{ .root_module = diff.root_module });
     const run_diff_tests = b.addRunArtifact(diff_tests);
-    // The journal core's own pure-logic test blocks.
-    const journal_tests = b.addTest(.{ .root_module = journal_mod });
-    const run_journal_tests = b.addRunArtifact(journal_tests);
+    // The Lens 3 pipeline type-checker's pure-logic test blocks.
+    const pipeline_tests = b.addTest(.{ .root_module = pipeline_mod });
+    const run_pipeline_tests = b.addRunArtifact(pipeline_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_grep_tests.step);
-    test_step.dependOn(&run_record_tests.step);
-    test_step.dependOn(&run_history_tests.step);
     test_step.dependOn(&run_diff_tests.step);
-    test_step.dependOn(&run_journal_tests.step);
+    test_step.dependOn(&run_pipeline_tests.step);
+
+    // Fast feedback loop for JUST the Lens 3 pipeline type-checker (avoids the
+    // hour-long datalog-dafsa test run).  `zig build run-pipeline-test`.
+    const pipeline_test_step = b.step("run-pipeline-test", "Run fx-pipeline type-checker tests only");
+    pipeline_test_step.dependOn(&run_pipeline_tests.step);
 
     // Also run the dhall-c core's own src test blocks (ast shift/subst/alpha_eq,
     // bignum, arena, sha256, ssrf) plus the nullary-union regression suite.

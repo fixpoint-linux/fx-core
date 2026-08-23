@@ -64,9 +64,22 @@ conflated**:
   roll-forward rollback, `dl_cas_revision`). `rm` / `cp` / `mv` / `touch` /
   `mkdir` / `ln` and `history` / `diff` do **not** ride this — they are coreutils
   and operate on the FS layer below.
-- **The per-tree FS journal** — what `fx history` / `fx diff` (coreutils) run on.
+- **The per-tree FS journal** — what `fx history` (coreutil, **removed**) ran
+  on. The journal/record/history code has been **deleted from the codebase** and
+  is **deprioritized "for now"** (2026-08-23 pivot): this design is kept
+  conceptually below, but is **not implemented**. `fx diff` no longer rides the
+  journal — it is now a plain Dhall-typed diff coreutil (see build-order item 3).
 
-### The per-tree FS journal: the journal *is* the fact stream
+> **Implementation status (2026-08-23):** `fx-journal.zig`, `fx-record.zig`, and
+> `fx-history.zig` have been **removed**. `fx diff` was rewritten as a standalone
+> typed diff coreutil with **no datalog/journal dependency**: two files → a
+> line-level unified diff (Myers O(ND) edit script → `@@` hunks with 3-line
+> context); two directories → a recursive, sorted path-level listing
+> (`+path` added / `-path` removed / `!path` changed by sha256 content hash).
+> The journal *design* below remains the conceptual narrative for what a future
+> timeline could be; it is no longer the shipped behavior.
+
+### The per-tree FS journal: the journal *is* the fact stream (design — not implemented)
 
 Each tree you opt into gets its own datalog-dafsa db (a `.fx` journal file —
 git-like: per-tree, small blast radius, per-tree retention). Mutations append a
@@ -85,10 +98,11 @@ a relation stream: every point in a tree's life is reconstructible by replaying
 up to it.
 
 - `fx history` = query the journal: `op` rows, filterable by `path`/`target`/
-  `cmd`/`ts`. "Did rm readme.md" → `op where cmd=rm`.
+  `cmd`/`ts`. "Did rm readme.md" → `op where cmd=rm`. *(design only — not built)*
 - `fx diff --to A --to B` = replay deltas to reconstruct `file(path, hash, size)`
   at A and B, then diff the two reconstructed sorted sets (linear merge). No
-  snapshots involved.
+  snapshots involved. *(this journal-based `fx diff` is design only — the shipped
+  `fx diff` is the plain typed coreutil in build-order item 3, not a journal query)*
 
 **Why this is clean:** no coupling to system state (a tree's history is only its
 own mutations, never "gen 7 activated visage"); no `dl_publish_snapshot`
@@ -165,6 +179,58 @@ whole command-and-pipeline model.
   output is a no-op. Every mutation lands as an idempotent "re-assert this
   relation," which composes with roll-forward rollback.
 
+### fx-compose — concrete design (what it actually is)
+
+**A pipeline is a typed derivation.** The unit of composition is the *pipeline
+value*: a materialized artifact carrying a Dhall type. There are four shapes:
+
+    Value = bytes                          raw byte stream (the honest-cut stream)
+          | lines                          newline-delimited text stream
+          | rows { <field> : <T>, ... }    a stream of typed records
+          | single <T>                     one typed value (a count, a diff, a file)
+
+**Every command declares an input→output signature.** This is the key new thing
+beyond today's single-Dhall-record args — today each command takes one record and
+produces text; fx-compose makes that a *typed function* between pipeline values:
+
+    fx find { path, name, type } : single { path : Text } -> rows { path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }
+    fx grep { pattern }          : rows { path : Text }   -> lines
+    fx ls  { path, long }        : single { path : Text } -> rows { name : Text, size : Natural, mode : Natural }
+
+**Composition is type-checked, then content-addressed.** `a |> b` is well-formed
+iff `out(a)` structurally equals `in(b)` (Dhall type equality). Running a pipeline
+materializes *every* intermediate to a content-addressed store
+(`$HOME/.local/state/fx/cas/<sha256-of-bytes>`), so a pipeline expression has a
+canonical, replayable form — each stage referenced by its `sha256:` integrity.
+
+**Determinism as proof, not hope.** Replaying a pipeline re-runs each stage and
+compares the produced intermediate against the recorded sha256. A divergence is a
+*caught non-deterministic command* (or a CAS hash collision — astronomically
+unlikely) surfaced loudly. This is the time-travel that is *not* git: you don't
+restore bytes, you **re-derive a known-good intermediate and trust the hash**.
+
+**Idempotence is the fixed-point guarantee.** The etymology lens: a fixed point
+satisfies f(x)=x. fx-compose marks mutation commands as idempotent when their semantics
+are "re-assert this relation" (`mkdir -p`, `rm`-on-missing, `cp`-same-content), and
+then *proves* convergence: `f(f(x)) == f(x)` by construction. Running a pipeline on
+its own output is a no-op; this is what composes with the journal's roll-forward.
+
+**Implementation order (smallest → thesis-defining):**
+
+1. **Pipeline value + type-checker** (pure Dhall, no engine, no I/O): the four
+   shapes, command signatures as a registry, and `compose(a,b)` → Ok / type-error.
+   Smallest demonstrable win: `fx find {..} |> fx grep {..}` accepted, and a
+   mismatched composition (e.g. `fx ls |> fx find`) rejected with a typed error.
+   This is a natural fit for the existing dhall-c zig module — reuse it, don't
+   reinvent.
+2. **Content-addressed evaluation**: run the chain, materialize each intermediate
+   into the CAS, emit the canonical `sha256:`-integrity pipeline expression.
+   Reuses the journal's `sha256Hex` and the same db/state-dir conventions.
+3. **Replay / determinism gate**: re-run + compare per-stage hashes; report the
+   exact stage that diverged. Time-travel without a VCS.
+4. **Idempotence annotations + convergence proof** on the mutation commands, then
+   roll-forward rollback ties back into the journal (Lens 2).
+
 ---
 
 ## Honest cut — where NOT to do this
@@ -214,10 +280,12 @@ Design sketch (to implement later):
    Zig 0.16.0, linking `libdatalog.so` via C-FFI).**
 2. **`fx grep` / `fx log`** — DAFSA regex-WALK; reuses the planned M4 log-DB
    primitive.
-3. **`fx history` / `fx diff`** — pure reuse of existing snapshot time-travel
-   API, zero engine work (like the M5 timeline); rides the timeline-vs-journal
-   split.
+3. **`fx diff`** — Dhall-typed diff coreutil: two files → line-level unified
+   hunks; two directories → recursive `+`/`-`/`!` listing by content hash.
+   **SHIPPING.** (The `fx history` / journal timeline is **REMOVED** — the
+   design below is kept conceptually, but the journal/record/history code has
+   been deleted and is deprioritized "for now".)
 4. **Provenance `what` / `why`** — design written up (above); implements once
    store-closure resolution from Zig lands.
-5. **Typed command composition / `fxsh`** — the real differentiator (Lens 3),
+5. **Typed command composition / `fx-compose`** — the real differentiator (Lens 3),
    biggest scope, do last.
