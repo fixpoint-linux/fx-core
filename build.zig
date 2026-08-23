@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../dhall-c/zig/src/dhall_mod.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const exe = b.addExecutable(.{
@@ -45,4 +46,11 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    // Also run the dhall-c core's own src test blocks (ast shift/subst/alpha_eq,
+    // bignum, arena, sha256, ssrf). Dependency-module tests do not run
+    // automatically under `zig build test`, so add an explicit step.
+    const dhall_tests = b.addTest(.{ .root_module = dhall_mod });
+    const run_dhall_tests = b.addRunArtifact(dhall_tests);
+    test_step.dependOn(&run_dhall_tests.step);
 }

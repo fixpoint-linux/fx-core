@@ -43,10 +43,12 @@ const Allocator = std.mem.Allocator;
 // CLI option model
 // ---------------------------------------------------------------------------
 
+const TypeFilter = enum { f, d }; // -type f|d, and Dhall `< f | d >` union tag
+
 const Options = struct {
     root: []const u8 = ".",
     name_glob: ?[]const u8 = null, // basename glob (* and ?), applied on output
-    type_filter: ?enum { f, d } = null, // -type f|d
+    type_filter: ?TypeFilter = null, // -type f|d
     maxdepth: ?usize = null, // depth limit (0 = only the root)
 };
 
@@ -119,6 +121,49 @@ test "evalDhallArgs record" {
     try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
 }
 
+test "evalDhallArgs type union field" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ root = \".\", type = < f : Text | d : Text >.f \"f\" }", std.testing.allocator);
+    defer std.testing.allocator.free(o.root);
+    try std.testing.expectEqual(@as(?TypeFilter, .f), o.type_filter);
+}
+
+test "evalDhallArgs type union field dir" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ root = \".\", type = < f : Text | d : Text >.d \"d\" }", std.testing.allocator);
+    defer std.testing.allocator.free(o.root);
+    try std.testing.expectEqual(@as(?TypeFilter, .d), o.type_filter);
+}
+
+test "evalDhallArgs type union wrong payload rejected" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    try std.testing.expectError(error.DhallType, evalDhallArgs("{ type = < f : Text | d : Text >.f 1 }", std.testing.allocator));
+}
+
+test "evalDhallArgs type union unknown alt rejected" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    try std.testing.expectError(error.DhallType, evalDhallArgs("{ type = < f : Text | d : Text >.x \"y\" }", std.testing.allocator));
+}
+
+test "jsonParseOpts type field f" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type\":{\"f\":\"f\"}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .f), o.type);
+}
+
+test "jsonParseOpts type field d" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type\":{\"d\":\"d\"}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .d), o.type);
+}
+
+test "jsonParseOpts type field unknown alt rejected" {
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(jsonParseOpts("{\"type\":{\"x\":\"x\"}}", &buf) == null);
+}
+
 // ---------------------------------------------------------------------------
 // Dhall arg evaluation -> Options
 // ---------------------------------------------------------------------------
@@ -127,9 +172,11 @@ test "evalDhallArgs record" {
 // from the JSON produced by dhall serialize.term_to_json for our record.
 // We only need root:Text, name:Optional Text, maxdepth:Optional Natural.
 const JsonOpts = struct {
+    const TypeTag = enum { f, d };
     root: ?[]const u8 = null,
     name: ?[]const u8 = null,
     maxdepth: ?usize = null,
+    type: ?TypeTag = null,
 };
 
 fn jsonSkipWs(s: []const u8, i: *usize) void {
@@ -217,6 +264,33 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
             off += val.len;
         } else if (i < s.len and s[i] == 'n' and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4; // None (Optional absent)
+        } else if (std.mem.eql(u8, key, "type") and i < s.len and s[i] == '{') {
+            // Union constructor serializes to a single-key nested object
+            // {"type":{"f":"f"}}. The inner key is the chosen alternative; the
+            // payload (the constructor argument) is discarded — `.f "anything"`
+            // still means file. Nullary constructors give an empty payload {}.
+            i += 1; // consume '{'
+            var tagbuf: [64]u8 = undefined;
+            const tag = jsonParseString(s, &i, &tagbuf) orelse return null;
+            if (!jsonExpect(s, &i, ':')) return null;
+            if (i < s.len and s[i] == '"') {
+                var payload: [64]u8 = undefined;
+                _ = jsonParseString(s, &i, &payload) orelse return null;
+            } else if (i < s.len and s[i] == '{') {
+                // nullary: < File | Dir > serializes payload as {}
+                i += 1;
+                if (!jsonExpect(s, &i, '}')) return null;
+            } else {
+                return null;
+            }
+            if (!jsonExpect(s, &i, '}')) return null;
+            if (std.mem.eql(u8, tag, "f")) {
+                res.type = .f;
+            } else if (std.mem.eql(u8, tag, "d")) {
+                res.type = .d;
+            } else {
+                return null; // unknown alternative -> could not parse fields
+            }
         } else {
             const num = jsonParseNumber(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "maxdepth")) res.maxdepth = num;
@@ -278,6 +352,10 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (opts.root) |r| o.root = try gpa.dupe(u8, r);
     if (opts.name) |n| o.name_glob = try gpa.dupe(u8, n);
     o.maxdepth = opts.maxdepth;
+    if (opts.type) |tt| o.type_filter = switch (tt) {
+        .f => .f,
+        .d => .d,
+    };
     return o;
 }
 
