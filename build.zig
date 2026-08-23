@@ -48,9 +48,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     // Also run the dhall-c core's own src test blocks (ast shift/subst/alpha_eq,
-    // bignum, arena, sha256, ssrf). Dependency-module tests do not run
-    // automatically under `zig build test`, so add an explicit step.
-    const dhall_tests = b.addTest(.{ .root_module = dhall_mod });
-    const run_dhall_tests = b.addRunArtifact(dhall_tests);
-    test_step.dependOn(&run_dhall_tests.step);
+    // bignum, arena, sha256, ssrf) plus the nullary-union regression suite.
+    // Dependency-module tests do not run automatically under `zig build test`,
+    // and a test rooted at the dhall_mod facade runs 0 tests (its re-exports are
+    // `pub const`, not test blocks), so root the explicit step at
+    // union_test.zig — it imports the sibling modules and carries its own tests.
+    const union_test_mod = b.createModule(.{
+        .root_source_file = b.path("../dhall-c/zig/src/union_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const union_tests = b.addTest(.{ .root_module = union_test_mod });
+    const run_union_tests = b.addRunArtifact(union_tests);
+    test_step.dependOn(&run_union_tests.step);
 }
