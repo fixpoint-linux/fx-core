@@ -53,58 +53,93 @@ boundaries, not continuously) becomes a relation that time-travel can as-of quer
 
 ---
 
-## Lens 2 — Mutations become timeline transitions: time travel, not delete
+## Lens 2 — Two distinct timelines: the store's, and the tree's
 
-Uses existing datalog-dafsa machinery (`dl_publish_snapshot`,
-`dl_snapshot_versions`, `dl_query_version`, roll-forward rollback,
-`dl_cas_revision`).
+Time-travel splits cleanly into **two independent timelines that must not be
+conflated**:
 
-- `rm` / `cp` / `mv` / `touch` / `mkdir` / `ln` publish a **new snapshot** rather
-  than destroy bytes: `rm X` = "a state where X is absent from the closure" — the
-  bytes live on in the old snapshot, queryable via as-of `dl_query_version`.
-- `rm -rf` stops being data destruction and becomes "roll forward past the bad
-  state." `history` / `undo` / `redo` fall out of the append-only timeline.
-- `cp` / `diff` are content-addressed: `cp` of a store file = CAS hardlink ref
-  (dedup by construction, like DAFSA path interning); `diff` = join two
-  snapshots' relations. `diff` against *yesterday* = as-of query: "what changed
-  in the last 24h" is a two-snapshot join.
-- Provenance: `what /usr/bin/foo` traces through the store closure to its
-  derivation; `why` is the inverse. The command shows its derivation — the
-  datalog proof tree / build closure. The manifesto made executable.
+- **The store/system timeline** — fxstore's job (M5), already built: package
+  activation, config change, boot, roll-forward rollback. Uses the snapshot
+  machinery (`dl_publish_snapshot`, `dl_snapshot_versions`, `dl_query_version`,
+  roll-forward rollback, `dl_cas_revision`). `rm` / `cp` / `mv` / `touch` /
+  `mkdir` / `ln` and `history` / `diff` do **not** ride this — they are coreutils
+  and operate on the FS layer below.
+- **The per-tree FS journal** — what `fx history` / `fx diff` (coreutils) run on.
 
-### The granularity-split resolution (snapshot on meaning, journal everything else)
+### The per-tree FS journal: the journal *is* the fact stream
 
-**Overhead is real if done naively.** `dl_publish_snapshot` re-evaluates to
-fixpoint and materializes all EDB+IDB DAFSAs at publish time — per-mutation
-snapshot is exactly the "fatal for OLTP" case the datalog-dafsa architecture
-flags. So:
+Each tree you opt into gets its own datalog-dafsa db (a `.fx` journal file —
+git-like: per-tree, small blast radius, per-tree retention). Mutations append a
+small **delta batch of facts**; nothing ever mutates shared state:
 
-- **Cheap mutations** (`rm`, `touch`, `cp`) → append to a **WAL/journal**
-  (incremental `dl_add_fact` / `dl_delete_fact`, batch atomic `dl_txn_*`,
-  bounded/rotated). The M7 durability machinery, not new engine work.
-- **Snapshots** only at *meaningful boundaries*: package activation, config
-  change, boot, manual `fx commit` / restore point. Coarse, human-meaningful,
-  where expensive fixpoint materialization pays for itself.
+```
+op(ts, seq, cmd, cwd, args, target)          # audit trail
+del(path, hash, size, mode)                  # what vanished
+add(path, hash, size, mode)                  # what appeared / replaced
+```
 
-**Pollution is solved by the same split.** Keep the state timeline apart from the
-operation log:
+The fixpoint trick: **current state = replaying the journal from empty** (a
+least-fixed-point over the delta stream). You never store a "current tree
+relation set" — you *derive* it by folding the deltas. That is event-sourcing as
+a relation stream: every point in a tree's life is reconstructible by replaying
+up to it.
 
-- **State timeline (snapshots):** `gen 7: activated visage-0.4`, `gen 8: config
-  change`, `gen 9: boot-ok`. Coarse, browsable.
-- **Command journal (audit):** `op(ts, cmd, cwd, args, target)` relation —
-  "did rm readme.md" is a journal query, not a timeline entry.
+- `fx history` = query the journal: `op` rows, filterable by `path`/`target`/
+  `cmd`/`ts`. "Did rm readme.md" → `op where cmd=rm`.
+- `fx diff --to A --to B` = replay deltas to reconstruct `file(path, hash, size)`
+  at A and B, then diff the two reconstructed sorted sets (linear merge). No
+  snapshots involved.
 
-They compose because everything is a relation: "did rm readme.md" = `op` where
-`cmd=rm`; "can I get it back" = join `op` to the nearest snapshot's `file`
-relation via as-of `dl_query_version`. Journal tells you what happened; timeline
-gives you the recovery point.
+**Why this is clean:** no coupling to system state (a tree's history is only its
+own mutations, never "gen 7 activated visage"); no `dl_publish_snapshot`
+fixpoint cost per op (just appends); cheap mutations are first-class at full
+granularity. The granularity-split resolution ("snapshot on meaning, journal
+everything else") still holds *for the store timeline*; the FS layer needs no
+snapshots at all — only the fold.
 
-**Honest tradeoff named:** content-undo granularity = snapshot granularity (your
-last restore point); audit granularity = full (journal). No byte-level undo for
-free from logging alone. But the 99% case — "did I delete that / get it back" —
-is covered at zero per-mutation snapshot cost and zero timeline noise.
+### Content recovery — optional, in three layers
 
-**Tagline:** *snapshot on meaning, journal everything else.*
+The journal alone answers *what happened* (structural); recovering *bytes* is
+opt-in, per tree, in escalating depth:
+
+1. **Structural (default).** Journal records `path/hash/size` deltas only — no
+   bytes, no hot-path capture (honest cut: don't back 10GB files as facts).
+   Change-detection only; "readme.md was deleted" answered, contents not
+   restorable.
+2. **+ CAS (opt-in).** Intern content at line/chunk granularity into the DAFSA;
+   interned `add`/`del` facts reference u32 symbols instead of duplicating bytes;
+   each symbol maps back to its bytes by content hash (`blob = sha256(content)`)
+   for recovery. A file is a **sequence of interned-line refs** (a path through
+   the line-DAFSA): shared lines across files dedupe once, and DAFSA structurally
+   merges lines that share prefixes/suffixes. This is fx-grep's DAFSA-WALK
+   mechanism, generalized into being the whole content history.
+3. **+ Chunking (future refinement).** Content-defined chunking (rolling hashes →
+   stable chunk boundaries → chunks dedupe by hash) to capture shared *middle*
+   blocks across near-identical files. Neither whole-file CAS nor DAFSA
+   prefix/suffix sharing catches a shared middle block; this is git-style
+   similarity dedupe.
+
+**DAFSA vs CAS — why both, and why they're different axes.** DAFSA dedupes
+**prefixes/suffixes of whole strings** (a trie with common suffixes merged); it
+is a compressed *set-acceptor* that answers membership and supports prefix-walk,
+but is **not addressable** — it collapses the set and doesn't remember which
+path is which file, so you can't fetch "file N" out of it. CAS dedupes by
+**whole-value equality** and is an addressable store (O(1) content-hash fetch).
+They compose, they don't substitute: **DAFSA shrinks what you index; CAS is how
+you get bytes back.** And a shared *middle* chunk is caught by neither — that's
+layer 3's job.
+
+**Tagline (FS layer):** *the journal is the fold; DAFSA is the index; CAS is the
+recovery — the last two optional.*
+
+---
+
+### Provenance: `what` / `why` (design-only — scoped, not yet built)
+
+Lens 2's provenance commands: `what /usr/bin/foo` traces a file back through the
+store closure to its derivation; `why` is the inverse (what does a package/derivation
+produce and depend on). The command shows its derivation — the datalog proof tree /
+build closure. The manifesto made executable.
 
 ---
 
