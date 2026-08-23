@@ -164,6 +164,34 @@ test "jsonParseOpts type field unknown alt rejected" {
     try std.testing.expect(jsonParseOpts("{\"type\":{\"x\":\"x\"}}", &buf) == null);
 }
 
+test "jsonParseOpts nullary type File" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type\":{\"File\":{}}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .f), o.type);
+}
+
+test "jsonParseOpts nullary type Dir" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type\":{\"Dir\":{}}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .d), o.type);
+}
+
+test "evalDhallArgs nullary type union field file" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ root = \".\", type = < File | Dir >.File }", std.testing.allocator);
+    defer std.testing.allocator.free(o.root);
+    try std.testing.expectEqual(@as(?TypeFilter, .f), o.type_filter);
+}
+
+test "evalDhallArgs nullary type union field dir" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ root = \".\", type = < File | Dir >.Dir }", std.testing.allocator);
+    defer std.testing.allocator.free(o.root);
+    try std.testing.expectEqual(@as(?TypeFilter, .d), o.type_filter);
+}
+
 // ---------------------------------------------------------------------------
 // Dhall arg evaluation -> Options
 // ---------------------------------------------------------------------------
@@ -284,9 +312,11 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
                 return null;
             }
             if (!jsonExpect(s, &i, '}')) return null;
-            if (std.mem.eql(u8, tag, "f")) {
+            // Accept both the typed tags (< f : Text | d : Text > -> "f"/"d")
+            // and the nullary tags (< File | Dir > -> "File"/"Dir").
+            if (std.mem.eql(u8, tag, "f") or std.mem.eql(u8, tag, "File")) {
                 res.type = .f;
-            } else if (std.mem.eql(u8, tag, "d")) {
+            } else if (std.mem.eql(u8, tag, "d") or std.mem.eql(u8, tag, "Dir")) {
                 res.type = .d;
             } else {
                 return null; // unknown alternative -> could not parse fields
