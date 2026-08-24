@@ -328,4 +328,44 @@ pub fn build(b: *std.Build) void {
         const run_cmd_tests = b.addRunArtifact(cmd_tests);
         test_step.dependOn(&run_cmd_tests.step);
     }
+
+    // -----------------------------------------------------------------------
+    // fxsystem batch: the 8 SYSTEM/IDENTITY pure coreutils (id, whoami,
+    // hostname, env, uname, date, tee, comm).  Table-driven exactly like the
+    // trivial batch; ALL are pure (libc + the dhall module only — no datalog,
+    // no caslog linkage).  NOTE: fx-hostname is an inetutils program, not a
+    // GNU coreutils binary — GNU coreutils has no `hostname`; we implement it
+    // anyway as a print-only tool (see fx-hostname.zig).
+    // -----------------------------------------------------------------------
+    const system_cmds = [_][]const u8{
+        "fx-id",       "fx-whoami",  "fx-hostname", "fx-env",
+        "fx-uname",    "fx-date",    "fx-tee",      "fx-comm",
+    };
+    inline for (system_cmds) |name| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const cmd_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dhall", .module = dhall_mod },
+                },
+            }),
+        });
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
 }
