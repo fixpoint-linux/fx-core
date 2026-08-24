@@ -373,7 +373,6 @@ fn rmTree(gpa: Allocator, state_dir: []const u8, dir_fd: c_int, dir_path: []cons
                 if (failed.* == null) failed.* = error.ReadlinkFailed;
                 continue;
             };
-            defer gpa.free(target);
             if (unlinkat(dir_fd, nz, 0) != 0) {
                 gpa.free(child);
                 if (failed.* == null) failed.* = error.UnlinkFailed;
@@ -461,7 +460,6 @@ fn rmOne(gpa: Allocator, state_dir: []const u8, path: []const u8, recursive: boo
     } else if (mt == @as(c_uint, dl.S_IFLNK)) {
         // Symlink: no bytes in CAS — target recorded inline in the effect.
         const target = try readLinkTarget(gpa, path);
-        defer gpa.free(target);
         if (unlink(&z) != 0) return error.UnlinkFailed;
         effects.append(gpa, Effect{
             .op = .unlink,
