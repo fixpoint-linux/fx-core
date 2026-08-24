@@ -1,6 +1,11 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // The build() comptime evaluation grew past the 11000-branch default as
+    // more table-driven batches were added; raise the quota for the whole
+    // function (does not change any batch's wiring).
+    @setEvalBranchQuota(200000);
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -257,6 +262,46 @@ pub fn build(b: *std.Build) void {
         "fx-sha384sum", "fx-sha512sum", "fx-cksum",     "fx-sum",
     };
     inline for (check_cmds) |name| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const cmd_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dhall", .module = dhall_mod },
+                },
+            }),
+        });
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
+
+    // -----------------------------------------------------------------------
+    // fxtrivial batch: the 8 tiny read-only/exit-only coreutils (basename,
+    // dirname, realpath, seq, echo, yes, true, false).  Table-driven exactly
+    // like the checksum batch; ALL are pure (libc + the dhall module only — no
+    // datalog, no caslog linkage).  fx-true/fx-false take no Dhall form at
+    // runtime and don't even @import dhall — the module import above is uniform
+    // across the table but unused by them.
+    // -----------------------------------------------------------------------
+    const trivial_cmds = [_][]const u8{
+        "fx-basename", "fx-dirname", "fx-realpath", "fx-seq",
+        "fx-echo",     "fx-yes",     "fx-true",     "fx-false",
+    };
+    inline for (trivial_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
         const cmd_exe = b.addExecutable(.{
             .name = name,
