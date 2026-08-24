@@ -209,6 +209,7 @@ pub fn build(b: *std.Build) void {
 
     const mut_cmds = [_][]const u8{
         "fx-cp", "fx-mv", "fx-rm", "fx-mkdir", "fx-rmdir", "fx-touch", "fx-ln", "fx-log", "fx-undo",
+        "fx-chmod", "fx-chown", "fx-chgrp",
     };
     inline for (mut_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});

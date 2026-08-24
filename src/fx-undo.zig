@@ -66,10 +66,14 @@ const Effect = caslog.Effect;
 const LogEntry = caslog.LogEntry;
 
 // Locally-defined constants (no @cInclude of fcntl.h / unistd.h).  AT_FDCWD =
-// -100, AT_SYMLINK_NOFOLLOW = 0x100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT =
-// 0o100, O_TRUNC = 0o1000.
+// -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_SYMLINK_FOLLOW = 0x400, O_RDONLY = 0,
+// O_WRONLY = 1, O_CREAT = 0o100, O_TRUNC = 0o1000.
 const AT_FDCWD: c_int = -100;
 const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
+/// AT_SYMLINK_FOLLOW makes fchownat FOLLOW a command-line symlink (operate on
+/// its target), matching GNU chown(1) default semantics.  fchownat with flags=0
+/// does NOT follow (lchown behavior); verified against glibc fcntl.h (0x400).
+const AT_SYMLINK_FOLLOW: c_int = 0x400;
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
@@ -94,6 +98,11 @@ extern fn unlink(path: [*:0]const u8) c_int;
 extern fn rename(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
 extern fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+/// fchownat(2): owner/group are uid_t/gid_t (unsigned int = c_uint).  A -1
+/// sentinel (0xFFFFFFFF as c_uint) leaves that field unchanged.  flags=0 does
+/// NOT follow symlinks; pass AT_SYMLINK_FOLLOW to operate on the target (GNU
+/// chown default).
+extern fn fchownat(dirfd: c_int, pathname: [*:0]const u8, owner: c_uint, group: c_uint, flags: c_int) c_int;
 extern fn utimensat(dirfd: c_int, pathname: [*:0]const u8, times: ?[*]const Timespec, flags: c_int) c_int;
 extern fn readlink(pathname: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
@@ -109,6 +118,7 @@ const UndoErr = error{
     ReadFailed,
     WriteFailed,
     ChmodFailed,
+    ChownFailed,
     MkdirFailed,
     RmdirFailed,
     UnlinkFailed,
@@ -238,11 +248,28 @@ fn mkdirParent(path: []const u8) void {
 // Divergence gate: verify current state matches the recorded POST-state
 // ---------------------------------------------------------------------------
 
+/// Does the inverse of `e` REMOVE (delete) the path it names?  Only effects
+/// whose inverse unlinks/rmdirs/moves-away their path count as "removing"
+/// for the mkdir child-coverage gate.  .unlink (inverse RESTORES the path) and
+/// .rmdir (inverse RECREATES the path) do NOT remove; .write with in!=null
+/// (inverse restores bytes) does NOT remove.
+fn inverseRemoves(e: Effect) bool {
+    return switch (e.op) {
+        .write => e.in == null, // fresh file -> inverse unlinks
+        .mkdir, .symlink, .link => true, // inverse rmdir / unlink
+        .touch => e.created, // created file -> inverse unlinks
+        .rename => true, // inverse moves dst (e.path) away to `from`
+        .unlink, .rmdir => false,
+        .chmod, .chown => false, // inverse restores prior mode/owner; path stays
+    };
+}
+
 /// Returns null if the gate PASSES, else the refusal error.  All gates are
 /// checked against the state as it exists BEFORE any inverse is applied (the
 /// recorded post-state of the mutation), so the checks are independent of the
-/// undo's own intermediate writes.
-fn checkGate(gpa: Allocator, e: Effect) ?UndoErr {
+/// undo's own intermediate writes.  `effects` is the full entry effects slice
+/// and `idx` the index of `e` within it, needed by the mkdir coverage gate.
+fn checkGate(gpa: Allocator, e: Effect, effects: []const Effect, idx: usize) ?UndoErr {
     switch (e.op) {
         .write => {
             // Post-state: path holds the written bytes (out).  The file must be
@@ -273,6 +300,34 @@ fn checkGate(gpa: Allocator, e: Effect) ?UndoErr {
         .mkdir => {
             // Post-state: path is a directory.
             if (pathKind(e.path) != .dir) return error.Diverged;
+            // Half-apply guard: the mkdir inverse rmdirs `e.path`, which fails
+            // ENOTEMPTY if the dir holds USER-added (foreign) content — and that
+            // would fire at APPLY time, after earlier reversed-order inverses
+            // already ran.  So at PREFLIGHT require every child currently in the
+            // dir to be covered by a SIBLING effect in the same entry (different
+            // index) whose .path equals the child path AND whose inverse REMOVES
+            // it (that inverse will run, in reversed order, before this parent
+            // rmdir).  Any uncovered child is foreign content => Refused whole.
+            // (A naive "dir must be empty" check would break the valid nested
+            // [mkdir a, mkdir a/b, ...] case, whose dirs are non-empty here.)
+            var zbuf: [std.posix.PATH_MAX]u8 = undefined;
+            const zdir = std.fmt.bufPrintZ(&zbuf, "{s}", .{e.path}) catch return error.BadPath;
+            const it = dl.opendir(zdir.ptr) orelse return error.BadPath;
+            defer _ = dl.closedir(it);
+            while (dl.readdir(it)) |entry| {
+                const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+                const child = std.fs.path.join(gpa, &.{ e.path, name }) catch return error.NoMem;
+                var covered = false;
+                for (effects, 0..) |s, si| {
+                    if (si == idx) continue; // sibling only, not the mkdir itself
+                    if (std.mem.eql(u8, s.path, child) and inverseRemoves(s)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) return error.Refused;
+            }
             return null;
         },
         .rename => {
@@ -296,6 +351,20 @@ fn checkGate(gpa: Allocator, e: Effect) ?UndoErr {
         .symlink => {
             // Post-state: path is a symlink.
             if (pathKind(e.path) != .symlink) return error.Diverged;
+            return null;
+        },
+        .chmod => {
+            // Existence-only gate: we record the PRIOR mode, not the applied
+            // new mode, so there is no recorded post-state to compare against.
+            // Undo unconditionally restores prior mode, which is the correct
+            // revert even if the user manually re-chmod'd in between.
+            if (!pathExists(e.path)) return error.Diverged;
+            return null;
+        },
+        .chown => {
+            // Existence-only gate, same reasoning as .chmod: we record the
+            // PRIOR uid/gid, not the applied new owner.  Undo restores prior.
+            if (!pathExists(e.path)) return error.Diverged;
             return null;
         },
     }
@@ -388,6 +457,23 @@ fn applyInverse(gpa: Allocator, state_dir: []const u8, e: Effect) UndoErr!void {
             const z = std.posix.toPosixPath(e.path) catch return error.BadPath;
             if (unlink(&z) != 0) return error.UnlinkFailed;
         },
+        .chmod => {
+            // Restore the PRIOR mode (e.mode carries the pre-mutation mode).
+            const z = std.posix.toPosixPath(e.path) catch return error.BadPath;
+            if (chmod(&z, e.mode) != 0) return error.ChmodFailed;
+        },
+        .chown => {
+            // Restore the PRIOR uid/gid.  null means "that field was not changed
+            // by the mutation" (chgrp sets uid=null); its inverse is a no-op for
+            // that field, expressed via the (uid_t)-1 / (gid_t)-1 sentinel
+            // (0xFFFFFFFF).  AT_SYMLINK_FOLLOW operates on the symlink's TARGET,
+            // matching GNU chown's command-line follow semantics (the mutation
+            // also followed; the effect's prior uid/gid are the target's).
+            const z = std.posix.toPosixPath(e.path) catch return error.BadPath;
+            const uid_arg: c_uint = if (e.uid) |u| u else ~@as(c_uint, 0);
+            const gid_arg: c_uint = if (e.gid) |g| g else ~@as(c_uint, 0);
+            if (fchownat(AT_FDCWD, &z, uid_arg, gid_arg, AT_SYMLINK_FOLLOW) != 0) return error.ChownFailed;
+        },
     }
 }
 
@@ -399,8 +485,8 @@ fn undoEntry(gpa: Allocator, state_dir: []const u8, entry: LogEntry) UndoErr!voi
     // Preflight: verify every gate against the current (post-mutation) state.
     // A gate failure (Diverged) OR an unrestorable effect (Refused) rejects the
     // whole entry BEFORE any inverse is applied — no half-apply.
-    for (entry.effects) |e| {
-        if (checkGate(gpa, e)) |err| {
+    for (entry.effects, 0..) |e, i| {
+        if (checkGate(gpa, e, entry.effects, i)) |err| {
             switch (err) {
                 error.Diverged => std.debug.print("fx-undo: state diverged for '{s}' ({s}) — entry {d} refused\n", .{ e.path, @tagName(e.op), entry.seq }),
                 else => std.debug.print("fx-undo: cannot restore '{s}' ({s}) — entry {d} refused\n", .{ e.path, @tagName(e.op), entry.seq }),
@@ -667,6 +753,37 @@ test "mkdir inverse rmdirs an empty dir; refuses a non-empty dir" {
     try std.testing.expect(pathExists(d)); // not half-applied
 }
 
+test "mkdir gate refuses multi-effect entry when a user adds foreign content into a created dir" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const state = try std.fs.path.join(aa, &.{ tmp, "state" });
+    try caslog.ensureDirs(state);
+    const a = try std.fs.path.join(aa, &.{ tmp, "a" });
+    const ab = try std.fs.path.join(aa, &.{ tmp, "a", "b" });
+
+    // Multi-effect entry [mkdir a, mkdir a/b]; post-state: both exist.
+    try makeDir(a);
+    try makeDir(ab);
+    var effects = [_]caslog.Effect{
+        .{ .op = .mkdir, .path = a, .kind = .dir, .mode = 0o755 },
+        .{ .op = .mkdir, .path = ab, .kind = .dir, .mode = 0o755 },
+    };
+    const entry = caslog.LogEntry{ .seq = 1, .ts = 0, .cwd = tmp, .cmd = "fx-mkdir", .args_json = "{}", .effects = &effects };
+
+    // USER manually adds foreign content into a created dir: a/user.txt.
+    try writeFileUnder(aa, a, "user.txt", "foreign");
+
+    // Undo must REFUSE at preflight (a/user.txt is not covered by any sibling
+    // removal effect) — and must NOT half-apply: the covered child a/b survives.
+    try std.testing.expectError(error.Refused, undoEntry(aa, state, entry));
+    try std.testing.expect(pathExists(ab)); // no half-apply
+    try std.testing.expect(pathExists(a)); // nothing removed
+    try std.testing.expectEqualStrings("foreign", try readAllUnder(aa, try std.fs.path.join(aa, &.{ a, "user.txt" })));
+}
+
 test "rename inverse moves dst back to from and restores prior dst bytes" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
@@ -862,6 +979,72 @@ test "selectEntry: last is highest-seq; SEQ selects by number; missing errors" {
     try std.testing.expectError(error.NoEntry, selectEntry(&entries, 99));
     const empty: []const LogEntry = &.{};
     try std.testing.expectError(error.NoEntry, selectEntry(empty, null));
+}
+
+test "chmod inverse round-trip: prior mode restored after a 0600 mutation" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const state = try std.fs.path.join(aa, &.{ tmp, "state" });
+    try caslog.ensureDirs(state);
+    const f = try std.fs.path.join(aa, &.{ tmp, "f" });
+    // Original file is 0644.
+    try writeFileUnder(aa, tmp, "f", "x");
+    // Simulate the mutation fx-chmod did: 0644 -> 0600.  chmod works in-sandbox,
+    // so this round-trip is REAL (the inverse's chmod syscall actually runs).
+    {
+        const z = std.posix.toPosixPath(f) catch return error.BadPath;
+        if (chmod(&z, 0o600) != 0) return error.ChmodFail;
+    }
+    // The effect records the PRIOR mode (0o644); undo restores it.
+    const eff = caslog.Effect{ .op = .chmod, .path = f, .kind = .file, .mode = 0o644 };
+    const entry = caslog.LogEntry{ .seq = 1, .ts = 0, .cwd = tmp, .cmd = "fx-chmod", .args_json = "{}", .effects = &.{eff} };
+    try undoEntry(aa, state, entry);
+    const st = statNoFollow(f).?;
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(st.st_mode & 0o7777)));
+    // log entry removed (seq 1 gone).
+    const entries = try caslog.logReadAll(aa, state);
+    defer caslog.freeLogEntries(aa, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "chmod gate: existing path passes; missing path diverges" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const f = try std.fs.path.join(aa, &.{ tmp, "f" });
+    try writeFileUnder(aa, tmp, "f", "x");
+    // Existing path: existence-only gate passes (null).
+    const ok = caslog.Effect{ .op = .chmod, .path = f, .kind = .file, .mode = 0o644 };
+    try std.testing.expect(checkGate(aa, ok, &.{}, 0) == null);
+    // Missing path: diverged.
+    const missing = try std.fs.path.join(aa, &.{ tmp, "nope" });
+    const bad = caslog.Effect{ .op = .chmod, .path = missing, .kind = .file, .mode = 0o644 };
+    try std.testing.expectEqual(error.Diverged, checkGate(aa, bad, &.{}, 0).?);
+}
+
+test "chown gate: PURE existence check (no fchownat called)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const f = try std.fs.path.join(aa, &.{ tmp, "f" });
+    try writeFileUnder(aa, tmp, "f", "x");
+    // .chown effect records PRIOR uid/gid.  We test only the GATE purity here:
+    // no fchownat is invoked (it EPERMs in-sandbox even for a no-op), mirroring
+    // the utimensat guard comment above.  The fchownat mutation + full chown
+    // inverse round-trip is HOST-ONLY.
+    const ok = caslog.Effect{ .op = .chown, .path = f, .kind = .file, .uid = 1000, .gid = 1000 };
+    try std.testing.expect(checkGate(aa, ok, &.{}, 0) == null);
+    // Missing path: diverged.
+    const missing = try std.fs.path.join(aa, &.{ tmp, "nope" });
+    const bad = caslog.Effect{ .op = .chown, .path = missing, .kind = .file, .uid = 1000, .gid = 1000 };
+    try std.testing.expectEqual(error.Diverged, checkGate(aa, bad, &.{}, 0).?);
 }
 
 // ---------------------------------------------------------------------------

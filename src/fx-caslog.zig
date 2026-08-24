@@ -112,6 +112,8 @@ pub const Op = enum {
     touch,
     link,
     symlink,
+    chmod,
+    chown,
 };
 
 /// One atomic filesystem effect.  Effects are logged in APPLICATION order; undo
@@ -135,6 +137,12 @@ pub const Effect = struct {
     mtime_s: i64 = 0,
     mtime_ns: i32 = 0,
     created: bool = false,
+    // PRIOR uid/gid for .chown (the inverse restores them; null means "leave
+    // unchanged", mirroring the chown(2) -1 sentinel — chgrp sets uid=null so
+    // restoring prior uid is a no-op).  Defaults null so every existing Effect
+    // literal still compiles unchanged.
+    uid: ?u32 = null,
+    gid: ?u32 = null,
 };
 
 /// One parsed derivation-log entry (logReadAll output).  All slices are
@@ -447,6 +455,19 @@ fn appendOptStr(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, s: ?[
     }
 }
 
+/// Like appendOptStr but for an optional u32 (uid/gid): emits `"name":<n>` or
+/// `"name":null`.  The caller writes the leading comma, matching appendOptStr.
+fn appendOptU32(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, v: ?u32) Error!void {
+    out.append(gpa, '"') catch return Error.NoMem;
+    out.appendSlice(gpa, name) catch return Error.NoMem;
+    out.appendSlice(gpa, "\":") catch return Error.NoMem;
+    if (v) |n| {
+        out.print(gpa, "{d}", .{n}) catch return Error.NoMem;
+    } else {
+        out.appendSlice(gpa, "null") catch return Error.NoMem;
+    }
+}
+
 /// Serialize one Effect as a fixed-field-order JSON object (no surrounding
 /// braces; the caller wraps it inside the `fx` array).  Field order matches the
 /// DESIGN C schema exactly so a parse-back round-trip is byte-identical.
@@ -477,6 +498,10 @@ pub fn serializeEffect(gpa: Allocator, out: *std.ArrayList(u8), e: Effect) Error
     out.print(gpa, ",\"mtime_s\":{d}", .{e.mtime_s}) catch return Error.NoMem;
     out.print(gpa, ",\"mtime_ns\":{d}", .{e.mtime_ns}) catch return Error.NoMem;
     out.print(gpa, ",\"created\":{}", .{e.created}) catch return Error.NoMem;
+    out.append(gpa, ',') catch return Error.NoMem;
+    try appendOptU32(gpa, out, "uid", e.uid);
+    out.append(gpa, ',') catch return Error.NoMem;
+    try appendOptU32(gpa, out, "gid", e.gid);
     out.append(gpa, '}') catch return Error.NoMem;
 }
 
@@ -791,6 +816,12 @@ fn parseU32(c: *Cursor) Error!u32 {
     return @intCast(v);
 }
 
+/// Parse an optional u32 (uid/gid): a literal `null` -> null, else a u32.
+fn parseOptU32(c: *Cursor) Error!?u32 {
+    if (c.expectLit("null")) return null;
+    return try parseU32(c);
+}
+
 fn parseBool(c: *Cursor) Error!bool {
     if (c.expectLit("true")) return true;
     if (c.expectLit("false")) return false;
@@ -880,6 +911,10 @@ fn parseEffect(gpa: Allocator, c: *Cursor) Error!Effect {
             e.mtime_ns = try parseI32(c);
         } else if (std.mem.eql(u8, key, "created")) {
             e.created = try parseBool(c);
+        } else if (std.mem.eql(u8, key, "uid")) {
+            e.uid = try parseOptU32(c);
+        } else if (std.mem.eql(u8, key, "gid")) {
+            e.gid = try parseOptU32(c);
         } else {
             // Unknown field: our writer emits exactly the fixed schema, so an
             // unknown key means the line is not ours — treat it as inert
@@ -1265,9 +1300,39 @@ test "serializeEffect fixed-field order + exact output" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(gpa);
     try serializeEffect(gpa, &out, e);
-    const want = std.fmt.allocPrint(gpa, "{{\"op\":\"write\",\"path\":\"/p\",\"kind\":\"file\",\"in\":\"sha256:{s}\",\"out\":null,\"mode\":420,\"size\":4,\"from\":null,\"target\":null,\"mtime_s\":0,\"mtime_ns\":0,\"created\":false}}", .{hash[0..64]}) catch return error.NoMem;
+    const want = std.fmt.allocPrint(gpa, "{{\"op\":\"write\",\"path\":\"/p\",\"kind\":\"file\",\"in\":\"sha256:{s}\",\"out\":null,\"mode\":420,\"size\":4,\"from\":null,\"target\":null,\"mtime_s\":0,\"mtime_ns\":0,\"created\":false,\"uid\":null,\"gid\":null}}", .{hash[0..64]}) catch return error.NoMem;
     defer gpa.free(want);
     try testing.expectEqualStrings(want, out.items);
+}
+
+test "serializeEffect/parseEffect round-trips a .chown effect with uid/gid set" {
+    const gpa = testing.allocator;
+    const e = Effect{
+        .op = .chown,
+        .path = "/p",
+        .kind = .file,
+        .uid = 1000,
+        .gid = 1000,
+    };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    try serializeEffect(gpa, &out, e);
+    // Field order + value: ...created,uid,gid
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"uid\":1000") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"gid\":1000") != null);
+    // Parse back (parseEffect is private but in-file tests may call it).
+    var c = Cursor{ .s = out.items, .i = 0 };
+    const parsed = try parseEffect(gpa, &c);
+    defer gpa.free(parsed.path);
+    try testing.expectEqual(Op.chown, parsed.op);
+    try testing.expectEqualStrings("/p", parsed.path);
+    try testing.expectEqual(@as(?u32, 1000), parsed.uid);
+    try testing.expectEqual(@as(?u32, 1000), parsed.gid);
+    // Re-serialize and confirm a byte-identical round-trip.
+    var out2 = std.ArrayList(u8).empty;
+    defer out2.deinit(gpa);
+    try serializeEffect(gpa, &out2, parsed);
+    try testing.expectEqualStrings(out.items, out2.items);
 }
 
 test "kindFromMode maps the three kinds" {
