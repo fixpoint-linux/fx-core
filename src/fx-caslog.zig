@@ -114,6 +114,8 @@ pub const Op = enum {
     symlink,
     chmod,
     chown,
+    truncate,
+    mkfifo,
 };
 
 /// One atomic filesystem effect.  Effects are logged in APPLICATION order; undo
@@ -1333,6 +1335,82 @@ test "serializeEffect/parseEffect round-trips a .chown effect with uid/gid set" 
     defer out2.deinit(gpa);
     try serializeEffect(gpa, &out2, parsed);
     try testing.expectEqualStrings(out.items, out2.items);
+}
+
+test "serializeEffect/parseEffect round-trips .truncate and .mkfifo (new ops)" {
+    const gpa = testing.allocator;
+    var in_hash: [65]u8 = undefined;
+    dh.sha256.sha256_hex("prior", &in_hash);
+    const trunc = Effect{
+        .op = .truncate,
+        .path = "/t",
+        .kind = .file,
+        .in = in_hash,
+        .mode = 0o600,
+        .size = 5,
+        .mtime_s = 1700000000,
+        .mtime_ns = 7,
+    };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    try serializeEffect(gpa, &out, trunc);
+    var c = Cursor{ .s = out.items, .i = 0 };
+    const p = try parseEffect(gpa, &c);
+    defer gpa.free(p.path);
+    try testing.expectEqual(Op.truncate, p.op);
+    try testing.expectEqualStrings("/t", p.path);
+    try testing.expectEqual(@as(u32, 0o600), p.mode);
+    try testing.expectEqual(@as(u64, 5), p.size);
+    if (p.in) |h| try testing.expectEqualStrings(in_hash[0..64], h[0..64]);
+    // Re-serialize and confirm a byte-identical round-trip.
+    var out2 = std.ArrayList(u8).empty;
+    defer out2.deinit(gpa);
+    try serializeEffect(gpa, &out2, p);
+    try testing.expectEqualStrings(out.items, out2.items);
+
+    // .mkfifo: minimal effect.
+    var out3 = std.ArrayList(u8).empty;
+    defer out3.deinit(gpa);
+    const fifo = Effect{ .op = .mkfifo, .path = "/p", .kind = .file, .mode = 0o644 };
+    try serializeEffect(gpa, &out3, fifo);
+    var c2 = Cursor{ .s = out3.items, .i = 0 };
+    const p2 = try parseEffect(gpa, &c2);
+    defer gpa.free(p2.path);
+    try testing.expectEqual(Op.mkfifo, p2.op);
+    try testing.expectEqualStrings("/p", p2.path);
+    try testing.expectEqual(@as(u32, 0o644), p2.mode);
+    var out4 = std.ArrayList(u8).empty;
+    defer out4.deinit(gpa);
+    try serializeEffect(gpa, &out4, p2);
+    try testing.expectEqualStrings(out3.items, out4.items);
+}
+
+test "logAppend/logReadAll round-trips .truncate and .mkfifo effects" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+    var in_hash: [65]u8 = undefined;
+    dh.sha256.sha256_hex("prior", &in_hash);
+    var effects = [_]Effect{
+        .{ .op = .truncate, .path = "/a", .kind = .file, .in = in_hash, .mode = 0o600, .size = 5 },
+        .{ .op = .mkfifo, .path = "/p", .kind = .file, .mode = 0o644 },
+    };
+    const seq = try logAppend(gpa, fix.state, "/cwd", "fx-truncate", "{}", &effects);
+    try testing.expectEqual(@as(u64, 1), seq);
+    const entries = try logReadAll(gpa, fix.state);
+    defer freeLogEntries(gpa, entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(usize, 2), entries[0].effects.len);
+    try testing.expectEqual(Op.truncate, entries[0].effects[0].op);
+    try testing.expectEqual(@as(u32, 0o600), entries[0].effects[0].mode);
+    if (entries[0].effects[0].in) |h| try testing.expectEqualStrings(in_hash[0..64], h[0..64]);
+    try testing.expectEqual(Op.mkfifo, entries[0].effects[1].op);
+    try testing.expectEqual(@as(u32, 0o644), entries[0].effects[1].mode);
 }
 
 test "kindFromMode maps the three kinds" {

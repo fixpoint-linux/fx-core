@@ -261,6 +261,8 @@ fn inverseRemoves(e: Effect) bool {
         .rename => true, // inverse moves dst (e.path) away to `from`
         .unlink, .rmdir => false,
         .chmod, .chown => false, // inverse restores prior mode/owner; path stays
+        .truncate => e.created, // created file -> inverse unlinks; else restores prior content
+        .mkfifo => true, // inverse unlinks the created fifo
     };
 }
 
@@ -364,6 +366,20 @@ fn checkGate(gpa: Allocator, e: Effect, effects: []const Effect, idx: usize) ?Un
         .chown => {
             // Existence-only gate, same reasoning as .chmod: we record the
             // PRIOR uid/gid, not the applied new owner.  Undo restores prior.
+            if (!pathExists(e.path)) return error.Diverged;
+            return null;
+        },
+        .truncate => {
+            // Post-state: the file is a regular file (possibly re-sized to
+            // zero/new size).  We record the PRIOR content+size+mode, not the
+            // applied new size, so undo unconditionally restores the prior
+            // bytes (the same "restore prior" philosophy as .chmod/.chown).
+            if (pathKind(e.path) != .file) return error.Diverged;
+            return null;
+        },
+        .mkfifo => {
+            // Post-state: the fifo path exists.  Undo unconditionally unlinks
+            // it, so an existence-only gate is sufficient.
             if (!pathExists(e.path)) return error.Diverged;
             return null;
         },
@@ -473,6 +489,29 @@ fn applyInverse(gpa: Allocator, state_dir: []const u8, e: Effect) UndoErr!void {
             const uid_arg: c_uint = if (e.uid) |u| u else ~@as(c_uint, 0);
             const gid_arg: c_uint = if (e.gid) |g| g else ~@as(c_uint, 0);
             if (fchownat(AT_FDCWD, &z, uid_arg, gid_arg, AT_SYMLINK_FOLLOW) != 0) return error.ChownFailed;
+        },
+        .truncate => {
+            if (e.created) {
+                // A truncate that CREATED the file: restore absence (unlink).
+                const z = std.posix.toPosixPath(e.path) catch return error.BadPath;
+                if (unlink(&z) != 0) return error.UnlinkFailed;
+            } else {
+                // Restore the PRIOR content + size + mode captured before the
+                // truncate (the same file-restore code path as .write/.unlink).
+                const h = e.in orelse return error.Refused;
+                const bytes = caslog.casGet(gpa, state_dir, h[0..64]) catch |err| switch (err) {
+                    caslog.Error.Missing => return error.MissingCas,
+                    else => return error.OpenFailed,
+                };
+                defer gpa.free(bytes);
+                mkdirParent(e.path);
+                try writeBytesWithMode(e.path, bytes, e.mode);
+            }
+        },
+        .mkfifo => {
+            // Remove the fifo created by the mutation.
+            const z = std.posix.toPosixPath(e.path) catch return error.BadPath;
+            if (unlink(&z) != 0) return error.UnlinkFailed;
         },
     }
 }
@@ -1045,6 +1084,109 @@ test "chown gate: PURE existence check (no fchownat called)" {
     const missing = try std.fs.path.join(aa, &.{ tmp, "nope" });
     const bad = caslog.Effect{ .op = .chown, .path = missing, .kind = .file, .uid = 1000, .gid = 1000 };
     try std.testing.expectEqual(error.Diverged, checkGate(aa, bad, &.{}, 0).?);
+}
+
+test "truncate inverse round-trip: restores prior content + size + mode" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const state = try std.fs.path.join(aa, &.{ tmp, "state" });
+    try caslog.ensureDirs(state);
+    const f = try std.fs.path.join(aa, &.{ tmp, "f" });
+    // Prior content captured to CAS; mode recorded.
+    const in_hash = try caslog.casPut(state, "0123456789");
+    // Post-state of fx-truncate: the file now holds the truncated bytes
+    // (e.g. sized down to 0).  Simulate that by writing empty content.
+    try writeFileUnder(aa, tmp, "f", "");
+
+    const eff = caslog.Effect{
+        .op = .truncate,
+        .path = f,
+        .kind = .file,
+        .in = in_hash,
+        .mode = 0o600,
+        .size = 10,
+    };
+    const entry = caslog.LogEntry{ .seq = 1, .ts = 0, .cwd = tmp, .cmd = "fx-truncate", .args_json = "{}", .effects = &.{eff} };
+    try undoEntry(aa, state, entry);
+    // Content + size restored from the CAS hash.
+    try std.testing.expectEqualStrings("0123456789", try readAllUnder(aa, f));
+    const st = statNoFollow(f).?;
+    try std.testing.expectEqual(@as(u64, 10), @as(u64, @intCast(st.st_size)));
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.st_mode & 0o7777)));
+    // log entry removed (seq 1 gone).
+    const entries = try caslog.logReadAll(aa, state);
+    defer caslog.freeLogEntries(aa, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "truncate gate: regular file passes; missing path diverges" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const f = try std.fs.path.join(aa, &.{ tmp, "f" });
+    try writeFileUnder(aa, tmp, "f", "x");
+    const ok = caslog.Effect{ .op = .truncate, .path = f, .kind = .file };
+    try std.testing.expect(checkGate(aa, ok, &.{}, 0) == null);
+    const missing = try std.fs.path.join(aa, &.{ tmp, "nope" });
+    const bad = caslog.Effect{ .op = .truncate, .path = missing, .kind = .file };
+    try std.testing.expectEqual(error.Diverged, checkGate(aa, bad, &.{}, 0).?);
+}
+
+test "truncate created-file undo: restores ABSENCE (unlinks, no stray file)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const state = try std.fs.path.join(aa, &.{ tmp, "state" });
+    try caslog.ensureDirs(state);
+    const f = try std.fs.path.join(aa, &.{ tmp, "newf" });
+    // Post-state of fx-truncate on a MISSING file (no -c): the file was created
+    // (empty) and sized.  Simulate the post-state by creating it.
+    try writeFileUnder(aa, tmp, "newf", "");
+
+    const eff = caslog.Effect{
+        .op = .truncate,
+        .path = f,
+        .kind = .file,
+        .in = null, // created=true => no prior content captured
+        .mode = 0o644,
+        .size = 10,
+        .created = true,
+    };
+    const entry = caslog.LogEntry{ .seq = 1, .ts = 0, .cwd = tmp, .cmd = "fx-truncate", .args_json = "{}", .effects = &.{eff} };
+    try undoEntry(aa, state, entry);
+    // The file should be REMOVED entirely (no stray 0-byte file left behind).
+    try std.testing.expect(!pathExists(f));
+    // log entry removed.
+    const entries = try caslog.logReadAll(aa, state);
+    defer caslog.freeLogEntries(aa, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "mkfifo inverse round-trip: unlinks the created fifo path" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const tmp = try testTmpDir(aa);
+    defer testRmTree(tmp);
+    const state = try std.fs.path.join(aa, &.{ tmp, "state" });
+    try caslog.ensureDirs(state);
+    const fifo = try std.fs.path.join(aa, &.{ tmp, "pipe" });
+    // Post-state of fx-mkfifo: the path exists (an existence-only gate).  A
+    // real fifo cannot be created in the sandbox (EPERM), so use a regular file
+    // as a stand-in — undo only unlinks the path, so the kind is irrelevant.
+    try writeFileUnder(aa, tmp, "pipe", "");
+
+    const eff = caslog.Effect{ .op = .mkfifo, .path = fifo, .kind = .file, .mode = 0o644 };
+    const entry = caslog.LogEntry{ .seq = 1, .ts = 0, .cwd = tmp, .cmd = "fx-mkfifo", .args_json = "{}", .effects = &.{eff} };
+    try undoEntry(aa, state, entry);
+    try std.testing.expect(!pathExists(fifo));
 }
 
 // ---------------------------------------------------------------------------

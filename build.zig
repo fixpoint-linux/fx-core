@@ -215,6 +215,7 @@ pub fn build(b: *std.Build) void {
     const mut_cmds = [_][]const u8{
         "fx-cp", "fx-mv", "fx-rm", "fx-mkdir", "fx-rmdir", "fx-touch", "fx-ln", "fx-log", "fx-undo",
         "fx-chmod", "fx-chown", "fx-chgrp", "fx-unlink",
+        "fx-link", "fx-truncate", "fx-mkfifo",
     };
     inline for (mut_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
@@ -342,6 +343,43 @@ pub fn build(b: *std.Build) void {
         "fx-uname",    "fx-date",    "fx-tee",      "fx-comm",
     };
     inline for (system_cmds) |name| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const cmd_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dhall", .module = dhall_mod },
+                },
+            }),
+        });
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
+
+    // -----------------------------------------------------------------------
+    // fxtxt batch: the 3 pure streaming/text coreutils (nl, paste, expand).
+    // Table-driven exactly like the system batch; ALL are pure (libc + the
+    // dhall module only — no datalog, no caslog linkage).  PURE text filters
+    // do not touch the filesystem log.
+    // -----------------------------------------------------------------------
+    const text_cmds = [_][]const u8{
+        "fx-nl", "fx-paste", "fx-expand",
+    };
+    inline for (text_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
         const cmd_exe = b.addExecutable(.{
             .name = name,
