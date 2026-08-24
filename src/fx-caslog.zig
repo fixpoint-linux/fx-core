@@ -145,7 +145,7 @@ pub const LogEntry = struct {
     cwd: []const u8,
     cmd: []const u8,
     args_json: []const u8,
-    effects: []Effect,
+    effects: []const Effect,
 };
 
 pub const Error = error{
@@ -1027,6 +1027,104 @@ pub fn logReadAll(gpa: Allocator, state_dir: []const u8) Error![]LogEntry {
 }
 
 // ---------------------------------------------------------------------------
+// logRemove: drop one entry by seq (rewrite in place, atomic tmp+rename)
+// ---------------------------------------------------------------------------
+
+/// Parse the leading `{"seq":<u64>` field of a raw log LINE.  Returns null if
+/// the line does not begin with a well-formed seq field (inert fragment).
+fn lineSeq(line: []const u8) ?u64 {
+    const prefix = "{\"seq\":";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    var i = prefix.len;
+    var seq: u64 = 0;
+    var any = false;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c < '0' or c > '9') {
+            if (!any) return null;
+            return seq;
+        }
+        any = true;
+        seq = std.math.mul(u64, seq, 10) catch return null;
+        seq += @as(u64, c - '0');
+    }
+    if (!any) return null;
+    return seq;
+}
+
+/// Remove the entry with the given `seq` from the log (used by fx-undo after a
+/// successful inverse application, so the same entry cannot be undone twice).
+/// The rewrite runs under flock(LOCK_EX) and is committed via tmp+rename
+/// (atomic, same dir).  A missing log / a not-found seq is a no-op success.
+/// Complete lines other than the target are preserved verbatim; a trailing torn
+/// fragment (no '\n') is preserved verbatim too so a subsequent logAppend still
+/// applies its corrective-newline rule.
+pub fn logRemove(gpa: Allocator, state_dir: []const u8, seq: u64) Error!void {
+    try ensureDirs(state_dir);
+    var lbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const log_path = std.fmt.bufPrintZ(&lbuf, "{s}/log", .{state_dir}) catch
+        return Error.BadPath;
+
+    const fd = open(log_path, O_RDWR, 0o644);
+    if (fd < 0) return; // no log yet -> nothing to remove
+    defer _ = close(fd);
+    if (flock(fd, LOCK_EX) != 0) return Error.LockFailed;
+    defer _ = flock(fd, LOCK_UN);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(gpa);
+    try readAllFrom(fd, &buf, gpa);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    var line_start: usize = 0;
+    var removed = false;
+    var i: usize = 0;
+    while (i < buf.items.len) : (i += 1) {
+        if (buf.items[i] == '\n') {
+            const line = buf.items[line_start..i];
+            if (line.len > 0) {
+                if (lineSeq(line) == seq) {
+                    removed = true;
+                } else {
+                    out.appendSlice(gpa, line) catch return Error.NoMem;
+                    out.append(gpa, '\n') catch return Error.NoMem;
+                }
+            }
+            line_start = i + 1;
+        }
+    }
+    // Preserve a trailing torn fragment (no '\n') verbatim.
+    if (line_start < buf.items.len) {
+        out.appendSlice(gpa, buf.items[line_start..]) catch return Error.NoMem;
+    }
+
+    if (!removed) return; // seq not present; nothing to rewrite
+
+    // Atomic rewrite via tmp + rename in the same dir (same fs).
+    const pid = getpid();
+    const cnt = nextTmpCounter();
+    var tbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tbuf, "{s}/.log.tmp-{d}-{d}", .{ state_dir, pid, cnt }) catch
+        return Error.BadPath;
+    const tfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if (tfd < 0) return Error.OpenFailed;
+    var wrote_ok = true;
+    writeAll(tfd, out.items) catch {
+        wrote_ok = false;
+    };
+    if (close(tfd) != 0) wrote_ok = false;
+    if (!wrote_ok) {
+        _ = unlink(tmp);
+        return Error.WriteFailed;
+    }
+    if (rename(tmp, log_path) != 0) {
+        _ = unlink(tmp);
+        return Error.RenameFailed;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1291,6 +1389,70 @@ test "lastSeq scan: empty log → seq 1, multi-line → 4, torn tail → seq 4 (
     try testing.expectEqual(@as(usize, 5), entries.len);
     try testing.expectEqual(@as(u64, 5), entries[4].seq);
     try testing.expectEqualStrings("fx-mkdir", entries[4].cmd);
+}
+
+test "logRemove drops one entry by seq, preserves others + torn tail" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    _ = try logAppend(gpa, fix.state, "/c", "fx-mkdir", "{\"path\":\"a\"}", &.{});
+    _ = try logAppend(gpa, fix.state, "/c", "fx-rm", "{\"path\":\"b\"}", &.{});
+    _ = try logAppend(gpa, fix.state, "/c", "fx-touch", "{\"path\":\"c\"}", &.{});
+
+    // Remove seq 2.
+    try logRemove(gpa, fix.state, 2);
+
+    const entries = try logReadAll(gpa, fix.state);
+    defer freeLogEntries(gpa, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqual(@as(u64, 1), entries[0].seq);
+    try testing.expectEqual(@as(u64, 3), entries[1].seq);
+    try testing.expectEqualStrings("fx-mkdir", entries[0].cmd);
+    try testing.expectEqualStrings("fx-touch", entries[1].cmd);
+}
+
+test "logRemove: absent seq and missing log are no-op; subsequent append is seq 4" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    _ = try logAppend(gpa, fix.state, "/c", "fx-a", "{}", &.{});
+    _ = try logAppend(gpa, fix.state, "/c", "fx-b", "{}", &.{});
+    // Removing a seq that is not present changes nothing.
+    try logRemove(gpa, fix.state, 99);
+    const e1 = try logReadAll(gpa, fix.state);
+    defer freeLogEntries(gpa, e1);
+    try testing.expectEqual(@as(usize, 2), e1.len);
+
+    // Remove the FIRST entry (seq 1), leaving seq 2; the next append is seq 3.
+    try logRemove(gpa, fix.state, 1);
+    const e2 = try logReadAll(gpa, fix.state);
+    defer freeLogEntries(gpa, e2);
+    try testing.expectEqual(@as(usize, 1), e2.len);
+    try testing.expectEqual(@as(u64, 2), e2[0].seq);
+    const s3 = try logAppend(gpa, fix.state, "/c", "fx-c", "{}", &.{});
+    try testing.expectEqual(@as(u64, 3), s3);
+
+    // A fresh state dir (no log) -> remove is a no-op.
+    const fix2 = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix2.state);
+        gpa.free(fix2.state);
+        _ = rmdir(fix2.tmp.ptr);
+        gpa.free(fix2.tmp);
+    }
+    try logRemove(gpa, fix2.state, 1);
 }
 
 test "logReadAll on a fresh (missing) state dir returns empty" {
