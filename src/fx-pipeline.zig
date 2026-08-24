@@ -163,7 +163,12 @@ pub fn resetArena() void {
 /// Return a builtin command by name, parsing its signature into the arena.
 /// The returned Command's Terms are valid until the next resetArena().
 /// `find |> grep` type-checks (rows width-subtyping); `ls |> find` (rows vs
-/// single) and `ls |> grep` (missing `path` field) do not.
+/// single), `ls |> grep` (missing `path` field), `ls |> wc` (rows vs lines)
+/// and `cat |> sort` (bytes vs lines) do not.
+///
+/// Signatures (Lens 3, 2026-08-24 batch): find single->rows; grep rows->lines;
+/// ls single->rows; cat bytes->bytes; head/tail/sort/uniq lines->lines; wc
+/// lines->single {lines,words,bytes}; du single {path} -> rows {path,bytes}.
 pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
@@ -181,6 +186,37 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         const in_t = try parseType("{ path : Text }", gpa);
         const out_t = try parseType("{ name : Text, size : Natural, mode : Natural }", gpa);
         return .{ .name = "ls", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
+    }
+    // cat:   bytes -> bytes (honest-cut content-addressable component)
+    if (std.mem.eql(u8, name, "cat")) {
+        return .{ .name = "cat", .input = .{ .tag = .bytes }, .output = .{ .tag = .bytes } };
+    }
+    // head:  lines -> lines
+    if (std.mem.eql(u8, name, "head")) {
+        return .{ .name = "head", .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
+    }
+    // tail:  lines -> lines
+    if (std.mem.eql(u8, name, "tail")) {
+        return .{ .name = "tail", .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
+    }
+    // sort:  lines -> lines
+    if (std.mem.eql(u8, name, "sort")) {
+        return .{ .name = "sort", .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
+    }
+    // uniq:  lines -> lines
+    if (std.mem.eql(u8, name, "uniq")) {
+        return .{ .name = "uniq", .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
+    }
+    // wc:    lines -> single { lines, words, bytes }
+    if (std.mem.eql(u8, name, "wc")) {
+        const out_t = try parseType("{ lines : Natural, words : Natural, bytes : Natural }", gpa);
+        return .{ .name = "wc", .input = .{ .tag = .lines }, .output = Shape.single(out_t) };
+    }
+    // du:    single { path : Text } -> rows { path, bytes }
+    if (std.mem.eql(u8, name, "du")) {
+        const in_t = try parseType("{ path : Text }", gpa);
+        const out_t = try parseType("{ path : Text, bytes : Natural }", gpa);
+        return .{ .name = "du", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     return error.UnknownCommand;
 }
@@ -260,4 +296,33 @@ test "builtin registry wiring is type-correct" {
     // mismatched pipeline: ls |> find  (rows vs single)
     const ls = Command{ .name = "ls", .input = Shape.single(singleType("{ path : Text }")), .output = Shape.rows(recType("{ name : Text, size : Natural, mode : Natural }")) };
     try t.expectError(error.ShapeMismatch, compose(ls, find));
+}
+
+test "registry: grep |> sort |> uniq |> wc composes (Lens 3 batch)" {
+    // grep rows->lines, sort/uniq lines->lines, wc lines->single.
+    const grep = try builtin("grep", t.allocator);
+    const sort = try builtin("sort", t.allocator);
+    const uniq = try builtin("uniq", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try compose(grep, sort);
+    try compose(sort, uniq);
+    try compose(uniq, wc);
+}
+
+test "registry: ls |> wc rejected (rows vs lines)" {
+    const ls = try builtin("ls", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(ls, wc));
+}
+
+test "registry: cat |> sort rejected (bytes vs lines)" {
+    const cat = try builtin("cat", t.allocator);
+    const sort = try builtin("sort", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(cat, sort));
+}
+
+test "registry: du |> cat rejected (rows vs bytes)" {
+    const du = try builtin("du", t.allocator);
+    const cat = try builtin("cat", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(du, cat));
 }

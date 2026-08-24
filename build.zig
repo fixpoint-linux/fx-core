@@ -135,4 +135,113 @@ pub fn build(b: *std.Build) void {
     const union_tests = b.addTest(.{ .root_module = union_test_mod });
     const run_union_tests = b.addRunArtifact(union_tests);
     test_step.dependOn(&run_union_tests.step);
+
+    // -----------------------------------------------------------------------
+    // Wave-1 batch: the 8 remaining roadmap coreutils.  Table-driven via
+    // `inline for` over a comptime array — one addExecutable + installArtifact
+    // + run step + test block per command.  All share the dhall module facade;
+    // the 5 datalog-backed commands (ls/du/sort/uniq/wc) additionally link
+    // libdatalog.so; cat/head/tail are pure (honest cut) and link libc only.
+    // Existing find/grep/diff/pipeline/union blocks above are untouched.
+    // -----------------------------------------------------------------------
+    const cmds = [_]struct { name: []const u8, datalog: bool }{
+        .{ .name = "fx-ls", .datalog = true },
+        .{ .name = "fx-du", .datalog = true },
+        .{ .name = "fx-sort", .datalog = true },
+        .{ .name = "fx-uniq", .datalog = true },
+        .{ .name = "fx-wc", .datalog = true },
+        .{ .name = "fx-cat", .datalog = false },
+        .{ .name = "fx-head", .datalog = false },
+        .{ .name = "fx-tail", .datalog = false },
+    };
+    inline for (cmds) |c| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{c.name});
+        const cmd_exe = b.addExecutable(.{
+            .name = c.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dhall", .module = dhall_mod },
+                },
+            }),
+        });
+        if (c.datalog) {
+            // Link libdatalog.so (the still-C datalog core) via C-FFI.
+            cmd_exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
+            cmd_exe.root_module.linkSystemLibrary("datalog", .{});
+            cmd_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+        }
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{c.name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ c.name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
+
+    // -----------------------------------------------------------------------
+    // fxmut batch: the 7 mutation coreutils (cp/mv/rm/mkdir/rmdir/touch/ln)
+    // + the fx-log reader, over the shared fx-caslog module (content-addressed
+    // store + global derivation log — Option B).  Table-driven exactly like the
+    // wave-1 batch above; NO mutator links libdatalog (caslog is pure libc +
+    // dhall-for-sha256).  Each command imports BOTH the dhall facade (typed
+    // args) and caslog (CAS + logAppend/logReadAll + the shared dirent/sys-stat
+    // @cImport surface).
+    // -----------------------------------------------------------------------
+    const caslog_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-caslog.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+        },
+    });
+
+    const mut_cmds = [_][]const u8{
+        "fx-cp", "fx-mv", "fx-rm", "fx-mkdir", "fx-rmdir", "fx-touch", "fx-ln", "fx-log",
+    };
+    inline for (mut_cmds) |name| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const cmd_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dhall", .module = dhall_mod },
+                    .{ .name = "caslog", .module = caslog_mod },
+                },
+            }),
+        });
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
+
+    // The caslog module's OWN test blocks (module tests do not auto-run from
+    // dependents — same wiring as pipeline_tests above).
+    const caslog_tests = b.addTest(.{ .root_module = caslog_mod });
+    const run_caslog_tests = b.addRunArtifact(caslog_tests);
+    test_step.dependOn(&run_caslog_tests.step);
 }
