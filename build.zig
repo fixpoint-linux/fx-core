@@ -245,4 +245,42 @@ pub fn build(b: *std.Build) void {
     const caslog_tests = b.addTest(.{ .root_module = caslog_mod });
     const run_caslog_tests = b.addRunArtifact(caslog_tests);
     test_step.dependOn(&run_caslog_tests.step);
+
+    // -----------------------------------------------------------------------
+    // fxchecksum batch: the 8 pure read-only checksum coreutils (md5sum,
+    // sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, cksum, sum).
+    // Table-driven exactly like the wave-1 pure block; ALL are pure (libc +
+    // the dhall module only — no datalog, no caslog linkage).
+    // -----------------------------------------------------------------------
+    const check_cmds = [_][]const u8{
+        "fx-md5sum",    "fx-sha1sum",   "fx-sha224sum", "fx-sha256sum",
+        "fx-sha384sum", "fx-sha512sum", "fx-cksum",     "fx-sum",
+    };
+    inline for (check_cmds) |name| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const cmd_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dhall", .module = dhall_mod },
+                },
+            }),
+        });
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
 }
