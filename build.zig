@@ -31,6 +31,19 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // fx-wire: the Lens 3 wire/codec layer (pure — no I/O, no CAS).  Imports
+    // dhall (structural type equality for canonical field order) and pipeline
+    // (parseType, used by the codec tests to derive declared field order).
+    const wire_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-wire.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "fx-find",
         .root_module = b.createModule(.{
@@ -113,17 +126,26 @@ pub fn build(b: *std.Build) void {
     // The Lens 3 pipeline type-checker's pure-logic test blocks.
     const pipeline_tests = b.addTest(.{ .root_module = pipeline_mod });
     const run_pipeline_tests = b.addRunArtifact(pipeline_tests);
+    // The Lens 3 wire/codec layer's test blocks (canonical JSON, T1, width subtyping).
+    const wire_tests = b.addTest(.{ .root_module = wire_mod });
+    const run_wire_tests = b.addRunArtifact(wire_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_grep_tests.step);
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_pipeline_tests.step);
+    test_step.dependOn(&run_wire_tests.step);
 
     // Fast feedback loop for JUST the Lens 3 pipeline type-checker (avoids the
     // hour-long datalog-dafsa test run).  `zig build run-pipeline-test`.
     const pipeline_test_step = b.step("run-pipeline-test", "Run fx-pipeline type-checker tests only");
     pipeline_test_step.dependOn(&run_pipeline_tests.step);
+
+    // Fast feedback loop for the fx-compose ENGINE tests (wire codec + eval
+    // orchestration).  `zig build run-compose-test`.
+    const compose_test_step = b.step("run-compose-test", "Run fx-compose engine tests (wire + eval)");
+    compose_test_step.dependOn(&run_wire_tests.step);
 
     // Also run the dhall-c core's own src test blocks (ast shift/subst/alpha_eq,
     // bignum, arena, sha256, ssrf) plus the nullary-union regression suite.
@@ -211,6 +233,61 @@ pub fn build(b: *std.Build) void {
             .{ .name = "dhall", .module = dhall_mod },
         },
     });
+
+    // fx-eval: the Lens 3 typed pipeline ENGINE (run/replay/converge + native
+    // find/grep + exec dispatch to real fx-* binaries).  Imports caslog (CAS),
+    // pipeline (shapes), wire (codec) and dhall (sha256 via caslog).
+    const eval_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-eval.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "caslog", .module = caslog_mod },
+            .{ .name = "fx-pipeline", .module = pipeline_mod },
+            .{ .name = "fx-wire", .module = wire_mod },
+        },
+    });
+
+    // The fx-eval engine's test blocks (native find/grep, run/replay/converge).
+    const eval_tests = b.addTest(.{ .root_module = eval_mod });
+    const run_eval_tests = b.addRunArtifact(eval_tests);
+    test_step.dependOn(&run_eval_tests.step);
+    compose_test_step.dependOn(&run_eval_tests.step);
+
+    // fx-compose: the typed pipeline ENGINE frontend executable.  Imports all of
+    // dhall + caslog + pipeline + wire + eval; links libc (exec dispatch shells
+    // to real fx-* binaries).
+    const compose_exe = b.addExecutable(.{
+        .name = "fx-compose",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fx-compose.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "dhall", .module = dhall_mod },
+                .{ .name = "caslog", .module = caslog_mod },
+                .{ .name = "fx-pipeline", .module = pipeline_mod },
+                .{ .name = "fx-wire", .module = wire_mod },
+                .{ .name = "fx-eval", .module = eval_mod },
+            },
+        }),
+    });
+    compose_exe.root_module.link_libc = true;
+    b.installArtifact(compose_exe);
+    const compose_run_step = b.step("run-compose", "Run fx-compose");
+    const compose_run = b.addRunArtifact(compose_exe);
+    compose_run_step.dependOn(&compose_run.step);
+    if (b.args) |args| compose_run.addArgs(args);
+
+    // The fx-compose frontend's test blocks (state-dir resolution ownership,
+    // manifest parse round-trip) — previously unwired (no addTest), which hid
+    // the B1 UAF.
+    const compose_tests = b.addTest(.{ .root_module = compose_exe.root_module });
+    const run_compose_tests = b.addRunArtifact(compose_tests);
+    test_step.dependOn(&run_compose_tests.step);
+    compose_test_step.dependOn(&run_compose_tests.step);
 
     const mut_cmds = [_][]const u8{
         "fx-cp", "fx-mv", "fx-rm", "fx-mkdir", "fx-rmdir", "fx-touch", "fx-ln", "fx-log", "fx-undo",
