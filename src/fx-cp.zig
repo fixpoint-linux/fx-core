@@ -56,6 +56,7 @@ extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn unlink(path: [*:0]const u8) c_int;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+extern fn fchmod(fd: c_int, mode: c_uint) c_int;
 extern fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 
 const CopyErr = error{ BadPath, NoMem, OpenFailed, ReadFailed, WriteFailed, OmittingDir, MissingSrc, CopyFailed };
@@ -420,6 +421,9 @@ fn writeFileUnder(gpa: Allocator, base: []const u8, name: []const u8, contents: 
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{p}) catch return error.BadPath;
     const fd = open(z.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
     if (fd < 0) return error.OpenFail;
+    // open()'s mode is masked by the process umask (NOT 022 in all shells);
+    // force the exact mode so the fixture is deterministic regardless of umask.
+    _ = fchmod(fd, 0o644);
     _ = write(fd, contents.ptr, contents.len);
     _ = close(fd);
 }
