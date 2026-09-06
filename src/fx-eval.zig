@@ -798,6 +798,65 @@ test "replay re-derives identical hashes; converge proves sort idempotence" {
     try testing.expect(div == null);
 }
 
+test "replay rejects a tampered manifest shape_out (ShapeMismatch)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+    var dzbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&dzbuf, "{s}/data", .{fix.tmp}) catch unreachable;
+    _ = mkdir(data_dir.ptr, 0o755);
+    var z: [std.posix.PATH_MAX]u8 = undefined;
+    const a_path = std.fmt.bufPrintZ(&z, "{s}/data/a.txt", .{fix.tmp}) catch unreachable;
+    try writeTestFile(a_path, "x\ny\n");
+
+    const stages = [_]Stage{
+        .{ .name = "find", .args = data_dir, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "grep", .args = "x", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+    };
+    const report = try run(&stages, "", fix.state, null, gpa, testing.io);
+    defer {
+        for (report.stages) |s| {
+            gpa.free(s.in_hash);
+            gpa.free(s.out_hash);
+        }
+        gpa.free(report.stages);
+        gpa.free(report.final_hash);
+        gpa.free(report.input_hash);
+    }
+
+    // same name/args/hashes, but stage 0's recorded shape_out ("rows" for
+    // find) replaced with a valid tag that contradicts the declared output.
+    var tampered_stages = [_]StageRecord{
+        .{
+            .index = report.stages[0].index,
+            .name = report.stages[0].name,
+            .args = report.stages[0].args,
+            .shape_out = "bytes",
+            .in_hash = report.stages[0].in_hash,
+            .out_hash = report.stages[0].out_hash,
+        },
+        .{
+            .index = report.stages[1].index,
+            .name = report.stages[1].name,
+            .args = report.stages[1].args,
+            .shape_out = report.stages[1].shape_out,
+            .in_hash = report.stages[1].in_hash,
+            .out_hash = report.stages[1].out_hash,
+        },
+    };
+    const tampered = RunReport{
+        .stages = &tampered_stages,
+        .final_hash = report.final_hash,
+        .input_hash = report.input_hash,
+    };
+    const err = replay(&tampered, fix.state, null, gpa, testing.io);
+    try testing.expectError(error.ShapeMismatch, err);
+}
 
 test "native find emits deterministic sorted JSONL rows" {
     const gpa = testing.allocator;
