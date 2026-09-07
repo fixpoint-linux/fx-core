@@ -182,7 +182,10 @@ pub fn resetArena() void {
 /// bytes->single {checksum,blocks}; basename/dirname/realpath single Text ->
 /// single Text (the bare-Text single VALUE wire form feeds the scalar PATH
 /// operand); echo/seq none -> lines (SOURCE generators — no pipeline input;
-/// they can only sit at position 0, enforced by shapeCompatible's .none arm).
+/// they can only sit at position 0, enforced by shapeCompatible's .none arm);
+/// paste/comm lines -> lines (TWO-FILE — the stage args are the SECOND FILE
+/// PATH verbatim, the pipeline input rides the CAS as FILE1; PATH2 is
+/// live-read at run AND replay, the find/ls/du live-operand caveat).
 pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
@@ -285,6 +288,15 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         std.mem.eql(u8, name, "seq"))
     {
         return .{ .name = name, .input = .{ .tag = .none }, .output = .{ .tag = .lines } };
+    }
+    // paste/comm: lines -> lines — TWO-FILE stages.  The pipeline input rides
+    // the CAS as FILE1; the stage args are the SECOND FILE PATH verbatim
+    // (live-read at run AND replay — the accepted find/ls/du live-operand
+    // caveat: a changed PATH2 diverges replay loudly, an absent one fails).
+    if (std.mem.eql(u8, name, "paste") or
+        std.mem.eql(u8, name, "comm"))
+    {
+        return .{ .name = name, .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
     }
     return error.UnknownCommand;
 }
@@ -506,4 +518,25 @@ test "registry: seq |> wc composes" {
 
 test "registry: yes is not a builtin (unbounded output is not internable)" {
     try t.expectError(error.UnknownCommand, builtin("yes", t.allocator));
+}
+
+test "registry: paste/comm are lines -> lines two-file stages" {
+    // a two-file stage sits fine mid-pipeline: sort |> paste |> wc and
+    // echo |> paste (both sides lines)
+    const sort = try builtin("sort", t.allocator);
+    const paste = try builtin("paste", t.allocator);
+    try compose(sort, paste);
+    const wc = try builtin("wc", t.allocator);
+    try compose(paste, wc);
+    const echo = try builtin("echo", t.allocator);
+    try compose(echo, paste);
+    const comm = try builtin("comm", t.allocator);
+    try compose(sort, comm);
+    // but their lines output feeds no operand/rows consumer (paste |> find)
+    const find = try builtin("find", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(paste, find));
+    try t.expectError(error.ShapeMismatch, compose(comm, find));
+    // ...nor can a generator consume them (a two-file stage is never a source)
+    const seq = try builtin("seq", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(comm, seq));
 }

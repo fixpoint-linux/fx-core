@@ -323,6 +323,14 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > `du |> grep` runs end-to-end, not just type-checks. Checksum stages re-emit
 > the typed single without the state-dir-dependent filename token (the same
 > trap as `wc`).
+>
+> **Registry note (2026-09, Lens-3 generators + two-file):** the registry now
+> also carries `echo`/`seq` `none`→`lines` (SOURCE stages — the `.none` input
+> kind; valid at position 0 only) and `paste`/`comm` `lines`→`lines` (TWO-FILE
+> stages — the stage args are the second file path, live-read at run AND
+> replay, the `find`/`ls`/`du` live-operand caveat).  `sort |> paste |> wc`
+> and `seq:3 |> paste:/tmp/b |> sort` type-check; `paste |> find` (lines vs
+> rows) and `sort |> seq` (lines vs none) are rejected with `ShapeMismatch`.
 
 **Determinism as proof, not hope.** Replaying a pipeline re-runs each stage and
 compares the produced intermediate against the recorded sha256. A divergence is a
@@ -375,10 +383,28 @@ its own output is a no-op; this is what composes with the journal's roll-forward
   -a/-m/-d/-t` are out of scope; `mkdir -m` is out of scope (mode is
   `0777 & ~umask`, recorded as the post-create mode). Each is documented as a
   follow-up rather than silently half-shipped.
-- **fx-compose stage cuts (v1, 2026-08-24):** `paste`/`comm` are out (two-file
+- **fx-compose stage cuts (v1, 2026-08-24):** `seq`/`echo`/`yes` were out
+  (output generators — no input shape) and `paste`/`comm` were out (two-file
   semantics — a second live-path operand passed as stage args breaks hermetic
-  replay); `seq`/`echo`/`yes` are out (output generators — no input shape);
-  `basename`/`dirname`/`realpath` were deferred (they need a single-`Text`
+  replay).
+  **Resolution (2026-09, Lens-3):** `seq`/`echo` shipped via a fifth input
+  kind `.none` (source) — `echo`/`echo:TEXT` (args = one verbatim operand)
+  and `seq:5` / `seq:1 2 9` / `seq:{ last = 5, ... }` (args whitespace-split
+  into 1-3 integer operands, or one Dhall record) emit `lines` and are valid
+  only at position 0 (a `.none` input matches no producer output).  `yes`
+  stays cut: unbounded output is not an internable CAS value — it needs a
+  streaming model or a NEW bounded stage name, not an overload of `yes`.
+  `paste`/`comm` shipped via the live-second-path operand: the stage args ARE
+  the second file path (`paste:/tmp/b.txt`, `comm:b-sorted.txt`), the
+  pipeline input rides the CAS as FILE1, and PATH2 is live-read at run AND
+  replay — exactly the already-accepted `find`/`ls`/`du` live-operand caveat
+  (a changed PATH2 diverges replay loudly, an absent one fails with
+  StageFailed; `comm`'s PATH2 must be pre-sorted by the caller — the naive
+  merge stays deterministic either way).  Flags (`paste -d/-s`, `comm
+  -1/-2/-3`) remain cut — the single-string stage-arg DSL has no flag
+  grammar; the full hermetic fix, a two-input join DAG with both operands
+  CAS-interned, stays deferred.  `basename`/`dirname`/`realpath` were
+  deferred (they need a single-`Text`
   *value* wire form to feed a scalar operand — a wire gap, not a registry
   rejection) — **resolved later in the batch:** the bare-Text single VALUE
   wire form shipped (one canonical JSON string + LF, the same `writeString`

@@ -163,6 +163,8 @@ pub fn dispatchTable() []const DispatchEntry {
         .{ .name = "expand", .dispatch = .{ .exec = .{ .binary = "expand" } }, .idempotent = true },
         .{ .name = "echo", .dispatch = .{ .exec = .{ .binary = "echo" } }, .idempotent = false },
         .{ .name = "seq", .dispatch = .{ .exec = .{ .binary = "seq" } }, .idempotent = false },
+        .{ .name = "paste", .dispatch = .{ .exec = .{ .binary = "paste" } }, .idempotent = false },
+        .{ .name = "comm", .dispatch = .{ .exec = .{ .binary = "comm" } }, .idempotent = false },
         .{ .name = "cksum", .dispatch = .{ .exec = .{ .binary = "cksum" } }, .idempotent = false },
         .{ .name = "sha256sum", .dispatch = .{ .exec = .{ .binary = "sha256sum" } }, .idempotent = false },
         .{ .name = "md5sum", .dispatch = .{ .exec = .{ .binary = "md5sum" } }, .idempotent = false },
@@ -476,6 +478,12 @@ fn dispatchStage(
 ///     '{' passes verbatim as one operand (fx-seq's Dhall-record form); empty
 ///     seq args fail loudly before the spawn (a source with nothing to
 ///     generate has no invented default).
+///   TWO-FILE stages (paste/comm): [bin, cas_path, PATH2] — the prior stage's
+///     CAS blob path is FILE1 and the stage args are the SECOND FILE PATH
+///     verbatim (live-read at run AND replay — the find/ls/du live-operand
+///     caveat: a changed PATH2 diverges replay loudly, an absent one fails).
+///     Empty args fail loudly before the spawn: the second operand is not
+///     optional.  Output is raw lines (no filename-token postprocess).
 ///   file-operand stages: [bin, flags..., cas_path] with the prior stage's CAS
 ///     blob path as the FILE operand.  Per-binary flags: head/tail -n N
 ///     (default 10); nl -b <args> and expand -t <args> when args is non-empty.
@@ -498,6 +506,13 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     // generator stages (echo/seq) are SOURCES: no pipeline input, no CAS blob
     const generator_stage = std.mem.eql(u8, binary, "echo") or
         std.mem.eql(u8, binary, "seq");
+
+    // two-file stages (paste/comm): the prior stage's CAS blob is FILE1, the
+    // stage args are the SECOND FILE PATH verbatim (live-read at run AND
+    // replay — the accepted find/ls/du live-operand caveat).  Unlike the
+    // stage categories above they DO materialize the CAS blob.
+    const two_file_stage = std.mem.eql(u8, binary, "paste") or
+        std.mem.eql(u8, binary, "comm");
 
     var pb: [std.posix.PATH_MAX]u8 = undefined;
     var cas_path: ?[:0]const u8 = null;
@@ -591,6 +606,16 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
                 }
             }
         }
+    } else if (two_file_stage) {
+        // fast-fail on empty args before the spawn: PATH2 is not optional
+        // (mirrors the seq/dirname pre-spawn rejections above) — without it
+        // the child would misparse its operands or read stdin
+        if (stage.args.len == 0) {
+            std.debug.print("fx-eval: {s}: stage args required (second file operand)\n", .{binary});
+            return error.StageFailed;
+        }
+        argv.append(ctx.gpa, cas_path.?) catch return error.NoMem; // FILE1
+        argv.append(ctx.gpa, stage.args) catch return error.NoMem; // PATH2
     } else {
         var cnt: [64]u8 = undefined;
         if (std.mem.eql(u8, binary, "head") or std.mem.eql(u8, binary, "tail")) {
@@ -1794,6 +1819,133 @@ test "exec dispatch: echo |> wc end-to-end + seq |> head replay (hermetic fakes)
 
         const div = try replay(&rep, fix.state, bin_dir, gpa, testing.io);
         try testing.expect(div == null);
+    }
+}
+
+test "exec dispatch: paste/comm two-file argv pin (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    // the fakes pin argv EXACTLY (argc + $2) and then `cat "$1"` so the test
+    // also pins that the CAS blob content IS the prior stage's output: FILE1
+    // is the materialized input blob, PATH2 rides the stage args verbatim.
+    var p2buf: [std.posix.PATH_MAX]u8 = undefined;
+    const path2 = std.fmt.bufPrintZ(&p2buf, "{s}/b.txt", .{fix.tmp}) catch unreachable;
+    try writeTestFile(path2, "x\ny\n");
+    try writeFakeBin(bin_dir, "paste",
+        \\#!/bin/sh
+        \\printf 'n:%s\n' "$#"
+        \\printf 'p2:%s\n' "$2"
+        \\cat "$1"
+        \\
+    );
+    try writeFakeBin(bin_dir, "comm",
+        \\#!/bin/sh
+        \\printf 'c:%s\n' "$#"
+        \\printf 'q2:%s\n' "$2"
+        \\cat "$1"
+        \\
+    );
+
+    for ([_][]const u8{ "paste", "comm" }) |name| {
+        // [fx-paste, cas_path, PATH2] / [fx-comm, cas_path, PATH2] — argc 2,
+        // $2 == PATH2 verbatim, blob content == the pipeline input
+        const want = if (std.mem.eql(u8, name, "paste"))
+            try std.fmt.allocPrint(gpa, "n:2\np2:{s}/b.txt\na\nb\n", .{fix.tmp})
+        else
+            try std.fmt.allocPrint(gpa, "c:2\nq2:{s}/b.txt\na\nb\n", .{fix.tmp});
+        defer gpa.free(want);
+
+        const stages = [_]Stage{.{ .name = name, .args = path2, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const rep = try run(&stages, "a\nb\n", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(want, out);
+    }
+
+    // the second operand is not optional: empty args fail loudly pre-spawn
+    {
+        const stages = [_]Stage{.{ .name = "paste", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        try testing.expectError(error.StageFailed, run(&stages, "a\nb\n", fix.state, bin_dir, gpa, testing.io));
+    }
+    {
+        const stages = [_]Stage{.{ .name = "comm", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        try testing.expectError(error.StageFailed, run(&stages, "a\nb\n", fix.state, bin_dir, gpa, testing.io));
+    }
+}
+
+test "exec dispatch: seq |> paste |> head end-to-end + replay (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    // real-behaving paste fake: merges the first line of FILE1 (the prior
+    // stage's CAS blob) with the first line of PATH2 — proving BOTH operands
+    // are live-read.  seq streams 1..3; head prints the first $2 lines of $3.
+    var p2buf: [std.posix.PATH_MAX]u8 = undefined;
+    const path2 = std.fmt.bufPrintZ(&p2buf, "{s}/b.txt", .{fix.tmp}) catch unreachable;
+    try writeTestFile(path2, "x\ny\n");
+    try writeFakeBin(bin_dir, "seq", "#!/bin/sh\nprintf '1\\n2\\n3\\n'\n");
+    try writeFakeBin(bin_dir, "paste",
+        \\#!/bin/sh
+        \\l1=$(sed -n 1p "$1")
+        \\l2=$(sed -n 1p "$2")
+        \\printf '%s\t%s\n' "$l1" "$l2"
+        \\
+    );
+    try writeFakeBin(bin_dir, "head",
+        \\#!/bin/sh
+        \\sed -n "1,${2}p" "$3"
+        \\
+    );
+
+    {
+        const stages = [_]Stage{
+            .{ .name = "seq", .args = "3", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "paste", .args = path2, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "head", .args = "1", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
+        };
+        const rep = try run(&stages, "", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const paste_out = try caslog.casGet(gpa, fix.state, rep.stages[1].out_hash);
+        defer gpa.free(paste_out);
+        try testing.expectEqualStrings("1\tx\n", paste_out);
+        const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(final);
+        try testing.expectEqualStrings("1\tx\n", final);
+
+        // replay re-derives identically (null divergence) — PATH2 unchanged
+        const div = try replay(&rep, fix.state, bin_dir, gpa, testing.io);
+        try testing.expect(div == null);
+
+        // the live-operand caveat, pinned: change PATH2 and the divergence is
+        // LOUD (stage 1), never silent
+        try writeTestFile(path2, "CHANGED\n");
+        const div2 = try replay(&rep, fix.state, bin_dir, gpa, testing.io);
+        try testing.expect(div2 != null);
+        if (div2) |d| {
+            try testing.expectEqual(@as(usize, 1), d.stage);
+            gpa.free(d.recorded);
+            gpa.free(d.actual);
+        }
     }
 }
 

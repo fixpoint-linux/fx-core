@@ -10,6 +10,12 @@
 // at position 0 (a shape .none input matches no producer output).  A
 // source-first pipeline reads no --input/--text/stdin at all.
 //
+// Two-file stages — `paste` and `comm`: the STAGE ARGS are the SECOND FILE
+// PATH verbatim (e.g. `paste:/tmp/b.txt`, `comm:b-sorted.txt`); the pipeline
+// input rides the CAS as FILE1.  PATH2 is live-read at run AND replay (the
+// same caveat as the find/ls/du operand stages: a changed PATH2 diverges
+// replay loudly, an absent one fails with StageFailed — never silent).
+//
 // --text VALUE: the initial input is the bare-Text single VALUE (canonical
 //   JSON string, wire.encodeSingleText) instead of --input/stdin — the entry
 //   point for single-Text stage chains (basename/dirname/realpath).  Mutually
@@ -394,10 +400,17 @@ fn runConverge(
 // Manifest serialization
 // ---------------------------------------------------------------------------
 
-/// Serialize a RunReport to manifest.jsonl (one JSON line per stage).
+/// Serialize a RunReport to manifest.jsonl (one JSON line per stage).  The
+/// FIRST line is a header carrying the run's INTERNED INITIAL-INPUT CAS hash
+/// (fx-eval.run's casPut of the raw input) — replay reads the initial input
+/// back from the CAS BY THAT HASH (#3).  A stage line's `in` field is the S1
+/// derivation hash (name+args+input), which is NOT a CAS key.
 fn manifestJson(gpa: Allocator, report: *const eval.RunReport) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
+    out.appendSlice(gpa, "{\"fx-pipe\":1,\"input\":\"") catch return error.NoMem;
+    out.appendSlice(gpa, report.input_hash) catch return error.NoMem;
+    out.appendSlice(gpa, "\"}\n") catch return error.NoMem;
     for (report.stages) |s| {
         out.append(gpa, '{') catch return error.NoMem;
         try appendJsonField(gpa, &out, "i", s.index);
@@ -477,9 +490,28 @@ fn writeAllFile(gpa: Allocator, path: [:0]const u8, bytes: []const u8) !void {
 fn loadManifest(gpa: Allocator, path: []const u8) !eval.RunReport {
     const bytes = try readFilePath(gpa, path);
     defer gpa.free(bytes);
+    return parseManifest(gpa, bytes);
+}
 
+/// One `"key":"value"` string field out of a JSON line (owned value), or null
+/// when absent — used for the header line (stage lines go through
+/// parseManifestLine).
+fn manifestStringField(gpa: Allocator, line: []const u8, key: []const u8) !?[]u8 {
+    var pat: [64]u8 = undefined;
+    const p = std.fmt.bufPrint(&pat, "\"{s}\":\"", .{key}) catch return error.BadManifest;
+    const at = std.mem.indexOf(u8, line, p) orelse return null;
+    const parsed = try unescapeJsonString(gpa, line, at + p.len);
+    return parsed.value;
+}
+
+fn parseManifest(gpa: Allocator, bytes: []const u8) !eval.RunReport {
     var stages = std.ArrayList(eval.StageRecord).empty;
     errdefer stages.deinit(gpa);
+
+    // the header line ({"fx-pipe":1,...}) carries the run's interned
+    // initial-input CAS hash — the key replay casGets the input back from
+    var header_input: ?[]u8 = null;
+    errdefer if (header_input) |h| gpa.free(h);
 
     var line_start: usize = 0;
     var pos: usize = 0;
@@ -487,7 +519,12 @@ fn loadManifest(gpa: Allocator, path: []const u8) !eval.RunReport {
         if (pos == bytes.len or bytes[pos] == '\n') {
             const line = bytes[line_start..pos];
             if (line.len > 0) {
-                try stages.append(gpa, try parseManifestLine(gpa, line));
+                if (std.mem.startsWith(u8, line, "{\"fx-pipe\":")) {
+                    if (header_input != null) return error.BadManifest;
+                    header_input = (try manifestStringField(gpa, line, "input")) orelse return error.BadManifest;
+                } else {
+                    try stages.append(gpa, try parseManifestLine(gpa, line));
+                }
             }
             line_start = pos + 1;
         }
@@ -496,7 +533,15 @@ fn loadManifest(gpa: Allocator, path: []const u8) !eval.RunReport {
     // Owned copies even for an empty manifest — runReplay frees these, and a
     // "" literal would be freed as a non-heap pointer (empty-manifest crash).
     const final_hash = if (list.len > 0) try gpa.dupe(u8, list[list.len - 1].out_hash) else try gpa.dupe(u8, "");
-    const input_hash = if (list.len > 0) try gpa.dupe(u8, list[0].in_hash) else try gpa.dupe(u8, "");
+    // Pre-header manifests carried no input hash at all (stage 0's `in` is a
+    // derivation hash, not a CAS key — they were already un-replayable, dying
+    // in casGet); keep loading them unchanged rather than crashing.
+    const input_hash = if (header_input) |h|
+        h
+    else if (list.len > 0)
+        try gpa.dupe(u8, list[0].in_hash)
+    else
+        try gpa.dupe(u8, "");
     return .{ .stages = list, .final_hash = final_hash, .input_hash = input_hash };
 }
 
@@ -628,8 +673,10 @@ test "manifest parse round-trip: escaped args survive (S6)" {
     };
     const manifest = try manifestJson(gpa, &report);
     defer gpa.free(manifest);
-    const nl = std.mem.indexOfScalar(u8, manifest, '\n').?;
-    const rec = try parseManifestLine(gpa, manifest[0..nl]);
+    // line 0 is the {"fx-pipe":1,...} header; the stage record is line 1
+    const nl0 = std.mem.indexOfScalar(u8, manifest, '\n').?;
+    const nl1 = std.mem.indexOfScalarPos(u8, manifest, nl0 + 1, '\n').?;
+    const rec = try parseManifestLine(gpa, manifest[nl0 + 1 .. nl1]);
     defer {
         gpa.free(rec.name);
         gpa.free(rec.args);
@@ -642,6 +689,53 @@ test "manifest parse round-trip: escaped args survive (S6)" {
     try testing.expectEqualStrings("lines", rec.shape_out);
     try testing.expectEqualStrings("aa", rec.in_hash);
     try testing.expectEqualStrings("bb", rec.out_hash);
+}
+
+fn freeLoadedReport(gpa: Allocator, rep: *const eval.RunReport) void {
+    for (rep.stages) |s| {
+        gpa.free(s.name);
+        gpa.free(s.args);
+        gpa.free(s.shape_out);
+        gpa.free(s.in_hash);
+        gpa.free(s.out_hash);
+    }
+    gpa.free(rep.stages);
+    gpa.free(rep.final_hash);
+    gpa.free(rep.input_hash);
+}
+
+test "manifest header carries the interned input CAS hash (replay's casGet key)" {
+    const gpa = testing.allocator;
+    // stage lines' `in` fields are S1 DERIVATION hashes (name+args+input),
+    // not CAS keys — the pre-2026-09 loader read stage 0's `in` as input_hash,
+    // so EVERY --replay died in casGet(Missing).  The header must win.
+    var stages_buf = [_]eval.StageRecord{
+        .{ .index = 0, .name = "sort", .args = "", .shape_out = "lines", .in_hash = "derive0", .out_hash = "mid" },
+        .{ .index = 1, .name = "head", .args = "1", .shape_out = "lines", .in_hash = "mid", .out_hash = "fin" },
+    };
+    const report = eval.RunReport{ .stages = &stages_buf, .final_hash = "fin", .input_hash = "cas0" };
+    const manifest = try manifestJson(gpa, &report);
+    defer gpa.free(manifest);
+    try testing.expect(std.mem.startsWith(u8, manifest, "{\"fx-pipe\":1,\"input\":\"cas0\"}\n"));
+
+    const loaded = try parseManifest(gpa, manifest);
+    defer freeLoadedReport(gpa, &loaded);
+    try testing.expectEqualStrings("cas0", loaded.input_hash);
+    try testing.expectEqual(@as(usize, 2), loaded.stages.len);
+    try testing.expectEqualStrings("sort", loaded.stages[0].name);
+    try testing.expectEqualStrings("fin", loaded.final_hash);
+}
+
+test "manifest without a header falls back to the legacy input-hash read" {
+    const gpa = testing.allocator;
+    // pre-header manifests carried no input hash (stage 0's `in` is a
+    // derivation hash, not a CAS key — already un-replayable); the loader
+    // keeps accepting them unchanged rather than crashing
+    const legacy = "{\"i\":0,\"name\":\"sort\",\"args\":\"\",\"shape\":\"lines\",\"in\":\"derive0\",\"out\":\"f1\"}\n";
+    const loaded = try parseManifest(gpa, legacy);
+    defer freeLoadedReport(gpa, &loaded);
+    try testing.expectEqualStrings("derive0", loaded.input_hash);
+    try testing.expectEqual(@as(usize, 1), loaded.stages.len);
 }
 
 test "cli parse: --text captures the value, --input unchanged" {
