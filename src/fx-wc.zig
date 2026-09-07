@@ -525,6 +525,41 @@ test "readFdAll round-trips bytes" {
 }
 
 // ---------------------------------------------------------------------------
+// Output line formatting
+// ---------------------------------------------------------------------------
+
+/// Format the output line: `<L> <W> <B>` plus the filename when one was given.
+/// Heap-allocated: the operand may be arbitrarily long (fx-compose passes
+/// state_dir/cas/<64hex> paths well past any fixed buffer), so a fixed
+/// bufPrint would truncate long names into a hard error.
+fn formatLine(gpa: Allocator, c: WcCounts, filename: ?[]const u8) ![]u8 {
+    if (filename) |fn_|
+        return std.fmt.allocPrint(gpa, "{d} {d} {d} {s}\n", .{ c.lines, c.words, c.bytes, fn_ });
+    return std.fmt.allocPrint(gpa, "{d} {d} {d}\n", .{ c.lines, c.words, c.bytes });
+}
+
+test "formatLine no filename (stdin form)" {
+    const line = try formatLine(std.testing.allocator, .{ .lines = 0, .words = 0, .bytes = 0 }, null);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("0 0 0\n", line);
+}
+
+test "formatLine long filename exceeds any fixed buffer" {
+    // Regression: the line was formatted into a fixed [64]u8, so an operand
+    // whose path made the line longer than 64 bytes failed (fx-compose's
+    // state_dir/cas/<64hex> operands hit this on every wc stage).
+    const gpa = std.testing.allocator;
+    const name = "/tmp/g1/cas/" ++ "ab" ** 32; // 76 chars: line length 83 > 64
+    const c = WcCounts{ .lines = 4, .words = 7, .bytes = 34 };
+    const line = try formatLine(gpa, c, name);
+    defer gpa.free(line);
+    try std.testing.expect(line.len > 64);
+    const expect = try std.fmt.allocPrint(gpa, "4 7 34 {s}\n", .{name});
+    defer gpa.free(expect);
+    try std.testing.expectEqualStrings(expect, line);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -561,10 +596,7 @@ pub fn main(init: std.process.Init) !void {
     const c = try countsFromContent(gpa, content.items);
 
     const stdout_file = std.Io.File.stdout();
-    var wbuf: [64]u8 = undefined;
-    const line = if (filename) |fn_|
-        std.fmt.bufPrint(&wbuf, "{d} {d} {d} {s}\n", .{ c.lines, c.words, c.bytes, fn_ }) catch return error.Out
-    else
-        std.fmt.bufPrint(&wbuf, "{d} {d} {d}\n", .{ c.lines, c.words, c.bytes }) catch return error.Out;
+    const line = try formatLine(gpa, c, filename);
+    defer gpa.free(line);
     _ = std.Io.File.writeStreamingAll(stdout_file, init.io, line) catch return error.WriteFailed;
 }
