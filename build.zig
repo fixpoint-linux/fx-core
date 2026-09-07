@@ -483,4 +483,122 @@ pub fn build(b: *std.Build) void {
         const run_cmd_tests = b.addRunArtifact(cmd_tests);
         test_step.dependOn(&run_cmd_tests.step);
     }
+
+    // -----------------------------------------------------------------------
+    // provenance batch (wave-2 unit U6): the Lens-2 query coreutils
+    // fx-what ("what owns this rootfs path?") and fx-why ("why is this
+    // package in the store?") — thin CLI frontends over the fxstore
+    // provenance ENGINE, imported cross-repo with the module graph
+    // mirrored from the fxstore build.zig (unit U2 wiring): the engine's
+    // `@import("closure")`-style imports are MODULE imports, so each
+    // sibling unit (packageset/derivation/closure/build/store) is its own
+    // module rooted at the ../fxstore checkout, and they all bind THIS
+    // repo's dhall facade module — one shared dhall-c instance per binary
+    // (the engine never imports fxstore's main.zig, so there is no
+    // main() clash).
+    //
+    // The engine module carries the libdatalog linkage itself (include
+    // path + linkSystemLibrary + library path + libc, the fxstore
+    // prov_mod/linkDatalog wiring); link directives aggregate onto every
+    // artifact importing it, so the closure/store dl_* externs resolve
+    // from the same .so and the exes only import `provenance` by name.
+    //
+    // CONFLICT RULE: build.zig is touched ONLY by this block.  Wave-3
+    // units (U7 fx-what / U8 fx-why) edit their src/fx-*.zig files
+    // exclusively — the exes, run steps and test steps are pre-registered
+    // here so wave 3 never reopens the build graph.
+    // -----------------------------------------------------------------------
+    const packageset_mod = b.createModule(.{
+        .root_source_file = b.path("../fxstore/zig/src/packageset.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+        },
+    });
+    const derivation_mod = b.createModule(.{
+        .root_source_file = b.path("../fxstore/zig/src/derivation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "packageset", .module = packageset_mod },
+        },
+    });
+    const closure_mod = b.createModule(.{
+        .root_source_file = b.path("../fxstore/zig/src/closure.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+        },
+    });
+    const fsbuild_mod = b.createModule(.{
+        .root_source_file = b.path("../fxstore/zig/src/build.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+        },
+    });
+    const store_mod = b.createModule(.{
+        .root_source_file = b.path("../fxstore/zig/src/store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+            .{ .name = "derivation", .module = derivation_mod },
+            .{ .name = "closure", .module = closure_mod },
+            .{ .name = "build", .module = fsbuild_mod },
+        },
+    });
+    const prov_mod = b.createModule(.{
+        .root_source_file = b.path("../fxstore/zig/src/provenance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+            .{ .name = "derivation", .module = derivation_mod },
+            .{ .name = "closure", .module = closure_mod },
+            .{ .name = "store", .module = store_mod },
+        },
+    });
+    prov_mod.addIncludePath(b.path("../datalog-dafsa/src"));
+    prov_mod.linkSystemLibrary("datalog", .{});
+    prov_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    const prov_cmds = [_][]const u8{ "fx-what", "fx-why" };
+    inline for (prov_cmds) |name| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const cmd_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "provenance", .module = prov_mod },
+                },
+            }),
+        });
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
 }
