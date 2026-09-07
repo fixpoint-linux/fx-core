@@ -1,8 +1,13 @@
 // fx-compose.zig — fx-compose Lens 3: the typed pipeline ENGINE frontend (CLI).
 //
 // argv DSL:
-//   fx-compose [--input FILE] [--state DIR] [--replay MANIFEST] [--converge] STAGE [STAGE ...]
+//   fx-compose [--input FILE | --text VALUE] [--state DIR] [--replay MANIFEST] [--converge] STAGE [STAGE ...]
 //   STAGE = `name` or `name:arg`  (e.g. `head:3`, `find:.`, `grep:TODO`)
+//
+// --text VALUE: the initial input is the bare-Text single VALUE (canonical
+//   JSON string, wire.encodeSingleText) instead of --input/stdin — the entry
+//   point for single-Text stage chains (basename/dirname/realpath).  Mutually
+//   exclusive with --input.
 //
 // Flow: parse argv -> type-check the whole chain with fx-pipeline.compose ->
 // call fx-eval.run (native find/grep + exec dispatch to real fx-* binaries) ->
@@ -22,6 +27,7 @@ const dh = @import("dhall");
 const pipeline = @import("fx-pipeline.zig");
 const caslog = @import("fx-caslog.zig");
 const eval = @import("fx-eval.zig");
+const wire = @import("fx-wire.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -78,42 +84,64 @@ fn readStdinIfAvailable(gpa: Allocator) ![]u8 {
     return readAllFd(gpa, 0);
 }
 
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+/// Parsed CLI flags.  All slices are argv/arena-backed (the caller passes the
+/// arena allocator), so nothing here needs freeing by main.
+const CliArgs = struct {
+    input_file: ?[]const u8 = null,
+    text_value: ?[]const u8 = null,
+    state_dir_arg: []const u8 = "",
+    replay_path: ?[]const u8 = null,
+    converge_name: ?[]const u8 = null,
+    stage_tokens: []const []const u8 = &.{},
+};
 
-    var input_file: ?[]const u8 = null;
-    var state_dir_arg: []const u8 = "";
-    var replay_path: ?[]const u8 = null;
-    var converge_name: ?[]const u8 = null;
-    var stage_tokens = std.ArrayList([]const u8).empty;
-    defer stage_tokens.deinit(init.arena.allocator());
+fn parseCliArgs(gpa: Allocator, args: []const []const u8) !CliArgs {
+    var out = CliArgs{};
+    var stages = std.ArrayList([]const u8).empty;
+    errdefer stages.deinit(gpa);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--input") and i + 1 < args.len) {
             i += 1;
-            input_file = args[i];
+            out.input_file = args[i];
+        } else if (std.mem.eql(u8, a, "--text") and i + 1 < args.len) {
+            i += 1;
+            out.text_value = args[i];
         } else if (std.mem.eql(u8, a, "--state") and i + 1 < args.len) {
             i += 1;
-            state_dir_arg = args[i];
+            out.state_dir_arg = args[i];
         } else if (std.mem.eql(u8, a, "--replay") and i + 1 < args.len) {
             i += 1;
-            replay_path = args[i];
+            out.replay_path = args[i];
         } else if (std.mem.eql(u8, a, "--converge")) {
-            converge_name = "sort"; // v1: the idempotent stage to demonstrate
+            out.converge_name = "sort"; // v1: the idempotent stage to demonstrate
         } else {
-            stage_tokens.append(init.arena.allocator(), a) catch return error.NoMem;
+            stages.append(gpa, a) catch return error.NoMem;
         }
     }
+
+    if (out.input_file != null and out.text_value != null) {
+        std.debug.print("fx-compose: --input and --text are mutually exclusive\n", .{});
+        return error.BadFlags;
+    }
+    out.stage_tokens = stages.toOwnedSlice(gpa) catch return error.NoMem;
+    return out;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    const cli = try parseCliArgs(init.arena.allocator(), args);
 
     // Resolve the state dir to an OWNED slice.  Ownership is hoisted to the
     // caller (NOT a block-scoped defer): the resolved dir is used by
     // ensureDirs / eval.run / writePipeRecord below, so it must outlive the
     // resolve site (B1 UAF).
-    const state_dir = try resolveStateDirOwned(gpa, state_dir_arg);
+    const state_dir = try resolveStateDirOwned(gpa, cli.state_dir_arg);
     defer gpa.free(state_dir);
     try caslog.ensureDirs(state_dir);
 
@@ -121,17 +149,17 @@ pub fn main(init: std.process.Init) !void {
     const bin_dir = try resolveBinDir(gpa, io);
     defer if (bin_dir) |b| gpa.free(b);
 
-    if (replay_path) |rp| {
+    if (cli.replay_path) |rp| {
         return runReplay(gpa, io, state_dir, bin_dir, rp);
     }
-    if (converge_name) |cn| {
+    if (cli.converge_name) |cn| {
         return runConverge(gpa, io, state_dir, bin_dir, cn);
     }
-    if (stage_tokens.items.len == 0) {
-        std.debug.print("fx-compose: no stages given (usage: fx-compose [--input FILE] [--state DIR] STAGE [STAGE...])\n", .{});
+    if (cli.stage_tokens.len == 0) {
+        std.debug.print("fx-compose: no stages given (usage: fx-compose [--input FILE|--text VALUE] [--state DIR] STAGE [STAGE...])\n", .{});
         return error.NoStages;
     }
-    return runPipeline(gpa, io, state_dir, bin_dir, input_file, stage_tokens.items);
+    return runPipeline(gpa, io, state_dir, bin_dir, cli.input_file, cli.text_value, cli.stage_tokens);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +247,7 @@ fn runPipeline(
     state_dir: []const u8,
     bin_dir: ?[]u8,
     input_file: ?[]const u8,
+    text_value: ?[]const u8,
     tokens: []const []const u8,
 ) !void {
     const built = try buildAndCheck(gpa, tokens);
@@ -227,11 +256,14 @@ fn runPipeline(
         gpa.free(built.commands);
     }
 
-    // Read the initial input: from --input FILE else stdin (non-blocking — a
-    // generator-first pipeline like `find:.` supplies its own input and must
-    // not block on an empty terminal stdin).
+    // Read the initial input: the --text VALUE wire form (bare canonical JSON
+    // string, wire.encodeSingleText), else from --input FILE, else stdin
+    // (non-blocking — a generator-first pipeline like `find:.` supplies its
+    // own input and must not block on an empty terminal stdin).
     var input_bytes: []u8 = undefined;
-    if (input_file) |path| {
+    if (text_value) |tv| {
+        input_bytes = try wire.encodeSingleText(gpa, tv);
+    } else if (input_file) |path| {
         input_bytes = try readFilePath(gpa, path);
     } else {
         input_bytes = try readStdinIfAvailable(gpa);
@@ -594,4 +626,33 @@ test "manifest parse round-trip: escaped args survive (S6)" {
     try testing.expectEqualStrings("lines", rec.shape_out);
     try testing.expectEqualStrings("aa", rec.in_hash);
     try testing.expectEqualStrings("bb", rec.out_hash);
+}
+
+test "cli parse: --text captures the value, --input unchanged" {
+    const gpa = testing.allocator;
+    const parsed = try parseCliArgs(gpa, &.{ "fx-compose", "--text", "/usr/lib", "basename", "dirname" });
+    defer gpa.free(parsed.stage_tokens);
+    try testing.expectEqualStrings("/usr/lib", parsed.text_value.?);
+    try testing.expect(parsed.input_file == null);
+    try testing.expectEqual(@as(usize, 2), parsed.stage_tokens.len);
+    try testing.expectEqualStrings("basename", parsed.stage_tokens[0]);
+    try testing.expectEqualStrings("dirname", parsed.stage_tokens[1]);
+
+    // --input behavior unchanged: value captured, no text.
+    const inp = try parseCliArgs(gpa, &.{ "fx-compose", "--input", "f.txt", "sort" });
+    defer gpa.free(inp.stage_tokens);
+    try testing.expectEqualStrings("f.txt", inp.input_file.?);
+    try testing.expect(inp.text_value == null);
+}
+
+test "cli parse: --input and --text are mutually exclusive" {
+    const gpa = testing.allocator;
+    try testing.expectError(
+        error.BadFlags,
+        parseCliArgs(gpa, &.{ "fx-compose", "--input", "f.txt", "--text", "x", "sort" }),
+    );
+    try testing.expectError(
+        error.BadFlags,
+        parseCliArgs(gpa, &.{ "fx-compose", "--text", "x", "--input", "f.txt", "sort" }),
+    );
 }
