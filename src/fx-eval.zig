@@ -8,7 +8,8 @@
 // canonical, content-addressed blob, and replay re-derives the same hashes.
 //
 // Dispatch (the four shapes wire through the same loop):
-//   .native  in-process fn(args, input, gpa) -> []u8   (find/grep, hermetic)
+//   .native  in-process fn(args, input, gpa) -> []u8   (find/grep, hermetic;
+//            grep compiles its regex via libdatalog IN-PROCESS — no spawn)
 //   .exec    shell out to a real fx-* binary via file-operand (cat/sort/
 //            head/tail/uniq/wc).  std.process.run forces stdin=.ignore, so the
 //            prior stage's CAS blob path is passed as the FILE operand.
@@ -21,6 +22,26 @@ const dh = @import("dhall");
 const pipeline = @import("fx-pipeline.zig");
 const caslog = @import("fx-caslog.zig");
 const wire = @import("fx-wire.zig");
+
+// libdatalog's regex-DFA compiler — the same engine the real fx-grep binary
+// uses, so fx-eval's grep and fx-grep share one regex subset by construction.
+// Declared as hand externs rather than @cImport: the header's include dir is
+// attached to eval_mod only, and in this Zig a dependency module's @cImport
+// does not see it when the compilation is rooted elsewhere (fx-compose's
+// tests) — while the -ldatalog LINK flag does aggregate, so the symbols
+// resolve everywhere.  Layout is pinned by regexwalk.h's transparent
+// regex_dfa contract (trans[s*256+byte], UINT32_MAX dead, accept[s]); the
+// DAFSA tests below walk the real automaton, so a layout drift fails tests.
+const rx = struct {
+    const regex_dfa = extern struct {
+        n_states: u32,
+        trans: ?[*]const u32,
+        accept: ?[*]const u8,
+        errmsg: ?[*:0]u8,
+    };
+    extern fn regex_compile(pattern: [*:0]const u8) ?*regex_dfa;
+    extern fn regex_dfa_free(dfa: ?*regex_dfa) void;
+};
 
 const Allocator = std.mem.Allocator;
 const Shape = pipeline.Shape;
@@ -86,6 +107,11 @@ pub const ManifestErr = error{
     MissingInput,
     BadHash,
     Diverged,
+    /// grep's regex failed to compile (syntax error / state cap) — mirrors
+    /// fx-grep's BadPattern.
+    BadPattern,
+    /// grep was given an empty pattern — mirrors fx-grep's EmptyPattern.
+    EmptyPattern,
 } || caslog.Error;
 
 pub const Diverged = struct {
@@ -288,12 +314,52 @@ fn clampMtime(mt: i64) u64 {
     return if (mt < 0) 0 else @intCast(@min(mt, @as(i64, 0xFFFFFFFF)));
 }
 
+/// Full-key DFA walk (regexwalk.h:47-49): start in state 0, step one byte at
+/// a time via trans[s*256+byte], BAIL on the UINT32_MAX dead marker BEFORE
+/// re-indexing trans with it (the marker is not a state — indexing with it
+/// would read far out of bounds), and accept iff accept[s] == 1 at end of
+/// input.  The DFA has implicit ^...$ semantics, so substring search is the
+/// caller's `.*(...).*` wrap, not this walk.
+fn dfaMatchFull(dfa: *const rx.regex_dfa, s: []const u8) bool {
+    const trans = dfa.trans orelse return false;
+    const accept = dfa.accept orelse return false;
+    var state: usize = 0;
+    for (s) |b| {
+        const next = trans[state * 256 + @as(usize, b)];
+        if (next == std.math.maxInt(u32)) return false;
+        state = next;
+    }
+    return accept[state] == 1;
+}
+
 /// native grep: read JSONL rows (the previous stage's output), extract each
-/// record's `path`, SUBSTRING-match against `args` (std.mem.indexOf — not the
-/// real fx-grep DAFSA regex, an honest v1 cut), emit matching paths one per
-/// line.
+/// record's `path` (width subtyping — only the path field is read), REGEX-match
+/// it against `args`, and emit matching paths one per line in INPUT ROW ORDER.
+/// The regex is the real fx-grep engine: libdatalog's regex_compile (subset:
+/// literals incl \ and \xHH, ., [abc]/[a-z]/[^abc], *, +, ?, |, () — ^ $ { }
+/// are plain literals here, backrefs/lookaround do not exist) with the same
+/// `.*({s}).*` substring wrap the binary uses, grouped so a top-level `|`
+/// stays inside one substring match.  Compile failures are stage errors
+/// (BadPattern), an empty pattern is EmptyPattern — both mirror fx-grep.
 pub fn nativeGrep(args: []const u8, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8 {
     _ = state_dir;
+    if (args.len == 0) return error.EmptyPattern;
+
+    const wrapped = std.fmt.allocPrint(gpa, ".*({s}).*", .{args}) catch return error.NoMem;
+    defer gpa.free(wrapped);
+    const wrapped_z = gpa.dupeZ(u8, wrapped) catch return error.NoMem;
+    defer gpa.free(wrapped_z);
+    const dfa = rx.regex_compile(wrapped_z.ptr);
+    if (dfa == null or dfa.?.errmsg != null) {
+        if (dfa != null and dfa.?.errmsg != null)
+            std.debug.print("fx-eval: bad pattern '{s}': {s}\n", .{ args, std.mem.span(dfa.?.errmsg.?) });
+        // free even on the error path — the engine is long-lived in-process,
+        // unlike fx-grep which exits right after (regex_dfa_free frees errmsg)
+        rx.regex_dfa_free(dfa);
+        return error.BadPattern;
+    }
+    defer rx.regex_dfa_free(dfa);
+
     const kk = try wire.declaredFieldKinds(gpa, grep_rows_src);
     defer {
         for (kk.names) |n| gpa.free(n);
@@ -314,7 +380,7 @@ pub fn nativeGrep(args: []const u8, input: []const u8, state_dir: []const u8, gp
                 break;
             }
         }
-        if (path.len > 0 and std.mem.indexOf(u8, path, args) != null) {
+        if (path.len > 0 and dfaMatchFull(dfa.?, path)) {
             out.appendSlice(gpa, path) catch return error.NoMem;
             out.append(gpa, '\n') catch return error.NoMem;
         }
@@ -872,7 +938,7 @@ test "native find emits deterministic sorted JSONL rows" {
     try testing.expectEqual(@as(u8, '{'), out1[0]);
 }
 
-test "native grep extracts and substring-matches paths" {
+test "native grep extracts and regex-matches paths (DAFSA)" {
     const gpa = testing.allocator;
     const rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
     const kk = try wire.declaredFieldKinds(gpa, rows_src);
@@ -884,13 +950,36 @@ test "native grep extracts and substring-matches paths" {
     const rows = wire.Rows{ .records = &.{
         .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/a/b" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
         .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/c/d" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
+        .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/axb" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
+        .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/azzb" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
     } };
     const enc = try wire.encodeRowsOrdered(gpa, rows, kk.names, kk.kinds);
     defer gpa.free(enc);
 
-    const out = try nativeGrep("a/", enc, "", gpa);
-    defer gpa.free(out);
-    try testing.expectEqualStrings("/a/b\n", out);
+    // literal 'a/' — the v1 substring behavior and the regex agree here
+    // (compat proof: existing pipelines' plain-literal patterns keep matching).
+    {
+        const out = try nativeGrep("a/", enc, "", gpa);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("/a/b\n", out);
+    }
+    // '.' is a metachar now, not a literal dot: 'a.b' matches /a/b (the '/'
+    // fills the dot) and /axb — under v1 substring rules it matched NOTHING.
+    {
+        const out = try nativeGrep("a.b", enc, "", gpa);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("/a/b\n/axb\n", out);
+    }
+    // alternation + grouping, output in input row order.
+    {
+        const out = try nativeGrep("a(x|zz)b", enc, "", gpa);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("/axb\n/azzb\n", out);
+    }
+    // a pattern that fails to compile / an empty pattern are stage errors,
+    // not silent matches (mirrors fx-grep).
+    try testing.expectError(error.BadPattern, nativeGrep("[unclosed", enc, "", gpa));
+    try testing.expectError(error.EmptyPattern, nativeGrep("", enc, "", gpa));
 }
 
 test "wc filename-strip: first three tokens only, canonical single JSON" {
