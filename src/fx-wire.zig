@@ -12,7 +12,12 @@
 //           field order = the DECLARED record type's field order (NOT
 //           insertion order, NOT sorted).  Width-subtyping: a decoder
 //           declared with a narrower type simply does not read extra fields.
-//   single  ONE canonical JSON value, LF-terminated.
+//   single  ONE canonical JSON value, LF-terminated.  Two payload forms,
+//           self-described by the first byte: '{' = a canonical JSON OBJECT
+//           (encodeSingleOrdered, e.g. wc -> {"lines","words","bytes"}) and
+//           '"' = a bare canonical JSON STRING (encodeSingleText, e.g. a
+//           single Text path).  decode() is the RECORD-single decoder;
+//           decodeSingleText() decodes the bare-Text form.
 //
 // A `single` with a record payload (e.g. wc -> {"lines","words","bytes"}) is
 // also serialized in the DECLARED field order.
@@ -254,6 +259,51 @@ pub fn encodeSingleOrdered(
     try writeCanonicalJsonObject(gpa, &out, key_order, kinds, s.fields);
     out.append(gpa, '\n') catch return error.NoMem;
     return out.toOwnedSlice(gpa) catch return error.NoMem;
+}
+
+// ---------------------------------------------------------------------------
+// Bare-Text single form (parallel codec pair; no existing type changes)
+// ---------------------------------------------------------------------------
+
+/// Encode a bare-Text single VALUE: one canonical JSON string — written by
+/// the same writeString as every other string on the wire, so escaping and
+/// determinism match by construction — followed by LF.  The first byte
+/// ('"' vs the record form's '{') self-describes the payload kind.
+pub fn encodeSingleText(gpa: Allocator, text: []const u8) WireErr![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    try writeString(&out, gpa, text);
+    out.append(gpa, '\n') catch return error.NoMem;
+    return out.toOwnedSlice(gpa) catch return error.NoMem;
+}
+
+/// Decode a bare-Text single VALUE (parallel to encodeSingleText; the record
+/// path stays with `decode`): the first non-empty line must be EXACTLY one
+/// JSON string — it must start with '"' (a record object, a bare word, a
+/// number, or empty input is BadWire), parse strictly via Parser.parseString
+/// (all escapes incl. \u00XX; an unterminated string is BadWire), and then
+/// reach the end of the line (trailing content such as `"a" "b"` is BadWire).
+/// Returns a gpa-owned slice the caller must free.
+pub fn decodeSingleText(gpa: Allocator, bytes: []const u8) WireErr![]const u8 {
+    const raw_lines = try splitLines(gpa, bytes);
+    defer gpa.free(raw_lines);
+    // single: first non-empty LF-terminated line is the value (mirrors decode)
+    var line: []const u8 = "";
+    for (raw_lines) |l| {
+        if (l.len > 0) {
+            line = l;
+            break;
+        }
+    }
+    if (line.len == 0 or line[0] != '"') return error.BadWire;
+    var p = Parser{ .src = line, .gpa = gpa };
+    const text = p.parseString() orelse return error.BadWire;
+    p.skipWs();
+    if (p.i != line.len) {
+        gpa.free(text);
+        return error.BadWire;
+    }
+    return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -761,4 +811,52 @@ test "json string escaping matches caslog rules" {
     const fields = [_]Field{.{ .name = "a", .value = .{ .text = s } }};
     try writeCanonicalJsonObject(gpa, &out, &.{"a"}, &.{.text}, &fields);
     try testing.expectEqualStrings("{\"a\":\"quote\\\" back\\\\ nl\\n tab\\t\"}", out.items);
+}
+
+test "single Text round-trip: plain path + escape-heavy text" {
+    const gpa = testing.allocator;
+    const cases = [_][]const u8{
+        "/a/b c.txt",
+        // quote, backslash, newline, tab (writer escapes) + a raw control
+        // char the writer emits as \u00XX
+        "quote\" back\\ nl\n tab\t ctl\x01",
+    };
+    for (cases) |s| {
+        const enc = try encodeSingleText(gpa, s);
+        defer gpa.free(enc);
+        // canonical single-Text wire: a JSON string, LF-terminated; the
+        // first byte self-describes the payload as text ('"' vs '{').
+        try testing.expect(enc[0] == '"');
+        try testing.expect(enc[enc.len - 1] == '\n');
+        const dec = try decodeSingleText(gpa, enc);
+        defer gpa.free(dec);
+        try testing.expectEqualStrings(s, dec);
+    }
+}
+
+test "decodeSingleText rejects non-text single payloads" {
+    const gpa = testing.allocator;
+    // the record-single payload form is NOT bare Text
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, "{\"lines\":3,\"words\":12,\"bytes\":67}\n"));
+    // a bare word (not a JSON string)
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, "hello\n"));
+    // an unterminated string
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, "\"abc\n"));
+    // trailing content after the one string
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, "\"a\" \"b\"\n"));
+    // a JSON number is a single value, but not a Text one
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, "42\n"));
+    // empty input / blank lines only
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, ""));
+    try testing.expectError(error.BadWire, decodeSingleText(gpa, "\n\n"));
+}
+
+test "single Text empty round-trips as the two quote bytes + LF" {
+    const gpa = testing.allocator;
+    const enc = try encodeSingleText(gpa, "");
+    defer gpa.free(enc);
+    try testing.expectEqualStrings("\"\"\n", enc);
+    const dec = try decodeSingleText(gpa, enc);
+    defer gpa.free(dec);
+    try testing.expectEqualStrings("", dec);
 }
