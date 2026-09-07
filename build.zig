@@ -171,27 +171,37 @@ pub fn build(b: *std.Build) void {
     // libdatalog.so; cat/head/tail are pure (honest cut) and link libc only.
     // Existing find/grep/diff/pipeline/union blocks above are untouched.
     // -----------------------------------------------------------------------
-    const cmds = [_]struct { name: []const u8, datalog: bool }{
-        .{ .name = "fx-ls", .datalog = true },
-        .{ .name = "fx-du", .datalog = true },
-        .{ .name = "fx-sort", .datalog = true },
-        .{ .name = "fx-uniq", .datalog = true },
-        .{ .name = "fx-wc", .datalog = true },
-        .{ .name = "fx-cat", .datalog = false },
-        .{ .name = "fx-head", .datalog = false },
-        .{ .name = "fx-tail", .datalog = false },
+    const cmds = [_]struct { name: []const u8, datalog: bool, wire: bool }{
+        .{ .name = "fx-ls", .datalog = true, .wire = true },
+        .{ .name = "fx-du", .datalog = true, .wire = true },
+        .{ .name = "fx-sort", .datalog = true, .wire = false },
+        .{ .name = "fx-uniq", .datalog = true, .wire = false },
+        .{ .name = "fx-wc", .datalog = true, .wire = false },
+        .{ .name = "fx-cat", .datalog = false, .wire = false },
+        .{ .name = "fx-head", .datalog = false, .wire = false },
+        .{ .name = "fx-tail", .datalog = false, .wire = false },
     };
     inline for (cmds) |c| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{c.name});
+        // fx-ls/fx-du gain a `--rows` wire mode (Lens-3 dispatch) and import
+        // the fx-wire codec module to emit canonical rows; the rest keep
+        // dhall only.
+        const imports: []const std.Build.Module.Import = if (c.wire)
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+                .{ .name = "fx-wire", .module = wire_mod },
+            }
+        else
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+            };
         const cmd_exe = b.addExecutable(.{
             .name = c.name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "dhall", .module = dhall_mod },
-                },
+                .imports = imports,
             }),
         });
         if (c.datalog) {
@@ -236,7 +246,12 @@ pub fn build(b: *std.Build) void {
 
     // fx-eval: the Lens 3 typed pipeline ENGINE (run/replay/converge + native
     // find/grep + exec dispatch to real fx-* binaries).  Imports caslog (CAS),
-    // pipeline (shapes), wire (codec) and dhall (sha256 via caslog).
+    // pipeline (shapes), wire (codec) and dhall (sha256 via caslog).  Also
+    // carries the libdatalog linkage (same triple as fx-grep above) so
+    // fx-eval.zig can @cImport("regexwalk.h") for the native-grep DFA walk;
+    // the directives aggregate onto every artifact importing eval_mod
+    // (fx-compose + its tests), the same prov_mod mechanism the provenance
+    // batch below relies on.
     const eval_mod = b.createModule(.{
         .root_source_file = b.path("src/fx-eval.zig"),
         .target = target,
@@ -249,6 +264,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "fx-wire", .module = wire_mod },
         },
     });
+    // Native grep deepening (Lens-3): same libdatalog linkage fx-grep uses.
+    eval_mod.addIncludePath(b.path("../datalog-dafsa/src"));
+    eval_mod.linkSystemLibrary("datalog", .{});
+    eval_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
 
     // The fx-eval engine's test blocks (native find/grep, run/replay/converge).
     const eval_tests = b.addTest(.{ .root_module = eval_mod });
@@ -258,7 +277,8 @@ pub fn build(b: *std.Build) void {
 
     // fx-compose: the typed pipeline ENGINE frontend executable.  Imports all of
     // dhall + caslog + pipeline + wire + eval; links libc (exec dispatch shells
-    // to real fx-* binaries).
+    // to real fx-* binaries) plus libdatalog inherited transitively from
+    // eval_mod (see above).
     const compose_exe = b.addExecutable(.{
         .name = "fx-compose",
         .root_module = b.createModule(.{
