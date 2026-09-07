@@ -505,6 +505,69 @@ pub fn build(b: *std.Build) void {
     }
 
     // -----------------------------------------------------------------------
+    // Lens-1 views batch: the 4 remaining "commands as views" coreutils
+    // (tree/df/ps/top).  Table-driven exactly like the wave-1 batch.  HONEST
+    // CUT: tree renders name-lex order only (no -S/-t sorts), df is PURE
+    // statvfs (datalog u32 columns wrap on real disks >16TiB; all u64), and
+    // ps/top are DETERMINISTIC SINGLE-SHOT snapshots (no live refresh, no
+    // cpu% — a snapshot's output is a deterministic function of the snapshot;
+    // replay diverges loudly, same honesty as find/ls live operands).
+    // All four carry `--rows` wire mode: the 3 datalog-backed (tree/ps/top)
+    // additionally link libdatalog.so; pure fx-df imports dhall + fx-wire
+    // with NO datalog linkage (the wire flag already supports pure+wire).
+    // Wave-2 units own the real logic per file; the skeletons compile today.
+    // -----------------------------------------------------------------------
+    const l1v_cmds = [_]struct { name: []const u8, datalog: bool, wire: bool }{
+        .{ .name = "fx-tree", .datalog = true, .wire = true },
+        .{ .name = "fx-df", .datalog = false, .wire = true },
+        .{ .name = "fx-ps", .datalog = true, .wire = true },
+        .{ .name = "fx-top", .datalog = true, .wire = true },
+    };
+    inline for (l1v_cmds) |c| {
+        const src_path = std.fmt.comptimePrint("src/{s}.zig", .{c.name});
+        // All four gain a `--rows` wire mode (Lens-3 dispatch) and import
+        // the fx-wire codec module to emit canonical rows — including the
+        // pure fx-df; none of them keep dhall only.
+        const imports: []const std.Build.Module.Import = if (c.wire)
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+                .{ .name = "fx-wire", .module = wire_mod },
+            }
+        else
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+            };
+        const cmd_exe = b.addExecutable(.{
+            .name = c.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src_path),
+                .target = target,
+                .optimize = optimize,
+                .imports = imports,
+            }),
+        });
+        if (c.datalog) {
+            // Link libdatalog.so (the still-C datalog core) via C-FFI.
+            cmd_exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
+            cmd_exe.root_module.linkSystemLibrary("datalog", .{});
+            cmd_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+        }
+        cmd_exe.root_module.link_libc = true;
+        b.installArtifact(cmd_exe);
+
+        const run_step_name = std.fmt.comptimePrint("run-{s}", .{c.name});
+        const cmd_run_step = b.step(run_step_name, "Run " ++ c.name);
+        const cmd_run = b.addRunArtifact(cmd_exe);
+        cmd_run_step.dependOn(&cmd_run.step);
+        cmd_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| cmd_run.addArgs(args);
+
+        const cmd_tests = b.addTest(.{ .root_module = cmd_exe.root_module });
+        const run_cmd_tests = b.addRunArtifact(cmd_tests);
+        test_step.dependOn(&run_cmd_tests.step);
+    }
+
+    // -----------------------------------------------------------------------
     // provenance batch (wave-2 unit U6): the Lens-2 query coreutils
     // fx-what ("what owns this rootfs path?") and fx-why ("why is this
     // package in the store?") — thin CLI frontends over the fxstore
