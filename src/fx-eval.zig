@@ -13,7 +13,8 @@
 //   .exec    shell out to a real fx-* binary via std.process.run (which forces
 //            stdin=.ignore).  Most take the prior stage's CAS blob path as the
 //            FILE operand (cat/sort/head/tail/uniq/wc/nl/expand/cksum/
-//            sha256sum); ls/du are OPERAND stages — argv [--rows + root-from-
+//            sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum);
+//            ls/du are OPERAND stages — argv [--rows + root-from-
 //            args], pipeline input ignored (mirror find).
 //
 // This module is hermetic: its unit tests use .native dispatch + a mkdtemp
@@ -129,7 +130,8 @@ pub const Diverged = struct {
 
 /// The name -> dispatch+metadata registry.  find/grep are NATIVE (production);
 /// the rest are EXEC (shell to real fx-* binaries): nl/expand take an optional
-/// -b/-t flag from args plus the file operand; cksum/sha256sum/wc get their
+/// -b/-t flag from args plus the file operand; the checksum stages (wc/cksum/
+/// sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum) get their
 /// filename token postprocessed (T2); ls/du are OPERAND stages run with --rows
 /// so they emit canonical wire rows.  `idempotent` marks stages where
 /// f(f(x)) == f(x) (used by --converge); only sort, uniq and expand are so
@@ -154,6 +156,12 @@ pub fn dispatchTable() []const DispatchEntry {
         .{ .name = "expand", .dispatch = .{ .exec = .{ .binary = "expand" } }, .idempotent = true },
         .{ .name = "cksum", .dispatch = .{ .exec = .{ .binary = "cksum" } }, .idempotent = false },
         .{ .name = "sha256sum", .dispatch = .{ .exec = .{ .binary = "sha256sum" } }, .idempotent = false },
+        .{ .name = "md5sum", .dispatch = .{ .exec = .{ .binary = "md5sum" } }, .idempotent = false },
+        .{ .name = "sha1sum", .dispatch = .{ .exec = .{ .binary = "sha1sum" } }, .idempotent = false },
+        .{ .name = "sha224sum", .dispatch = .{ .exec = .{ .binary = "sha224sum" } }, .idempotent = false },
+        .{ .name = "sha384sum", .dispatch = .{ .exec = .{ .binary = "sha384sum" } }, .idempotent = false },
+        .{ .name = "sha512sum", .dispatch = .{ .exec = .{ .binary = "sha512sum" } }, .idempotent = false },
+        .{ .name = "sum", .dispatch = .{ .exec = .{ .binary = "sum" } }, .idempotent = false },
         .{ .name = "ls", .dispatch = .{ .exec = .{ .binary = "ls" } }, .idempotent = false },
         .{ .name = "du", .dispatch = .{ .exec = .{ .binary = "du" } }, .idempotent = false },
     };
@@ -445,8 +453,8 @@ fn dispatchStage(
 ///   file-operand stages: [bin, flags..., cas_path] with the prior stage's CAS
 ///     blob path as the FILE operand.  Per-binary flags: head/tail -n N
 ///     (default 10); nl -b <args> and expand -t <args> when args is non-empty.
-/// wc/cksum/sha256sum output ends in a filename token that IS the state-dir
-/// CAS path (T2/wc-trap) — postprocessed into the stage's DECLARED single as
+/// wc/cksum/sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum output
+/// ends in a filename token that IS the state-dir CAS path (T2/wc-trap) — postprocessed into the stage's DECLARED single as
 /// canonical JSON (S8).
 fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input: []const u8) ![]u8 {
     const bin_dir = ctx.bin_dir orelse return error.UnknownCommand;
@@ -520,8 +528,18 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     if (std.mem.eql(u8, binary, "cksum")) {
         return cksumPostProcess(ctx.gpa, res.stdout);
     }
-    if (std.mem.eql(u8, binary, "sha256sum")) {
+    if (std.mem.eql(u8, binary, "sha256sum") or
+        std.mem.eql(u8, binary, "md5sum") or
+        std.mem.eql(u8, binary, "sha1sum") or
+        std.mem.eql(u8, binary, "sha224sum") or
+        std.mem.eql(u8, binary, "sha384sum") or
+        std.mem.eql(u8, binary, "sha512sum"))
+    {
+        // all GNU-style "{hex}  {path}" digests share the sha256sum shape
         return sha256sumPostProcess(ctx.gpa, res.stdout);
+    }
+    if (std.mem.eql(u8, binary, "sum")) {
+        return sumPostProcess(ctx.gpa, res.stdout);
     }
     return gpa_dupe(ctx.gpa, res.stdout);
 }
@@ -626,6 +644,42 @@ fn sha256sumPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
         .{ .name = "hash", .value = .{ .text = hash } },
     } };
     return wire.encodeSingleOrdered(gpa, single_v, &.{"hash"}, &.{.text});
+}
+
+/// sum filename-strip (T2, same trap as wc): fx-sum with a FILE operand emits
+/// "{checksum} {blocks} {path}\n" (BSD pads both columns; the tokens are the
+/// same).  Take the FIRST TWO tokens, drop the third (the CAS path — a
+/// state-dir-dependent string that would break cross-state-dir replay), and
+/// re-emit the stage's DECLARED single { checksum, blocks } as canonical JSON
+/// in declared field order (S8).
+fn sumPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
+    var token_start: usize = 0;
+    var in_tok = false;
+    var tok_i: usize = 0;
+    var checksum: u64 = 0;
+    var blocks: u64 = 0;
+    var idx: usize = 0;
+    while (idx <= stdout.len) : (idx += 1) {
+        const is_space = idx == stdout.len or stdout[idx] == ' ' or stdout[idx] == '\t' or stdout[idx] == '\n' or stdout[idx] == '\r';
+        if (!is_space and !in_tok) {
+            in_tok = true;
+            token_start = idx;
+        } else if (is_space and in_tok) {
+            in_tok = false;
+            const tok = stdout[token_start..idx];
+            switch (tok_i) {
+                0 => checksum = std.fmt.parseInt(u64, tok, 10) catch return error.UnknownCommand,
+                1 => blocks = std.fmt.parseInt(u64, tok, 10) catch return error.UnknownCommand,
+                else => break, // 3rd token (filename) and beyond: drop
+            }
+            tok_i += 1;
+        }
+    }
+    const single_v = wire.Single{ .fields = &.{
+        .{ .name = "checksum", .value = .{ .natural = checksum } },
+        .{ .name = "blocks", .value = .{ .natural = blocks } },
+    } };
+    return wire.encodeSingleOrdered(gpa, single_v, &.{ "checksum", "blocks" }, &.{ .natural, .natural });
 }
 
 fn shapeTagName(s: Shape) []const u8 {
@@ -1261,6 +1315,53 @@ test "cksum/sha256sum filename-strip: canonical single JSON (T2)" {
         const out = try sha256sumPostProcess(gpa, "abc  /state/fx/cas/deadbeef\n");
         defer gpa.free(out);
         try testing.expectEqualStrings("{\"hash\":\"abc\"}\n", out);
+    }
+    {
+        // sum (BSD default pads both columns) — tokens still checksum/blocks
+        const out = try sumPostProcess(gpa, "00123    4 /state/fx/cas/deadbeef\n");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"checksum\":123,\"blocks\":4}\n", out);
+    }
+    {
+        // sha1sum binary mode: "{hex} *{path}" — the hex token still parses
+        const out = try sha256sumPostProcess(gpa, "deadbeef */state/fx/cas/deadbeef\n");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"hash\":\"deadbeef\"}\n", out);
+    }
+}
+
+test "exec dispatch: md5sum/sha1sum/sum strip the CAS filename token (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // the fakes emit the checksum-line shapes with the REAL operand path
+    // ($1 = the state-dir CAS blob path) as the filename token — the
+    // postprocess must drop it or replay across state dirs would diverge.
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "md5sum", "#!/bin/sh\necho \"f00d  $1\"\n");
+    try writeFakeBin(bin_dir, "sha1sum", "#!/bin/sh\necho \"beef *$1\"\n");
+    try writeFakeBin(bin_dir, "sum", "#!/bin/sh\necho \"00123 4 $1\"\n");
+
+    const cases = [_]struct { name: []const u8, want: []const u8 }{
+        .{ .name = "md5sum", .want = "{\"hash\":\"f00d\"}\n" },
+        .{ .name = "sha1sum", .want = "{\"hash\":\"beef\"}\n" },
+        .{ .name = "sum", .want = "{\"checksum\":123,\"blocks\":4}\n" },
+    };
+    for (cases) |c| {
+        const stages = [_]Stage{.{ .name = c.name, .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
+        const rep = try run(&stages, "payload", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
     }
 }
 

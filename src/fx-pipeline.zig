@@ -169,8 +169,9 @@ pub fn resetArena() void {
 /// Signatures (Lens 3, 2026-08-24 batch): find single->rows; grep rows->lines;
 /// ls single->rows; cat bytes->bytes; head/tail/sort/uniq lines->lines; wc
 /// lines->single {lines,words,bytes}; du single {path} -> rows {path,bytes};
-/// nl/expand lines->lines; cksum bytes->single {sum,bytes}; sha256sum
-/// bytes->single {hash}.
+/// nl/expand lines->lines; cksum bytes->single {sum,bytes}; md5sum/sha1sum/
+/// sha224sum/sha256sum/sha384sum/sha512sum bytes->single {hash}; sum
+/// bytes->single {checksum,blocks}.
 pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
@@ -237,6 +238,22 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     if (std.mem.eql(u8, name, "sha256sum")) {
         const out_t = try parseType("{ hash : Text }", gpa);
         return .{ .name = "sha256sum", .input = .{ .tag = .bytes }, .output = Shape.single(out_t) };
+    }
+    // md5sum/sha1sum/sha224sum/sha384sum/sha512sum: bytes -> single { hash }
+    // (same GNU "{hex}  {path}" digest shape as sha256sum)
+    if (std.mem.eql(u8, name, "md5sum") or
+        std.mem.eql(u8, name, "sha1sum") or
+        std.mem.eql(u8, name, "sha224sum") or
+        std.mem.eql(u8, name, "sha384sum") or
+        std.mem.eql(u8, name, "sha512sum"))
+    {
+        const out_t = try parseType("{ hash : Text }", gpa);
+        return .{ .name = name, .input = .{ .tag = .bytes }, .output = Shape.single(out_t) };
+    }
+    // sum: bytes -> single { checksum, blocks } ("{checksum} {blocks} {path}")
+    if (std.mem.eql(u8, name, "sum")) {
+        const out_t = try parseType("{ checksum : Natural, blocks : Natural }", gpa);
+        return .{ .name = "sum", .input = .{ .tag = .bytes }, .output = Shape.single(out_t) };
     }
     return error.UnknownCommand;
 }
@@ -368,6 +385,16 @@ test "registry: cat |> cksum and cat |> sha256sum compose" {
     const sha256sum = try builtin("sha256sum", t.allocator);
     try compose(cat, cksum);
     try compose(cat, sha256sum);
+}
+
+test "registry: cat |> each checksum stage composes" {
+    // cat bytes->bytes; the digest stages are bytes->single {hash}, sum is
+    // bytes->single {checksum,blocks}.
+    const cat = try builtin("cat", t.allocator);
+    inline for (.{ "md5sum", "sha1sum", "sha224sum", "sha384sum", "sha512sum", "sum" }) |nm| {
+        const stage = try builtin(nm, t.allocator);
+        try compose(cat, stage);
+    }
 }
 
 test "registry: grep |> expand |> wc composes" {
