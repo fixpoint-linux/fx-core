@@ -23,9 +23,17 @@
 // space + name.  No uid/gid/owner columns and no "total N" line (documented
 // divergence).  -S = sort by size (largest first), -t = sort by mtime (newest
 // first); there is no -r (reverse) flag in this slice (documented).
+//
+// --rows (Lens-3 dispatch): instead of display text, emit canonical wire rows
+// (one JSON object per line, LF-terminated) for the record type the
+// fx-pipeline registry declares for ls — { name : Text, size : Natural,
+// mode : Natural } — so downstream wire.decode consumers (e.g. grep) can
+// type-check ls|>grep.  `long` is display-only and has no effect in rows
+// mode; all/sort still apply (default Name order = deterministic).
 
 const std = @import("std");
 const dh = @import("dhall");
+const wire = @import("fx-wire");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -43,10 +51,12 @@ const dl = @cImport({
 });
 
 // libc close/mkdtemp/rmdir/fstatat (std.posix slimmed these out in 0.16).
+// write is for the fixture-file test helper only (std.posix dropped it too).
 extern fn close(fd: c_int) c_int;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
 const Allocator = std.mem.Allocator;
 
@@ -61,7 +71,14 @@ const Options = struct {
     long: bool = false,
     all: bool = false,
     sort: SortTag = .Name,
+    rows: bool = false, // --rows: canonical wire rows instead of display text
 };
+
+/// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
+/// registry's builtin("ls") output type ("{ name : Text, size : Natural,
+/// mode : Natural }") — the declared order pins the canonical JSON key order
+/// (single source of truth: the Lens-3 registry table).
+const ls_rows_src = "{ name : Text, size : Natural, mode : Natural }";
 
 // ---------------------------------------------------------------------------
 // mode-string helper (long format)
@@ -90,6 +107,25 @@ test "modeString" {
     try std.testing.expectEqualStrings("-rw-r--r--", &modeString(0o644, false));
     try std.testing.expectEqualStrings("drwxr-xr-x", &modeString(0o755, true));
     try std.testing.expectEqualStrings("----------", &modeString(0o000, false));
+}
+
+/// Format one entry in display (text) mode: long -> mode-string + width-10
+/// size + mtime + name, short -> name only; LF-terminated.  Shared by main
+/// and the text-mode tests so the display bytes stay pinned (they must not
+/// drift when --rows lands).  Returns null when the line exceeds `buf`.
+fn formatTextLine(buf: []u8, e: Entry, long: bool) ?[]const u8 {
+    if (long) {
+        const ms = modeString(e.mode, e.isdir);
+        return std.fmt.bufPrint(buf, "{s} {d:>10} {d} {s}\n", .{ ms[0..], e.size, e.mtime, e.name }) catch null;
+    }
+    return std.fmt.bufPrint(buf, "{s}\n", .{e.name}) catch null;
+}
+
+test "formatTextLine pins the display bytes (text mode unchanged)" {
+    var buf: [512]u8 = undefined;
+    const e = Entry{ .size = 10, .mtime = 1700000000, .name = "a.txt", .mode = 0o644, .isdir = false };
+    try std.testing.expectEqualStrings("a.txt\n", formatTextLine(&buf, e, false).?);
+    try std.testing.expectEqualStrings("-rw-r--r--         10 1700000000 a.txt\n", formatTextLine(&buf, e, true).?);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +175,7 @@ const JsonOpts = struct {
     long: bool = false,
     all: bool = false,
     sort: ?SortTag = null,
+    rows: bool = false,
 };
 
 fn jsonSkipWs(s: []const u8, i: *usize) void {
@@ -222,6 +259,8 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
                 res.long = b;
             } else if (std.mem.eql(u8, key, "all")) {
                 res.all = b;
+            } else if (std.mem.eql(u8, key, "rows")) {
+                res.rows = b;
             }
         } else if (std.mem.eql(u8, key, "sort") and i < s.len and s[i] == '{') {
             // Nullary union constructor serializes to a single-key nested object
@@ -309,6 +348,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (opts.path) |pth| o.path = try gpa.dupe(u8, pth);
     o.long = opts.long;
     o.all = opts.all;
+    o.rows = opts.rows;
     if (opts.sort) |st| o.sort = st; // default (absent) stays .Name
     return o;
 }
@@ -382,6 +422,16 @@ test "evalDhallArgs record with long and all" {
     try std.testing.expectEqualStrings(".", o.path); // default
 }
 
+test "evalDhallArgs rows flag" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ rows = True, all = True }", std.testing.allocator);
+    try std.testing.expect(o.rows);
+    try std.testing.expect(o.all);
+    const dflt = try evalDhallArgs("{ path = \"/tmp\" }", std.testing.allocator);
+    defer std.testing.allocator.free(dflt.path);
+    try std.testing.expect(!dflt.rows); // default
+}
+
 // ---------------------------------------------------------------------------
 // POSIX-style fallback arg parsing
 // ---------------------------------------------------------------------------
@@ -399,6 +449,8 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
             o.sort = .Size;
         } else if (std.mem.eql(u8, a, "-t")) {
             o.sort = .MTime;
+        } else if (std.mem.eql(u8, a, "--rows")) {
+            o.rows = true;
         } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
             std.debug.print("fx-ls: unknown option '{s}'\n", .{a});
             return error.UnknownOption;
@@ -436,6 +488,15 @@ test "parsePosixArgs -t sets MTime" {
 test "parsePosixArgs unknown option rejected" {
     const args = [_][:0]const u8{ "fx-ls", "-r" };
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+}
+
+test "parsePosixArgs --rows" {
+    const args = [_][:0]const u8{ "fx-ls", "--rows", "-a", "/tmp" };
+    const o = try parsePosixArgs(&args, std.testing.allocator);
+    defer std.testing.allocator.free(o.path);
+    try std.testing.expect(o.rows);
+    try std.testing.expect(o.all);
+    try std.testing.expectEqualStrings("/tmp", o.path);
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +618,134 @@ fn buildFacts(db: *dl.dl_db, opts: Options, gpa: Allocator) !void {
 }
 
 // ---------------------------------------------------------------------------
+// wire-rows emission (--rows mode)
+// ---------------------------------------------------------------------------
+
+/// Encode entries as canonical wire rows for `ls_rows_src` ({ name, size,
+/// mode } — the fx-pipeline builtin("ls") type): one canonical JSON object
+/// per line, LF-terminated, keys in DECLARED order, values JSON-escaped.
+/// `long` has no effect here (display-only); all/sort were applied by the
+/// caller.  Caller owns the returned bytes.
+fn encodeRowsWire(gpa: Allocator, entries: []const Entry) ![]u8 {
+    const kk = try wire.declaredFieldKinds(gpa, ls_rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+
+    var rows = std.ArrayList(wire.Row).empty;
+    errdefer rows.deinit(gpa);
+    defer {
+        for (rows.items) |r| gpa.free(r.fields);
+        rows.deinit(gpa);
+    }
+    for (entries) |e| {
+        const fields = try gpa.alloc(wire.Field, 3);
+        fields[0] = .{ .name = "name", .value = .{ .text = e.name } };
+        fields[1] = .{ .name = "size", .value = .{ .natural = e.size } };
+        fields[2] = .{ .name = "mode", .value = .{ .natural = e.mode } };
+        try rows.append(gpa, .{ .fields = fields });
+    }
+    return wire.encodeRowsOrdered(gpa, .{ .records = rows.items }, kk.names, kk.kinds);
+}
+
+test "rows mode: fixture dir emits canonical rows that decode back" {
+    const gpa = std.testing.allocator;
+
+    // Tmp fixture (mkdtemp, mirrors the fx-du FS fixture): .hidden(5B,0600),
+    // a.txt(10B,0644), b(3B,0640).  Modes are pinned via chmod so the exact
+    // canonical bytes below are umask-proof.
+    var tpl = "/tmp/fxlsrowsXXXXXX".*;
+    const t = mkdtemp(&tpl) orelse return error.TmpDirFail;
+    const tpath = std.mem.span(t);
+
+    const Fixture = struct { name: []const u8, payload: []const u8, mode: u32 };
+    const fixtures = [_]Fixture{
+        .{ .name = ".hidden", .payload = "12345", .mode = 0o600 },
+        .{ .name = "a.txt", .payload = "0123456789", .mode = 0o644 },
+        .{ .name = "b", .payload = "abc", .mode = 0o640 },
+    };
+    for (fixtures) |f| {
+        const p = try std.fs.path.joinZ(gpa, &.{ tpath, f.name });
+        defer gpa.free(p);
+        const fd = std.posix.openat(std.posix.AT.FDCWD, p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600) catch return error.OpenFail;
+        var off: usize = 0;
+        while (off < f.payload.len) {
+            const n = write(fd, f.payload.ptr + off, f.payload.len - off);
+            if (n <= 0) {
+                _ = close(fd);
+                return error.WriteFail;
+            }
+            off += @intCast(n);
+        }
+        _ = close(fd);
+        if (std.c.chmod(p.ptr, f.mode) != 0) return error.ChmodFail;
+    }
+
+    // The pipeline main() runs, up to (not including) stdout: transient db +
+    // facts + Name ordering, with all=true so the hidden fixture is included
+    // (rows mode honors `all`).
+    var tmpbuf: [64]u8 = undefined;
+    const tmpl = std.fmt.bufPrintSentinel(&tmpbuf, "/tmp/fxlsrowsdbXXXXXX", .{}, 0) catch unreachable;
+    const dir_z = mkdtemp(tmpl.ptr) orelse return error.Mkdtemp;
+    const dirdb = std.mem.span(dir_z);
+    defer _ = rmdir(dirdb.ptr);
+    const db = dl.dl_open(dirdb.ptr) orelse return error.DlOpen;
+    defer dl.dl_close(db);
+    if (dl.dl_declare_relation(db, "ent", 5) != 0) return error.Decl;
+    if (dl.dl_declare_relation(db, "entt", 5) != 0) return error.Decl;
+
+    try buildFacts(db, .{ .path = tpath, .all = true }, gpa);
+
+    var entries = std.ArrayList(Entry).empty;
+    defer {
+        for (entries.items) |e| gpa.free(e.name);
+        entries.deinit(gpa);
+    }
+    try collectRelation(gpa, db, "ent", false, &entries);
+    sortEntriesByName(entries.items);
+
+    const bytes = try encodeRowsWire(gpa, entries.items);
+    defer gpa.free(bytes);
+
+    // Canonical bytes: one JSON object per line, keys in the DECLARED
+    // registry order (name, size, mode), rows in Name order (the --rows
+    // default).
+    const want =
+        "{\"name\":\".hidden\",\"size\":5,\"mode\":384}\n" ++
+        "{\"name\":\"a.txt\",\"size\":10,\"mode\":420}\n" ++
+        "{\"name\":\"b\",\"size\":3,\"mode\":416}\n";
+    try std.testing.expectEqualStrings(want, bytes);
+
+    // Round-trip: decode with the SAME declared type the downstream dispatch
+    // would use (ls|>grep type-checks against the registry type) and verify
+    // the fields came back intact.
+    const kk = try wire.declaredFieldKinds(gpa, ls_rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+    const dec = try wire.decode(gpa, bytes, .rows, kk.names, kk.kinds);
+    defer dec.deinit(gpa);
+    switch (dec) {
+        .rows => |r| {
+            try std.testing.expectEqual(@as(usize, 3), r.records.len);
+            try std.testing.expectEqualStrings(".hidden", r.records[0].fields[0].value.text);
+            try std.testing.expectEqual(@as(u64, 5), r.records[0].fields[1].value.natural);
+            try std.testing.expectEqual(@as(u64, 384), r.records[0].fields[2].value.natural);
+            try std.testing.expectEqualStrings("a.txt", r.records[1].fields[0].value.text);
+            try std.testing.expectEqual(@as(u64, 10), r.records[1].fields[1].value.natural);
+            try std.testing.expectEqualStrings("b", r.records[2].fields[0].value.text);
+            try std.testing.expectEqual(@as(u64, 3), r.records[2].fields[1].value.natural);
+            try std.testing.expectEqual(@as(u64, 416), r.records[2].fields[2].value.natural);
+        },
+        else => unreachable,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -615,15 +804,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const stdout_file = std.Io.File.stdout();
+    if (opts.rows) {
+        // --rows: canonical wire rows instead of display text.  `long` is
+        // deliberately ignored (display-only); all/sort were honored above.
+        const bytes = try encodeRowsWire(gpa, entries.items);
+        defer gpa.free(bytes);
+        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, bytes) catch return error.WriteFail;
+        return;
+    }
+
     var wbuf: [512]u8 = undefined;
     for (entries.items) |e| {
-        if (opts.long) {
-            const ms = modeString(e.mode, e.isdir);
-            const line = std.fmt.bufPrint(&wbuf, "{s} {d:>10} {d} {s}\n", .{ ms[0..], e.size, e.mtime, e.name }) catch continue;
-            _ = std.Io.File.writeStreamingAll(stdout_file, init.io, line) catch continue;
-        } else {
-            const line = std.fmt.bufPrint(&wbuf, "{s}\n", .{e.name}) catch continue;
-            _ = std.Io.File.writeStreamingAll(stdout_file, init.io, line) catch continue;
-        }
+        const line = formatTextLine(&wbuf, e, opts.long) orelse continue;
+        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, line) catch continue;
     }
 }

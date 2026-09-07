@@ -33,6 +33,13 @@
 // Output: `<total>\t<path>` rows, lex-sorted by path (deterministic; GNU du
 // order is walk order — documented divergence).
 //
+// --rows (Lens-3 dispatch): instead of display text, emit canonical wire rows
+// (one JSON object per line, LF-terminated) for the record type the
+// fx-pipeline registry declares for du — { path : Text, bytes : Natural } —
+// so downstream wire.decode consumers (e.g. grep) can type-check du|>grep.
+// The rows are the same lex-sorted, maxdepth/summary-filtered set as the
+// text rows.
+//
 // Size semantics (apparent size, documented divergences from GNU du):
 //   - size = st_size of REGULAR FILES only; directories contribute 0;
 //   - symlinks/fifos/devices contribute nothing and are never followed
@@ -47,6 +54,7 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const wire = @import("fx-wire");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -91,7 +99,14 @@ const Options = struct {
     path: []const u8 = ".",
     maxdepth: ?usize = null, // print totals at most this many levels below root
     summary: bool = false, // root row only (GNU -s / --summarize)
+    rows: bool = false, // --rows: canonical wire rows instead of display text
 };
+
+/// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
+/// registry's builtin("du") output type ("{ path : Text, bytes : Natural }")
+/// — the declared order pins the canonical JSON key order (single source of
+/// truth: the Lens-3 registry table).
+const du_rows_src = "{ path : Text, bytes : Natural }";
 
 // ---------------------------------------------------------------------------
 // Depth / row-filter helpers (Zig-side maxdepth + summary)
@@ -129,6 +144,13 @@ fn rowPasses(root: []const u8, row_path: []const u8, opts: Options) bool {
     if (opts.summary) return std.mem.eql(u8, row_path, root);
     if (opts.maxdepth) |md| return relativeDepth(root, row_path) <= md;
     return true;
+}
+
+/// Append one display row `<total>\t<path>\n`.  Shared by main and the
+/// text-mode test so the display bytes stay pinned (they must not drift when
+/// --rows lands).
+fn appendTextRow(out: *std.ArrayList(u8), gpa: Allocator, r: Row) !void {
+    try out.print(gpa, "{d}\t{s}\n", .{ r.total, r.path });
 }
 
 test "countSegments" {
@@ -182,6 +204,7 @@ const JsonOpts = struct {
     path: ?[]const u8 = null,
     maxdepth: ?usize = null,
     summary: bool = false,
+    rows: bool = false,
 };
 
 fn jsonSkipWs(s: []const u8, i: *usize) void {
@@ -272,7 +295,11 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
             off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             const b = jsonParseBool(s, &i) orelse return null;
-            if (std.mem.eql(u8, key, "summary")) res.summary = b;
+            if (std.mem.eql(u8, key, "summary")) {
+                res.summary = b;
+            } else if (std.mem.eql(u8, key, "rows")) {
+                res.rows = b;
+            }
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4; // None (Optional absent)
         } else {
@@ -333,6 +360,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (opts.path) |pth| o.path = try gpa.dupe(u8, pth);
     o.maxdepth = opts.maxdepth;
     o.summary = opts.summary;
+    o.rows = opts.rows;
     return o;
 }
 
@@ -409,6 +437,8 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
             };
         } else if (std.mem.eql(u8, a, "-s")) {
             o.summary = true;
+        } else if (std.mem.eql(u8, a, "--rows")) {
+            o.rows = true;
         } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
             std.debug.print("fx-du: unknown option '{s}'\n", .{a});
             return error.UnknownOption;
@@ -454,6 +484,24 @@ test "parsePosixArgs bad -d rejected" {
 test "parsePosixArgs missing -d arg rejected" {
     const args = [_][:0]const u8{"fx-du", "-d"};
     try std.testing.expectError(error.BadMaxdepth, parsePosixArgs(&args, std.testing.allocator));
+}
+
+test "parsePosixArgs --rows" {
+    const args = [_][:0]const u8{ "fx-du", "--rows", "/tmp" };
+    const o = try parsePosixArgs(&args, std.testing.allocator);
+    defer std.testing.allocator.free(o.path);
+    try std.testing.expect(o.rows);
+    try std.testing.expectEqualStrings("/tmp", o.path);
+}
+
+test "evalDhallArgs rows flag" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ rows = True, summary = True }", std.testing.allocator);
+    try std.testing.expect(o.rows);
+    try std.testing.expect(o.summary);
+    try std.testing.expect(o.maxdepth == null); // default
+    const dflt = try evalDhallArgs("{ summary = True }", std.testing.allocator);
+    try std.testing.expect(!dflt.rows); // default
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +853,124 @@ test "du pipeline: empty tree still reports the root with 0" {
     try std.testing.expectEqual(@as(u32, 0), rows.items[0].total);
 }
 
+test "appendTextRow pins the display bytes (text mode unchanged)" {
+    const gpa = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    try appendTextRow(&out, gpa, .{ .path = "/a/b", .total = 95 });
+    try appendTextRow(&out, gpa, .{ .path = "/a/b/c", .total = 0 });
+    try std.testing.expectEqualStrings("95\t/a/b\n0\t/a/b/c\n", out.items);
+}
+
+test "rows mode: FS fixture emits canonical rows that decode back" {
+    const gpa = std.testing.allocator;
+
+    // Same fixture tree as the text-mode test: t=95, t/a=85, t/a/b=25.
+    var tpl = "/tmp/fxdurowsXXXXXX".*;
+    const t = mkdtemp(&tpl) orelse return error.TmpDirFail;
+    const tpath = std.mem.span(t);
+
+    const a_path = try std.fs.path.joinZ(gpa, &.{ tpath, "a" });
+    defer gpa.free(a_path);
+    const b_path = try std.fs.path.joinZ(gpa, &.{ tpath, "a", "b" });
+    defer gpa.free(b_path);
+    if (mkdir(a_path.ptr, 0o755) != 0) return error.MkdirFail;
+    if (mkdir(b_path.ptr, 0o755) != 0) return error.MkdirFail;
+
+    const f1 = try std.fs.path.join(gpa, &.{ tpath, "f1" });
+    defer gpa.free(f1);
+    const f2 = try std.fs.path.join(gpa, &.{ tpath, "a", "f2" });
+    defer gpa.free(f2);
+    const f3 = try std.fs.path.join(gpa, &.{ tpath, "a", "b", "f3" });
+    defer gpa.free(f3);
+    const f4 = try std.fs.path.join(gpa, &.{ tpath, "a", "f4" });
+    defer gpa.free(f4);
+    try writeFileExact(gpa, f1, "0123456789"); // 10
+    try writeFileExact(gpa, f2, "abcdefghijklmnopqrst"); // 20
+    try writeFileExact(gpa, f3, "0123456789012345678901234"); // 25
+    try writeFileExact(gpa, f4, "0123456789012345678901234567890123456789"); // 40
+
+    var rows = try computeRows(gpa, .{ .path = tpath });
+    defer freeRows(gpa, &rows);
+
+    // main()'s shaping of the rows before emission: no filters pass-through,
+    // then the deterministic lex order by path (root sorts first).
+    const kept = try gpa.alloc(Row, rows.items.len);
+    defer gpa.free(kept);
+    var nk: usize = 0;
+    for (rows.items) |r| {
+        if (rowPasses(tpath, r.path, .{ .path = tpath })) {
+            kept[nk] = r;
+            nk += 1;
+        }
+    }
+    std.mem.sort(Row, kept[0..nk], {}, struct {
+        fn lt(_: void, a: Row, b: Row) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+
+    const bytes = try encodeRowsWire(gpa, kept[0..nk]);
+    defer gpa.free(bytes);
+
+    // Canonical bytes: keys in the DECLARED registry order (path, bytes),
+    // rows lex-sorted by path.
+    const want = try std.fmt.allocPrint(gpa, "{{\"path\":\"{s}\",\"bytes\":95}}\n" ++
+        "{{\"path\":\"{s}/a\",\"bytes\":85}}\n{{\"path\":\"{s}/a/b\",\"bytes\":25}}\n", .{ tpath, tpath, tpath });
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, bytes);
+
+    // Round-trip: decode with the SAME declared type the downstream dispatch
+    // would use (du|>grep type-checks against the registry type).
+    const kk = try wire.declaredFieldKinds(gpa, du_rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+    const dec = try wire.decode(gpa, bytes, .rows, kk.names, kk.kinds);
+    defer dec.deinit(gpa);
+    const b_path_expect = try std.fmt.allocPrint(gpa, "{s}/a/b", .{tpath});
+    defer gpa.free(b_path_expect);
+    switch (dec) {
+        .rows => |r| {
+            try std.testing.expectEqual(@as(usize, 3), r.records.len);
+            try std.testing.expectEqualStrings(tpath, r.records[0].fields[0].value.text);
+            try std.testing.expectEqual(@as(u64, 95), r.records[0].fields[1].value.natural);
+            try std.testing.expectEqualStrings(b_path_expect, r.records[2].fields[0].value.text);
+            try std.testing.expectEqual(@as(u64, 25), r.records[2].fields[1].value.natural);
+        },
+        else => unreachable,
+    }
+}
+
+/// Encode kept rows as canonical wire rows for `du_rows_src` ({ path, bytes
+/// } — the fx-pipeline builtin("du") type): one canonical JSON object per
+/// line, LF-terminated, keys in DECLARED order, values JSON-escaped.  Caller
+/// owns the returned bytes.
+fn encodeRowsWire(gpa: Allocator, rows: []const Row) ![]u8 {
+    const kk = try wire.declaredFieldKinds(gpa, du_rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+
+    var wrows = std.ArrayList(wire.Row).empty;
+    errdefer wrows.deinit(gpa);
+    defer {
+        for (wrows.items) |r| gpa.free(r.fields);
+        wrows.deinit(gpa);
+    }
+    for (rows) |r| {
+        const fields = try gpa.alloc(wire.Field, 2);
+        fields[0] = .{ .name = "path", .value = .{ .text = r.path } };
+        fields[1] = .{ .name = "bytes", .value = .{ .natural = r.total } };
+        try wrows.append(gpa, .{ .fields = fields });
+    }
+    return wire.encodeRowsOrdered(gpa, .{ .records = wrows.items }, kk.names, kk.kinds);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -846,11 +1012,17 @@ pub fn main(init: std.process.Init) !void {
     }.lt);
 
     const stdout_file = std.Io.File.stdout();
-    var wbuf: [32]u8 = undefined;
-    for (kept[0..nk]) |r| {
-        const num = std.fmt.bufPrint(&wbuf, "{d}\t", .{r.total}) catch continue;
-        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, num) catch continue;
-        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, r.path) catch continue;
-        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, "\n") catch continue;
+    if (opts.rows) {
+        // --rows: canonical wire rows for the same filtered, lex-sorted set
+        // the display path would print.
+        const bytes = try encodeRowsWire(gpa, kept[0..nk]);
+        defer gpa.free(bytes);
+        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, bytes) catch return error.WriteFail;
+        return;
     }
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(gpa);
+    for (kept[0..nk]) |r| try appendTextRow(&out, gpa, r);
+    _ = std.Io.File.writeStreamingAll(stdout_file, init.io, out.items) catch return error.WriteFail;
 }
