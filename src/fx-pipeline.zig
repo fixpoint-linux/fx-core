@@ -1,13 +1,16 @@
 // fx-pipeline.zig — fx-compose Lens 3, step 1: the pipeline value + type-checker.
 //
 // The unit of composition is the pipeline VALUE: a materialized artifact
-// carrying a Dhall type.  Four shapes (see concept.md "fx-compose — concrete
-// design"):
+// carrying a Dhall type.  Four data shapes + the source-input kind (see
+// concept.md "fx-compose — concrete design"):
 //
 //   bytes          raw byte stream           (the honest-cut stream)
 //   lines          newline-delimited text
 //   rows { ... }   a stream of typed records (Dhall record TYPE payload)
 //   single T       one typed value           (Dhall type payload)
+//   none           no input at all           (source/generator stages only;
+//                  compatible with NO producer output, so a generator can
+//                  only sit at position 0 of a pipeline)
 //
 // Every command declares an input->output signature.  Composition `a |> b` is
 // well-formed iff b's input shape is COMPATIBLE with a's output shape.  For
@@ -39,7 +42,7 @@ const Allocator = std.mem.Allocator;
 // Pipeline value shapes
 // ---------------------------------------------------------------------------
 
-pub const ShapeTag = enum { bytes, lines, rows, single };
+pub const ShapeTag = enum { bytes, lines, rows, single, none };
 
 pub const Shape = struct {
     tag: ShapeTag,
@@ -112,6 +115,11 @@ pub fn shapeCompatible(out: Shape, inp: Shape) ComposeErr!void {
         .single => {
             if (!ast.alpha_eq(out.ty.?, inp.ty.?)) return error.SingleMismatch;
         },
+        // a SOURCE input is compatible with no producer output — this is what
+        // confines generators to position 0 (the tag-equality check above
+        // already rejected every real producer; this case is the defensive
+        // exhaustiveness arm for a hypothetical .none-output producer)
+        .none => return error.ShapeMismatch,
     }
 }
 
@@ -173,7 +181,8 @@ pub fn resetArena() void {
 /// sha224sum/sha256sum/sha384sum/sha512sum bytes->single {hash}; sum
 /// bytes->single {checksum,blocks}; basename/dirname/realpath single Text ->
 /// single Text (the bare-Text single VALUE wire form feeds the scalar PATH
-/// operand).
+/// operand); echo/seq none -> lines (SOURCE generators — no pipeline input;
+/// they can only sit at position 0, enforced by shapeCompatible's .none arm).
 pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
@@ -267,6 +276,15 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         const in_t = try parseType("Text", gpa);
         const out_t = try parseType("Text", gpa);
         return .{ .name = name, .input = Shape.single(in_t), .output = Shape.single(out_t) };
+    }
+    // echo/seq: none -> lines — SOURCE (generator) stages, ty-less like
+    // head/tail.  echo's stage args are ONE verbatim text operand (empty args
+    // -> bare newline); seq's args are whitespace-split into 1-3 integer
+    // operands (or one Dhall-record operand when args[0] == '{').
+    if (std.mem.eql(u8, name, "echo") or
+        std.mem.eql(u8, name, "seq"))
+    {
+        return .{ .name = name, .input = .{ .tag = .none }, .output = .{ .tag = .lines } };
     }
     return error.UnknownCommand;
 }
@@ -463,4 +481,29 @@ test "registry: basename |> sort and basename |> wc rejected (single vs lines)" 
     const wc = try builtin("wc", t.allocator);
     try t.expectError(error.ShapeMismatch, compose(basename, sort));
     try t.expectError(error.ShapeMismatch, compose(basename, wc));
+}
+
+test "registry: echo |> sort composes (source at position 0)" {
+    // echo/seq are none -> lines: they feed any lines consumer...
+    const echo = try builtin("echo", t.allocator);
+    const sort = try builtin("sort", t.allocator);
+    try compose(echo, sort);
+}
+
+test "registry: sort |> echo rejected (lines vs none — generator only at position 0)" {
+    // ...but nothing feeds THEM: a .none input is compatible with no producer
+    // output, so a generator anywhere but position 0 is a ShapeMismatch.
+    const sort = try builtin("sort", t.allocator);
+    const echo = try builtin("echo", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(sort, echo));
+}
+
+test "registry: seq |> wc composes" {
+    const seq = try builtin("seq", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try compose(seq, wc);
+}
+
+test "registry: yes is not a builtin (unbounded output is not internable)" {
+    try t.expectError(error.UnknownCommand, builtin("yes", t.allocator));
 }

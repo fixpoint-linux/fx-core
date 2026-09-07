@@ -4,6 +4,12 @@
 //   fx-compose [--input FILE | --text VALUE] [--state DIR] [--replay MANIFEST] [--converge] STAGE [STAGE ...]
 //   STAGE = `name` or `name:arg`  (e.g. `head:3`, `find:.`, `grep:TODO`)
 //
+// Source (generator) stages — `echo` (or `echo:TEXT`) and `seq` (`seq:5`,
+// `seq:1 5`, `seq:1 2 9`, or the fx-seq Dhall-record form `seq:{ last = 5, ... }`)
+// take NO pipeline input: they supply the data themselves and are only valid
+// at position 0 (a shape .none input matches no producer output).  A
+// source-first pipeline reads no --input/--text/stdin at all.
+//
 // --text VALUE: the initial input is the bare-Text single VALUE (canonical
 //   JSON string, wire.encodeSingleText) instead of --input/stdin — the entry
 //   point for single-Text stage chains (basename/dirname/realpath).  Mutually
@@ -156,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
         return runConverge(gpa, io, state_dir, bin_dir, cn);
     }
     if (cli.stage_tokens.len == 0) {
-        std.debug.print("fx-compose: no stages given (usage: fx-compose [--input FILE|--text VALUE] [--state DIR] STAGE [STAGE...])\n", .{});
+        std.debug.print("fx-compose: no stages given (usage: fx-compose [--input FILE|--text VALUE] [--state DIR] STAGE [STAGE...]; source stages echo/seq need no input)\n", .{});
         return error.NoStages;
     }
     return runPipeline(gpa, io, state_dir, bin_dir, cli.input_file, cli.text_value, cli.stage_tokens);
@@ -260,8 +266,18 @@ fn runPipeline(
     // string, wire.encodeSingleText), else from --input FILE, else stdin
     // (non-blocking — a generator-first pipeline like `find:.` supplies its
     // own input and must not block on an empty terminal stdin).
+    //
+    // A SOURCE-first pipeline (echo/seq at position 0) supplies its own input
+    // outright: no --input/--text/stdin read at all — the initial input is ""
+    // and fx-eval.run's stage-0 in_hash excludes it (S1 hygiene), so the
+    // recorded derivation is ambient-stdin-independent.
     var input_bytes: []u8 = undefined;
-    if (text_value) |tv| {
+    if (built.stages[0].shape_in.tag == .none) {
+        if (text_value != null or input_file != null) {
+            std.debug.print("fx-compose: warning: source stage '{s}' supplies its own input; --input/--text ignored\n", .{built.stages[0].name});
+        }
+        input_bytes = try gpa.dupe(u8, "");
+    } else if (text_value) |tv| {
         input_bytes = try wire.encodeSingleText(gpa, tv);
     } else if (input_file) |path| {
         input_bytes = try readFilePath(gpa, path);
@@ -655,4 +671,25 @@ test "cli parse: --input and --text are mutually exclusive" {
         error.BadFlags,
         parseCliArgs(gpa, &.{ "fx-compose", "--text", "x", "--input", "f.txt", "sort" }),
     );
+}
+
+test "buildAndCheck: seq:5 source stage lands at position 0 with shape .none" {
+    const gpa = testing.allocator;
+    const built = try buildAndCheck(gpa, &.{ "seq:5", "sort" });
+    defer {
+        gpa.free(built.stages);
+        gpa.free(built.commands);
+    }
+    try testing.expectEqualStrings("seq", built.stages[0].name);
+    try testing.expectEqualStrings("5", built.stages[0].args);
+    try testing.expectEqual(pipeline.ShapeTag.none, built.stages[0].shape_in.tag);
+    try testing.expectEqual(pipeline.ShapeTag.lines, built.stages[0].shape_out.tag);
+    try testing.expectEqual(pipeline.ShapeTag.lines, built.stages[1].shape_in.tag);
+}
+
+test "buildAndCheck: sort |> seq:5 rejected (a generator is position-0 only)" {
+    const gpa = testing.allocator;
+    // the existing adjacent-pair check rejects it: sort's lines output vs
+    // seq's .none input is a ShapeMismatch
+    try testing.expectError(error.ShapeMismatch, buildAndCheck(gpa, &.{ "sort", "seq:5" }));
 }

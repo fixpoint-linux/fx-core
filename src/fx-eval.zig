@@ -17,7 +17,9 @@
 //            ls/du are OPERAND stages — argv [--rows + root-from-
 //            args], pipeline input ignored (mirror find); basename/dirname/
 //            realpath are TEXT-OPERAND stages — argv [path-value, suffix?]
-//            with the prior stage's single-Text VALUE as the PATH operand.
+//            with the prior stage's single-Text VALUE as the PATH operand;
+//            echo/seq are GENERATOR (source) stages — argv [args?], no input,
+//            valid only at pipeline position 0 (shape .none).
 //
 // This module is hermetic: its unit tests use .native dispatch + a mkdtemp
 // state dir (the caslog test idiom) so no binaries spawn and $HOME is untouched.
@@ -136,8 +138,9 @@ pub const Diverged = struct {
 /// sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum) get their
 /// filename token postprocessed (T2); ls/du are OPERAND stages run with --rows
 /// so they emit canonical wire rows; basename/dirname/realpath are TEXT-OPERAND
-/// stages fed the prior stage's single-Text VALUE as the PATH operand.
-/// `idempotent` marks stages where
+/// stages fed the prior stage's single-Text VALUE as the PATH operand; echo/seq
+/// are GENERATOR (source) stages — argv [bin, args?], no file operand, no
+/// pipeline input.  `idempotent` marks stages where
 /// f(f(x)) == f(x) (used by --converge); only sort, uniq and expand are so
 /// marked (trivially true, a demonstration not a prover).
 pub const DispatchEntry = struct {
@@ -158,6 +161,8 @@ pub fn dispatchTable() []const DispatchEntry {
         .{ .name = "wc", .dispatch = .{ .exec = .{ .binary = "wc" } }, .idempotent = false },
         .{ .name = "nl", .dispatch = .{ .exec = .{ .binary = "nl" } }, .idempotent = false },
         .{ .name = "expand", .dispatch = .{ .exec = .{ .binary = "expand" } }, .idempotent = true },
+        .{ .name = "echo", .dispatch = .{ .exec = .{ .binary = "echo" } }, .idempotent = false },
+        .{ .name = "seq", .dispatch = .{ .exec = .{ .binary = "seq" } }, .idempotent = false },
         .{ .name = "cksum", .dispatch = .{ .exec = .{ .binary = "cksum" } }, .idempotent = false },
         .{ .name = "sha256sum", .dispatch = .{ .exec = .{ .binary = "sha256sum" } }, .idempotent = false },
         .{ .name = "md5sum", .dispatch = .{ .exec = .{ .binary = "md5sum" } }, .idempotent = false },
@@ -453,7 +458,7 @@ fn dispatchStage(
 }
 
 /// exec dispatch: run the real fx-<binary> and capture stdout
-/// (std.process.run, stdin=.ignore).  Three argv shapes:
+/// (std.process.run, stdin=.ignore).  Four argv shapes:
 ///   OPERAND stages (ls/du): [bin, "--rows", args?] — the stage args are the
 ///     TREE ROOT (mirror find: the pipeline input is ignored entirely, no file
 ///     operand; in_hash still covers name+args via stageInHash).
@@ -461,6 +466,16 @@ fn dispatchStage(
 ///     the prior stage's single-Text VALUE is decoded from the bare-Text wire
 ///     form and passed as the PATH operand (basename's stage args are the
 ///     SUFFIX; dirname/realpath reject args); no CAS blob is materialized.
+///   GENERATOR stages (echo/seq): [bin, args?] — SOURCE stages, no file
+///     operand and no pipeline input at all (valid only at position 0, which
+///     shapeCompatible enforces).  echo passes its stage args as ONE verbatim
+///     text operand (empty args -> argv [bin] -> a bare newline, GNU echo
+///     behavior; a leading-dash arg reaches fx-echo's option parser and fails
+///     loudly).  seq whitespace-splits its stage args into 1-3 INTEGER
+///     operands mirroring fx-seq parsePosixArgs, EXCEPT an arg starting with
+///     '{' passes verbatim as one operand (fx-seq's Dhall-record form); empty
+///     seq args fail loudly before the spawn (a source with nothing to
+///     generate has no invented default).
 ///   file-operand stages: [bin, flags..., cas_path] with the prior stage's CAS
 ///     blob path as the FILE operand.  Per-binary flags: head/tail -n N
 ///     (default 10); nl -b <args> and expand -t <args> when args is non-empty.
@@ -480,9 +495,13 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         std.mem.eql(u8, binary, "dirname") or
         std.mem.eql(u8, binary, "realpath");
 
+    // generator stages (echo/seq) are SOURCES: no pipeline input, no CAS blob
+    const generator_stage = std.mem.eql(u8, binary, "echo") or
+        std.mem.eql(u8, binary, "seq");
+
     var pb: [std.posix.PATH_MAX]u8 = undefined;
     var cas_path: ?[:0]const u8 = null;
-    if (!operand_stage and !text_operand_stage) {
+    if (!operand_stage and !text_operand_stage and !generator_stage) {
         // materialize input as a CAS blob path to pass as the FILE operand
         const in_hex = try caslog.casPut(ctx.state_dir, input);
         cas_path = std.fmt.bufPrintZ(&pb, "{s}/cas/{s}", .{ ctx.state_dir, in_hex[0..64] }) catch
@@ -530,6 +549,47 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         argv.append(ctx.gpa, pt) catch return error.NoMem;
         if (std.mem.eql(u8, binary, "basename") and stage.args.len > 0) {
             argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+        }
+    } else if (generator_stage) {
+        if (std.mem.eql(u8, binary, "echo")) {
+            // the whole post-':' arg is ONE verbatim text operand (spaces
+            // included); empty args -> argv [bin] -> a bare newline
+            if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+        } else {
+            // seq: fast-fail on empty args before the spawn (mirrors the
+            // dirname extra-args rejection above) — fx-seq with no operand is
+            // MissingOperand, but the engine rejects it itself so the contract
+            // holds even under fake-binary tests
+            if (stage.args.len == 0) {
+                std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
+                return error.StageFailed;
+            }
+            if (stage.args[0] == '{') {
+                // the fx-seq Dhall-record form rides verbatim as ONE operand
+                argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+            } else {
+                // whitespace-split into 1-3 INTEGER operands, mirroring
+                // fx-seq parsePosixArgs (a non-integer or a 4th operand is a
+                // loud engine-side failure, not a surprise child exit)
+                var n: usize = 0;
+                var it = std.mem.tokenizeAny(u8, stage.args, " \t");
+                while (it.next()) |tok| {
+                    n += 1;
+                    if (n > 3) {
+                        std.debug.print("fx-eval: seq: more than 3 integer operands\n", .{});
+                        return error.StageFailed;
+                    }
+                    _ = std.fmt.parseInt(i128, tok, 10) catch {
+                        std.debug.print("fx-eval: seq: operand '{s}' is not an integer\n", .{tok});
+                        return error.StageFailed;
+                    };
+                    argv.append(ctx.gpa, tok) catch return error.NoMem;
+                }
+                if (n == 0) {
+                    std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
+                    return error.StageFailed;
+                }
+            }
         }
     } else {
         var cnt: [64]u8 = undefined;
@@ -750,6 +810,7 @@ fn shapeTagName(s: Shape) []const u8 {
         .lines => "lines",
         .rows => "rows",
         .single => "single",
+        .none => "none",
     };
 }
 
@@ -800,8 +861,14 @@ pub fn run(
 
         const out_hex = try caslog.casPut(state_dir, output);
         const out_str = try hexToStr(gpa, out_hex);
+        // a SOURCE stage's stage-0 in_hash excludes the ambient initial input
+        // entirely (S1 hygiene): the derivation reads name+args only, so the
+        // same generator pipeline records the same manifest whatever stdin /
+        // --input / --text happened to carry.
         const in_str = if (prev_hex) |ph|
             try hexToStr(gpa, ph)
+        else if (st.shape_in.tag == .none)
+            try stageInHashHex(gpa, st.name, st.args, "")
         else
             try stageInHashHex(gpa, st.name, st.args, input_bytes);
 
@@ -1594,6 +1661,140 @@ test "exec dispatch: basename |> dirname single-Text chain + replay (hermetic fa
     // determinism gate through the new codec
     const div = try replay(&rep, fix.state, bin_dir, gpa, testing.io);
     try testing.expect(div == null);
+}
+
+test "exec dispatch: echo/seq generator argv pin (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // the fakes fold $#/$1/$2/$3 into ONE emitted line so the test pins argv
+    // EXACTLY: echo passes its whole stage args as ONE verbatim operand
+    // (empty -> argv [bin]); seq whitespace-splits into integer operands
+    // unless the args start with '{' (the fx-seq Dhall-record form rides
+    // verbatim).  The ambient initial input must never appear.
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "echo", "#!/bin/sh\necho \"e:$#:$1:$2\"\n");
+    try writeFakeBin(bin_dir, "seq", "#!/bin/sh\necho \"s:$#:$1:$2:$3\"\n");
+
+    const cases = [_]struct { name: []const u8, args: []const u8, want: []const u8 }{
+        // [fx-echo] — no operand (the real fx-echo emits the bare newline)
+        .{ .name = "echo", .args = "", .want = "e:0::\n" },
+        // [fx-echo, "hello world"] — ONE verbatim operand, spaces included
+        .{ .name = "echo", .args = "hello world", .want = "e:1:hello world:\n" },
+        // [fx-seq, 5]
+        .{ .name = "seq", .args = "5", .want = "s:1:5::\n" },
+        // [fx-seq, 1, 2, 9] — whitespace-split into three integer operands
+        .{ .name = "seq", .args = "1 2 9", .want = "s:3:1:2:9\n" },
+        // [fx-seq, "{last = 5, first = 1, increment = 2}"] — verbatim record
+        .{ .name = "seq", .args = "{last = 5, first = 1, increment = 2}", .want = "s:1:{last = 5, first = 1, increment = 2}::\n" },
+    };
+    for (cases) |c| {
+        const stages = [_]Stage{.{ .name = c.name, .args = c.args, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        const rep = try run(&stages, "AMBIENT-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+
+    // a source with nothing to generate fails loudly (no invented default),
+    // and so do 4 operands / a non-integer operand — engine-side, pre-spawn
+    {
+        const stages = [_]Stage{.{ .name = "seq", .args = "", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        try testing.expectError(error.StageFailed, run(&stages, "", fix.state, bin_dir, gpa, testing.io));
+    }
+    {
+        const stages = [_]Stage{.{ .name = "seq", .args = "1 2 3 4", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        try testing.expectError(error.StageFailed, run(&stages, "", fix.state, bin_dir, gpa, testing.io));
+    }
+    {
+        const stages = [_]Stage{.{ .name = "seq", .args = "x", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        try testing.expectError(error.StageFailed, run(&stages, "", fix.state, bin_dir, gpa, testing.io));
+    }
+}
+
+test "exec dispatch: echo |> wc end-to-end + seq |> head replay (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    // real-behaving fakes: echo prints its ONE operand + newline (nothing for
+    // zero operands); wc emits the GNU "{l} {w} {b} {path}" line with the
+    // REAL operand path as the filename token; seq streams 1..5; head prints
+    // the first $2 lines of $3 (its argv is [-n, N, cas_path]).
+    try writeFakeBin(bin_dir, "echo",
+        \\#!/bin/sh
+        \\if [ $# -eq 0 ]; then printf '\n'; else printf '%s\n' "$1"; fi
+        \\
+    );
+    try writeFakeBin(bin_dir, "wc", "#!/bin/sh\necho \"1 2 6 $1\"\n");
+    try writeFakeBin(bin_dir, "seq", "#!/bin/sh\nprintf '1\\n2\\n3\\n4\\n5\\n'\n");
+    try writeFakeBin(bin_dir, "head",
+        \\#!/bin/sh
+        \\sed -n "1,${2}p" "$3"
+        \\
+    );
+
+    // echo |> wc — the generator's lines ride the CAS file operand into wc
+    // END TO END, and wc's filename token is stripped into the canonical
+    // declared single { lines, words, bytes }.
+    {
+        const stages = [_]Stage{
+            .{ .name = "echo", .args = "hello world", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "wc", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .single } },
+        };
+        const rep = try run(&stages, "", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const echo_out = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
+        defer gpa.free(echo_out);
+        try testing.expectEqualStrings("hello world\n", echo_out);
+        const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(final);
+        try testing.expectEqualStrings("{\"lines\":1,\"words\":2,\"bytes\":6}\n", final);
+    }
+
+    // seq |> head:3 — replay re-derives identical per-stage hashes (null
+    // divergence), and the generator's stage-0 in_hash is ambient-input-
+    // INDEPENDENT (S1 hygiene: a different initial input records the same
+    // stage hashes, because the source reads name+args only).
+    {
+        const stages = [_]Stage{
+            .{ .name = "seq", .args = "5", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "head", .args = "3", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
+        };
+        const rep = try run(&stages, "AMBIENT", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const seq_out = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
+        defer gpa.free(seq_out);
+        try testing.expectEqualStrings("1\n2\n3\n4\n5\n", seq_out);
+        const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(final);
+        try testing.expectEqualStrings("1\n2\n3\n", final);
+
+        const rep2 = try run(&stages, "DIFFERENT-AMBIENT", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep2);
+        try testing.expectEqualStrings(rep.stages[0].in_hash, rep2.stages[0].in_hash);
+        try testing.expectEqualStrings(rep.final_hash, rep2.final_hash);
+
+        const div = try replay(&rep, fix.state, bin_dir, gpa, testing.io);
+        try testing.expect(div == null);
+    }
 }
 
 test "exec dispatch: text-operand stage errors are StageFailed (hermetic)" {
