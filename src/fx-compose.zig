@@ -303,9 +303,18 @@ fn runConverge(
     bin_dir: ?[]u8,
     name: []const u8,
 ) !void {
-    // idempotent stages: sort, uniq
-    if (!std.mem.eql(u8, name, "sort") and !std.mem.eql(u8, name, "uniq")) {
-        std.debug.print("fx-compose: '{s}' is not idempotent-annotated (v1 marks only sort/uniq)\n", .{ name });
+    // idempotent stages come from the engine's dispatch table (sort, uniq,
+    // expand) — the same flag eval.converge itself checks, one source of truth
+    // instead of a duplicated name list.
+    var idem = false;
+    for (eval.dispatchTable()) |e| {
+        if (std.mem.eql(u8, e.name, name)) {
+            idem = e.idempotent;
+            break;
+        }
+    }
+    if (!idem) {
+        std.debug.print("fx-compose: '{s}' is not idempotent-annotated (v1 marks only sort/uniq/expand)\n", .{ name });
         return error.NotIdempotent;
     }
     const cmd = try pipeline.builtin(name, gpa);

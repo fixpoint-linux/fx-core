@@ -10,9 +10,11 @@
 // Dispatch (the four shapes wire through the same loop):
 //   .native  in-process fn(args, input, gpa) -> []u8   (find/grep, hermetic;
 //            grep compiles its regex via libdatalog IN-PROCESS — no spawn)
-//   .exec    shell out to a real fx-* binary via file-operand (cat/sort/
-//            head/tail/uniq/wc).  std.process.run forces stdin=.ignore, so the
-//            prior stage's CAS blob path is passed as the FILE operand.
+//   .exec    shell out to a real fx-* binary via std.process.run (which forces
+//            stdin=.ignore).  Most take the prior stage's CAS blob path as the
+//            FILE operand (cat/sort/head/tail/uniq/wc/nl/expand/cksum/
+//            sha256sum); ls/du are OPERAND stages — argv [--rows + root-from-
+//            args], pipeline input ignored (mirror find).
 //
 // This module is hermetic: its unit tests use .native dispatch + a mkdtemp
 // state dir (the caslog test idiom) so no binaries spawn and $HOME is untouched.
@@ -126,9 +128,12 @@ pub const Diverged = struct {
 // ---------------------------------------------------------------------------
 
 /// The name -> dispatch+metadata registry.  find/grep are NATIVE (production);
-/// cat/sort/head/tail/uniq/wc are EXEC (shell to real binaries).  `idempotent`
-/// marks stages where f(f(x)) == f(x) (used by --converge); only sort and uniq
-/// are so marked (trivially true, a demonstration not a prover).
+/// the rest are EXEC (shell to real fx-* binaries): nl/expand take an optional
+/// -b/-t flag from args plus the file operand; cksum/sha256sum/wc get their
+/// filename token postprocessed (T2); ls/du are OPERAND stages run with --rows
+/// so they emit canonical wire rows.  `idempotent` marks stages where
+/// f(f(x)) == f(x) (used by --converge); only sort, uniq and expand are so
+/// marked (trivially true, a demonstration not a prover).
 pub const DispatchEntry = struct {
     name: []const u8,
     dispatch: Dispatch,
@@ -145,6 +150,12 @@ pub fn dispatchTable() []const DispatchEntry {
         .{ .name = "head", .dispatch = .{ .exec = .{ .binary = "head" } }, .idempotent = false },
         .{ .name = "tail", .dispatch = .{ .exec = .{ .binary = "tail" } }, .idempotent = false },
         .{ .name = "wc", .dispatch = .{ .exec = .{ .binary = "wc" } }, .idempotent = false },
+        .{ .name = "nl", .dispatch = .{ .exec = .{ .binary = "nl" } }, .idempotent = false },
+        .{ .name = "expand", .dispatch = .{ .exec = .{ .binary = "expand" } }, .idempotent = true },
+        .{ .name = "cksum", .dispatch = .{ .exec = .{ .binary = "cksum" } }, .idempotent = false },
+        .{ .name = "sha256sum", .dispatch = .{ .exec = .{ .binary = "sha256sum" } }, .idempotent = false },
+        .{ .name = "ls", .dispatch = .{ .exec = .{ .binary = "ls" } }, .idempotent = false },
+        .{ .name = "du", .dispatch = .{ .exec = .{ .binary = "du" } }, .idempotent = false },
     };
 }
 
@@ -426,35 +437,61 @@ fn dispatchStage(
     }
 }
 
-/// exec dispatch: run the real fx-<binary> with the prior CAS blob as its FILE
-/// operand, capture stdout (std.process.run, stdin=.ignore).  For `wc`, strip
-/// the trailing filename token (the input path — T2/wc-trap) and re-emit
-/// canonical `{lines} {words} {bytes}\n`.
+/// exec dispatch: run the real fx-<binary> and capture stdout
+/// (std.process.run, stdin=.ignore).  Two argv shapes:
+///   OPERAND stages (ls/du): [bin, "--rows", args?] — the stage args are the
+///     TREE ROOT (mirror find: the pipeline input is ignored entirely, no file
+///     operand; in_hash still covers name+args via stageInHash).
+///   file-operand stages: [bin, flags..., cas_path] with the prior stage's CAS
+///     blob path as the FILE operand.  Per-binary flags: head/tail -n N
+///     (default 10); nl -b <args> and expand -t <args> when args is non-empty.
+/// wc/cksum/sha256sum output ends in a filename token that IS the state-dir
+/// CAS path (T2/wc-trap) — postprocessed into the stage's DECLARED single as
+/// canonical JSON (S8).
 fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input: []const u8) ![]u8 {
     const bin_dir = ctx.bin_dir orelse return error.UnknownCommand;
 
-    // materialize input as a CAS blob path to pass as the FILE operand
-    const in_hex = try caslog.casPut(ctx.state_dir, input);
+    // operand stages never see the pipeline input, so no CAS blob is materialized
+    const operand_stage = std.mem.eql(u8, binary, "ls") or std.mem.eql(u8, binary, "du");
+
     var pb: [std.posix.PATH_MAX]u8 = undefined;
-    const cas_path = std.fmt.bufPrintZ(&pb, "{s}/cas/{s}", .{ ctx.state_dir, in_hex[0..64] }) catch
-        return error.BadStateDir;
+    var cas_path: ?[:0]const u8 = null;
+    if (!operand_stage) {
+        // materialize input as a CAS blob path to pass as the FILE operand
+        const in_hex = try caslog.casPut(ctx.state_dir, input);
+        cas_path = std.fmt.bufPrintZ(&pb, "{s}/cas/{s}", .{ ctx.state_dir, in_hex[0..64] }) catch
+            return error.BadStateDir;
+    }
 
     var binbuf: [std.posix.PATH_MAX]u8 = undefined;
     const bin_path = std.fmt.bufPrintZ(&binbuf, "{s}/fx-{s}", .{ bin_dir, binary }) catch
         return error.BadStateDir;
 
-    // build argv: [bin, flags..., cas_path]
+    // build argv per-binary: [bin, flags..., operand]
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(ctx.gpa);
     argv.append(ctx.gpa, bin_path) catch return error.NoMem;
-    if (std.mem.eql(u8, binary, "head") or std.mem.eql(u8, binary, "tail")) {
+    if (operand_stage) {
+        // --rows: canonical wire rows (the declared registry output shape);
+        // ls/du text output is display-only and does not round-trip the type
+        argv.append(ctx.gpa, "--rows") catch return error.NoMem;
+        if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+    } else {
         var cnt: [64]u8 = undefined;
-        const n = if (stage.args.len > 0) stage.args else "10";
-        const nz = std.fmt.bufPrintZ(&cnt, "{s}", .{n}) catch return error.BadStateDir;
-        argv.append(ctx.gpa, "-n") catch return error.NoMem;
-        argv.append(ctx.gpa, nz) catch return error.NoMem;
+        if (std.mem.eql(u8, binary, "head") or std.mem.eql(u8, binary, "tail")) {
+            const n = if (stage.args.len > 0) stage.args else "10";
+            const nz = std.fmt.bufPrintZ(&cnt, "{s}", .{n}) catch return error.BadStateDir;
+            argv.append(ctx.gpa, "-n") catch return error.NoMem;
+            argv.append(ctx.gpa, nz) catch return error.NoMem;
+        } else if (stage.args.len > 0 and std.mem.eql(u8, binary, "nl")) {
+            argv.append(ctx.gpa, "-b") catch return error.NoMem;
+            argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+        } else if (stage.args.len > 0 and std.mem.eql(u8, binary, "expand")) {
+            argv.append(ctx.gpa, "-t") catch return error.NoMem;
+            argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+        }
+        argv.append(ctx.gpa, cas_path.?) catch return error.NoMem;
     }
-    argv.append(ctx.gpa, cas_path) catch return error.NoMem;
 
     const res = std.process.run(ctx.gpa, ctx.io, .{ .argv = argv.items }) catch |e| {
         std.debug.print("fx-eval: spawn failed for {s} (e={s}) argv={s}\n", .{ binary, @errorName(e), bin_path });
@@ -479,6 +516,12 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
 
     if (std.mem.eql(u8, binary, "wc")) {
         return wcPostProcess(ctx.gpa, res.stdout);
+    }
+    if (std.mem.eql(u8, binary, "cksum")) {
+        return cksumPostProcess(ctx.gpa, res.stdout);
+    }
+    if (std.mem.eql(u8, binary, "sha256sum")) {
+        return sha256sumPostProcess(ctx.gpa, res.stdout);
     }
     return gpa_dupe(ctx.gpa, res.stdout);
 }
@@ -519,6 +562,70 @@ fn wcPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
         .{ .name = "bytes", .value = .{ .natural = c } },
     } };
     return wire.encodeSingleOrdered(gpa, single_v, &.{ "lines", "words", "bytes" }, &.{ .natural, .natural, .natural });
+}
+
+/// cksum filename-strip (T2, same trap as wc): fx-cksum with a FILE operand
+/// emits "{sum} {bytes} {path}\n".  Take the FIRST TWO tokens, drop the third
+/// (the CAS path — a state-dir-dependent string that would break cross-state-
+/// dir replay), and re-emit the stage's DECLARED single { sum, bytes } as
+/// canonical JSON in declared field order (S8).
+fn cksumPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
+    var token_start: usize = 0;
+    var in_tok = false;
+    var tok_i: usize = 0;
+    var sum: u64 = 0;
+    var nbytes: u64 = 0;
+    var idx: usize = 0;
+    while (idx <= stdout.len) : (idx += 1) {
+        const is_space = idx == stdout.len or stdout[idx] == ' ' or stdout[idx] == '\t' or stdout[idx] == '\n' or stdout[idx] == '\r';
+        if (!is_space and !in_tok) {
+            in_tok = true;
+            token_start = idx;
+        } else if (is_space and in_tok) {
+            in_tok = false;
+            const tok = stdout[token_start..idx];
+            switch (tok_i) {
+                0 => sum = std.fmt.parseInt(u64, tok, 10) catch return error.UnknownCommand,
+                1 => nbytes = std.fmt.parseInt(u64, tok, 10) catch return error.UnknownCommand,
+                else => break, // 3rd token (filename) and beyond: drop
+            }
+            tok_i += 1;
+        }
+    }
+    const single_v = wire.Single{ .fields = &.{
+        .{ .name = "sum", .value = .{ .natural = sum } },
+        .{ .name = "bytes", .value = .{ .natural = nbytes } },
+    } };
+    return wire.encodeSingleOrdered(gpa, single_v, &.{ "sum", "bytes" }, &.{ .natural, .natural });
+}
+
+/// sha256sum filename-strip (T2, same trap as wc): fx-sha256sum with a FILE
+/// operand emits "{hash}  {path}\n" (two spaces, GNU style).  Take the FIRST
+/// token only, drop the rest (the CAS path), and re-emit the stage's DECLARED
+/// single { hash : Text } as canonical JSON (S8).
+fn sha256sumPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
+    var token_start: usize = 0;
+    var in_tok = false;
+    var hash: []const u8 = "";
+    var found = false;
+    var idx: usize = 0;
+    while (idx <= stdout.len) : (idx += 1) {
+        const is_space = idx == stdout.len or stdout[idx] == ' ' or stdout[idx] == '\t' or stdout[idx] == '\n' or stdout[idx] == '\r';
+        if (!is_space and !in_tok) {
+            in_tok = true;
+            token_start = idx;
+        } else if (is_space and in_tok) {
+            hash = stdout[token_start..idx];
+            found = true;
+            break;
+        }
+    }
+    // no digest token on stdout = a misbehaving child, not a zero hash
+    if (!found) return error.UnknownCommand;
+    const single_v = wire.Single{ .fields = &.{
+        .{ .name = "hash", .value = .{ .text = hash } },
+    } };
+    return wire.encodeSingleOrdered(gpa, single_v, &.{"hash"}, &.{.text});
 }
 
 fn shapeTagName(s: Shape) []const u8 {
@@ -741,6 +848,27 @@ fn writeTestFile(path: []const u8, content: []const u8) !void {
     if (fd < 0) return error.BadStateDir;
     _ = write(fd, content.ptr, content.len);
     _ = close(fd);
+}
+
+/// Write an executable shell script as {bin_dir}/fx-{name} — the hermetic
+/// fake-binary idiom: exec dispatch spawns {bin_dir}/fx-<binary>, so a test
+/// can pin argv shape / stdout without any real fx-* binary or zig-out.
+fn writeFakeBin(bin_dir: []const u8, name: []const u8, script: []const u8) !void {
+    var buf: [std.posix.PATH_MAX]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&buf, "{s}/fx-{s}", .{ bin_dir, name }) catch return error.BadStateDir;
+    try writeTestFile(p, script);
+    _ = std.c.chmod(p.ptr, 0o755);
+}
+
+/// Free a RunReport's gpa-owned slices (every run() caller owes these).
+fn freeRunReport(gpa: Allocator, rep: *const RunReport) void {
+    for (rep.stages) |s| {
+        gpa.free(s.in_hash);
+        gpa.free(s.out_hash);
+    }
+    gpa.free(rep.stages);
+    gpa.free(rep.final_hash);
+    gpa.free(rep.input_hash);
 }
 
 /// mkdtemp fixture + caslog.ensureDirs.  Returns gpa-owned copies: `tmp` is the
@@ -1057,4 +1185,173 @@ test "exec dispatch: output round-trips; non-zero exit is StageFailed (S5)" {
     // UnknownCommand (S5).
     const sort_stage = [_]Stage{.{ .name = "sort", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
     try testing.expectError(error.StageFailed, run(&sort_stage, "x\ny\n", fix.state, bin_dir, gpa, testing.io));
+}
+
+test "exec dispatch: nl/expand flag argv + file-operand round-trip (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // fakes pin the argv spec: with args, nl/expand must pass [-b|-t, args,
+    // cas_path] ($1/$2/$3); without args, NO flag at all — argv is just
+    // [cas_path] ($# == 1), and the CAS operand content round-trips.
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "nl",
+        \\#!/bin/sh
+        \\if [ "$1" = "-b" ]; then echo "nl:$1:$2"; cat "$3"; else echo "nl:$#"; cat "$1"; fi
+        \\
+    );
+    try writeFakeBin(bin_dir, "expand",
+        \\#!/bin/sh
+        \\if [ "$1" = "-t" ]; then echo "expand:$1:$2"; cat "$3"; else echo "expand:$#"; cat "$1"; fi
+        \\
+    );
+
+    const input = "one\ntwo\n";
+    {
+        const stages = [_]Stage{.{ .name = "nl", .args = "a", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("nl:-b:a\none\ntwo\n", out);
+    }
+    {
+        const stages = [_]Stage{.{ .name = "nl", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("nl:1\none\ntwo\n", out);
+    }
+    {
+        const stages = [_]Stage{.{ .name = "expand", .args = "4", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("expand:-t:4\none\ntwo\n", out);
+    }
+    {
+        const stages = [_]Stage{.{ .name = "expand", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("expand:1\none\ntwo\n", out);
+    }
+}
+
+test "cksum/sha256sum filename-strip: canonical single JSON (T2)" {
+    const gpa = testing.allocator;
+    {
+        const out = try cksumPostProcess(gpa, "123 45 /state/fx/cas/deadbeef\n");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"sum\":123,\"bytes\":45}\n", out);
+    }
+    {
+        // GNU sha256sum separates digest and filename with TWO spaces
+        const out = try sha256sumPostProcess(gpa, "abc  /state/fx/cas/deadbeef\n");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"hash\":\"abc\"}\n", out);
+    }
+}
+
+test "exec dispatch: cksum/sha256sum strip the CAS filename token (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // the fakes emit the GNU-style checksum line with the REAL operand path
+    // ($1 = the state-dir CAS blob path) as the filename token — the
+    // postprocess must drop it or replay across state dirs would diverge.
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "cksum", "#!/bin/sh\necho \"123 45 $1\"\n");
+    try writeFakeBin(bin_dir, "sha256sum", "#!/bin/sh\necho \"abc  $1\"\n");
+
+    {
+        const stages = [_]Stage{.{ .name = "cksum", .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
+        const rep = try run(&stages, "payload", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"sum\":123,\"bytes\":45}\n", out);
+    }
+    {
+        const stages = [_]Stage{.{ .name = "sha256sum", .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
+        const rep = try run(&stages, "payload", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"hash\":\"abc\"}\n", out);
+    }
+}
+
+test "exec dispatch: ls/du are --rows operand stages; du|>grep composes (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // fakes fold $#/$1/$2 into the emitted wire row so the test pins the argv
+    // EXACTLY: [--rows, <root>] when args is set, [--rows] when not — and
+    // never a CAS file operand (a 3rd arg changes the folded count).
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "du",
+        \\#!/bin/sh
+        \\echo "{\"path\":\"du:$#:$1:$2\",\"bytes\":7}"
+        \\
+    );
+    try writeFakeBin(bin_dir, "ls",
+        \\#!/bin/sh
+        \\echo "{\"name\":\"ls:$#:$1:$2\",\"size\":1,\"mode\":2}"
+        \\
+    );
+
+    // du:root |> grep:du:[0-9] — the exec stage's canonical wire rows feed the
+    // NATIVE DAFSA grep (character class), end to end.  The pipeline input is
+    // ignored by the operand stage: it appears in no output.
+    const stages = [_]Stage{
+        .{ .name = "du", .args = "/root", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "grep", .args = "du:[0-9]", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+    };
+    const rep = try run(&stages, "GARBAGE-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
+    defer freeRunReport(gpa, &rep);
+    const du_out = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
+    defer gpa.free(du_out);
+    try testing.expectEqualStrings("{\"path\":\"du:2:--rows:/root\",\"bytes\":7}\n", du_out);
+    const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
+    defer gpa.free(final);
+    try testing.expectEqualStrings("du:2:--rows:/root\n", final);
+
+    // ls with NO args: argv is just [--rows] (the root defaults inside the
+    // child, exactly like find with empty args).
+    {
+        const ls_stages = [_]Stage{.{ .name = "ls", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
+        const lrep = try run(&ls_stages, "ignored", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &lrep);
+        const out = try caslog.casGet(gpa, fix.state, lrep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"name\":\"ls:1:--rows:\",\"size\":1,\"mode\":2}\n", out);
+    }
 }
