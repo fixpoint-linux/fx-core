@@ -293,7 +293,7 @@ beyond today's single-Dhall-record args — today each command takes one record 
 produces text; fx-compose makes that a *typed function* between pipeline values:
 
     fx find { path, name, type } : single { path : Text } -> rows { path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }
-    fx grep { pattern }          : rows { path : Text }   -> lines
+    fx grep { pattern }          : rows { path : Text }   -> lines    (engine stage is a real DAFSA regex-WALK — `regex_compile` + `.*(...).*` wrap over each row's path, same engine/subset as the `fx-grep` binary; not a substring cut)
     fx ls  { path, long }        : single { path : Text } -> rows { name : Text, size : Natural, mode : Natural }
     fx cat                        : bytes -> bytes
     fx head / fx tail             : lines -> lines
@@ -313,6 +313,16 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > lines→`single {lines,words,bytes}`; `du` single `{path}`→rows `{path,bytes}`.
 > `grep |> sort |> uniq |> wc` type-checks; `ls |> wc` (rows vs lines) and
 > `cat |> sort` (bytes vs lines) are rejected with `ShapeMismatch`.
+>
+> **Registry note (2026-08-24, engine deepening):** the registry now also carries
+> `nl`/`expand` lines→lines, `cksum` bytes→`single {sum : Natural, bytes :
+> Natural}`, and `sha256sum` bytes→`single {hash : Text}` — composing as typed
+> stages like the rest. `ls`/`du` were registry-present but display-text-only;
+> they now take `--rows` and emit their declared wire rows (canonical field
+> order via `fx-wire`), and the engine dispatches them as operand stages —
+> `du |> grep` runs end-to-end, not just type-checks. Checksum stages re-emit
+> the typed single without the state-dir-dependent filename token (the same
+> trap as `wc`).
 
 **Determinism as proof, not hope.** Replaying a pipeline re-runs each stage and
 compares the produced intermediate against the recorded sha256. A divergence is a
@@ -365,6 +375,14 @@ its own output is a no-op; this is what composes with the journal's roll-forward
   -a/-m/-d/-t` are out of scope; `mkdir -m` is out of scope (mode is
   `0777 & ~umask`, recorded as the post-create mode). Each is documented as a
   follow-up rather than silently half-shipped.
+- **fx-compose stage cuts (v1, 2026-08-24):** `paste`/`comm` are out (two-file
+  semantics — a second live-path operand passed as stage args breaks hermetic
+  replay); `seq`/`echo`/`yes` are out (output generators — no input shape);
+  `basename`/`dirname`/`realpath` are deferred (they need a single-`Text`
+  *value* wire form to feed a scalar operand — a wire gap, not a registry
+  rejection); the six remaining checksum flavors (`md5sum`/`sha1sum`/
+  `sha224sum`/`sha384sum`/`sha512sum`/`b2sum`) are mechanical clones of
+  `cksum`/`sha256sum`. Each is a deliberate cut, not an omission.
 
 **Resolution (2026-08-24):** this batch upheld the cut. The user's framing was
 "datalog-backed where meaningful"; the engine was used exactly where the data
@@ -454,7 +472,11 @@ next automated roll-forward re-converges it. On the books rather than silent.
    manual `fxstore rollback` leaves prov facts at the pre-rollback activation
    (shared with generation/svc) — documented, re-converges on roll-forward.
 5. **Typed command composition / `fx-compose`** — the real differentiator (Lens 3),
-   biggest scope, do last.
+   biggest scope, do last. **Deepened (2026-08-24):** the engine's `grep` stage
+   is a real DAFSA regex-WALK (same engine/subset as the `fx-grep` binary), the
+   `builtin()` registry gains `nl`/`expand`/`cksum`/`sha256sum` as typed
+   stages, and `ls`/`du` dispatch with a real `--rows` wire mode (see Lens 3);
+   remaining v1 stage cuts are in the honest-cut section.
 6. **The 2026-08-24 batch** — `ls`, `du`, `sort`, `uniq`, `wc` **SHIPPING** as
    datalog-backed coreutils (transient DB, Dhall-typed records); `cat`, `head`,
    `tail` **SHIPPING** as pure typed binaries (honest cut). Extends the
