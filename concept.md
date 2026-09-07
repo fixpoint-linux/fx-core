@@ -241,12 +241,15 @@ recovery — the last two optional.*
 
 ---
 
-### Provenance: `what` / `why` (design-only — scoped, not yet built)
+### Provenance: `what` / `why` (SHIPPING — store-relative provenance)
 
-Lens 2's provenance commands: `what /usr/bin/foo` traces a file back through the
-store closure to its derivation; `why` is the inverse (what does a package/derivation
-produce and depend on). The command shows its derivation — the datalog proof tree /
-build closure. The manifesto made executable.
+Lens 2's provenance commands: `fx-what /bin/foo` traces an installed file back
+through its activation `install` relation to the store dir that provides it,
+then through the dependency closure to the roots that pulled it in; `fx-why` is
+the inverse (what does a package provide and depend on). The command shows its
+derivation — the datalog proof tree / build closure. The manifesto made
+executable. **SHIPPING** as store-relative provenance over the activation
+facts (schema + full story in the provenance section below).
 
 ---
 
@@ -373,28 +376,62 @@ eight**; only the *engine* is reserved for where it pays.
 
 ---
 
-## Provenance: `what` / `why` (design-only — scoped, not yet built)
+## Provenance: `what` / `why` (SHIPPING — store-relative provenance)
 
-Lens 2's provenance commands: `what /usr/bin/foo` traces a file back through the
-store closure to its derivation; `why` is the inverse (what does a package/derivation
-produce and depend on). The command shows its derivation — the datalog proof tree /
-build closure. The manifesto made executable.
+Lens 2's provenance commands: `fx-what /bin/foo` traces an installed file back
+through the store closure to its derivation; `fx-why` is the inverse (what does
+a package provide and depend on). The command shows its derivation — the datalog
+proof tree / build closure. The manifesto made executable.
 
-**First slice decision (2026-08): DESIGN-ONLY.** fx-find ships now; what/why is
-written up here and implemented in a later pass, once the store closure is
-resolvable from Zig. Do not fabricate a seeded ownership relation — real provenance
-rides the fxstore snapshot closure (`provides(pkg, path)` / `derives(path, pkg, src)`
-relations in the store DB), and a fake POC would teach the wrong lesson.
+**The shipped slice (2026-08): store-relative provenance.** The design-only
+sketch this section used to carry was wrong about the data model, so the schema
+first: the store DB never had `provides(pkg, path)` / `derives(path, pkg, src)`
+relations. What exists is the activation pkg graph
+(`store`/`pkg`/`dep`/`root`/`closure`, all snapshot-versioned) with derivations
+implicit in the content-addressed hex — and nothing mapping an *installed* path
+back to any of it. The slice materializes exactly that mapping as two new
+snapshot-versioned relations, written by fx-activate in the SAME activation txn
+as the `generation`/`svc` facts (idempotent `declare`, clear-and-rewrite on
+re-activation, so every snapshot is self-consistent):
 
-Design sketch (to implement later):
-- `what PATH` — query `provides(pkg,path)` (or `derives(path,pkg,src)`) in the
-  store DB for `PATH`; follow `depends_on(pkg,pkg2)` closure to show the derivation
-  chain. Output = the datalog proof tree.
-- `why PKG` — inverse: the set of store paths a package produces + the dependency
-  closure that pulls it in. Reuses the same closure relation as fxstore GC
-  (`reachable from CURRENT snapshot`).
-- Both are pure queries over existing relations → zero engine work; the hard part
-  is the store-closure resolution path from Zig, which is why it's deferred.
+- `install(target, origin, mode, genhash)` — one fact per installed file.
+  `target` is rootfs-absolute (`/etc/p`, `/bin/name`); `origin` is
+  STORE-relative (`{genhash}-system-generation/etc/p` for the /etc copies,
+  `{hash}-{pkg}` for the /bin symlinks) so facts survive store relocation —
+  resolved against `--store` at query time; `mode` is the raw u32 (0o644 for
+  etc files, 0 for symlinks) so the reconcile pass can compare
+  `st_mode & 0o7777`; `genhash` pins the snapshot that wrote the fact.
+- `provides(pkg, store_dir)` — the pkg-name → store-dir mapping
+  (`{hash}-{pkg}`) that used to be implicit in the derivation hex.
+
+The write side is the real activation txn, not a seeded relation — the old
+"do not fabricate a seeded ownership relation; a fake POC teaches the wrong
+lesson" rule kept by construction. The query engine lives in fxstore (it owns
+the store schema + closure semantics); the `fx-what` / `fx-why` coreutils are
+thin readers that open the store DB — query decoupled from the write side.
+
+- `fx-what PATH [--as-of N] [--store DIR]` — resolve `install(target)` as-of
+  the snapshot → store-relative origin → `provides` inverse → pkg → dependency
+  closure → the indented datalog proof tree (which roots pull it in). An
+  unmanaged path (no `install` fact) is a clear error suggesting `verify`.
+- `fx-why PKG [--as-of N] [--store DIR]` — inverse: the closure the pkg pulls
+  in, its store dir, the targets it provides, and which roots reach it.
+- Both ride the store snapshot timeline (the same as-of read every other
+  store reader uses): `--as-of N` answers over history, and pre-prov snapshots
+  (relations absent) read as empty, not as errors.
+- `fxstore verify` — the truth pass, because declared buildfile actions ≠
+  on-disk state. Per `install` fact: lstat the target (**missing**), compare
+  symlink target vs origin (**link_target**), content-hash etc files against
+  the store copy (**hash**), compare mode bits (**mode**); plus a walk of
+  /etc + /bin for entries no `install` fact claims (**unmanaged**).
+
+Roll-forward consistency: the automated boot roll-forward re-publishes the
+target generation's activation facts, prov relations included, so provenance
+agrees with the restored store. **Documented cut:** the manual `fxstore
+rollback` CLI still leaves prov facts at the pre-rollback activation — the
+same pre-existing semantics as every other activation fact
+(`generation`/`svc`); `verify` flags the disagreement in the meantime, and the
+next automated roll-forward re-converges it. On the books rather than silent.
 
 ## Build order (proof-of-concept, smallest → thesis-defining)
 
@@ -409,8 +446,13 @@ Design sketch (to implement later):
    **SHIPPING.** (The `fx history` / journal timeline is **REMOVED** — the
    design below is kept conceptually, but the journal/record/history code has
    been deleted and is deprioritized "for now".)
-4. **Provenance `what` / `why`** — design written up (above); implements once
-   store-closure resolution from Zig lands.
+4. **Provenance `what` / `why`** — **SHIPPING**: store-relative provenance over
+   the activation-written `install(target,origin,mode,genhash)` /
+   `provides(pkg,store_dir)` relations — `fx-what` / `fx-why` coreutils plus
+   `fxstore what/why/verify`, as-of any store snapshot, with the
+   reconcile/verify drift pass (see the provenance section above). Known cut:
+   manual `fxstore rollback` leaves prov facts at the pre-rollback activation
+   (shared with generation/svc) — documented, re-converges on roll-forward.
 5. **Typed command composition / `fx-compose`** — the real differentiator (Lens 3),
    biggest scope, do last.
 6. **The 2026-08-24 batch** — `ls`, `du`, `sort`, `uniq`, `wc` **SHIPPING** as
