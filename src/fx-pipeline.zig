@@ -168,7 +168,9 @@ pub fn resetArena() void {
 ///
 /// Signatures (Lens 3, 2026-08-24 batch): find single->rows; grep rows->lines;
 /// ls single->rows; cat bytes->bytes; head/tail/sort/uniq lines->lines; wc
-/// lines->single {lines,words,bytes}; du single {path} -> rows {path,bytes}.
+/// lines->single {lines,words,bytes}; du single {path} -> rows {path,bytes};
+/// nl/expand lines->lines; cksum bytes->single {sum,bytes}; sha256sum
+/// bytes->single {hash}.
 pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
@@ -217,6 +219,24 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         const in_t = try parseType("{ path : Text }", gpa);
         const out_t = try parseType("{ path : Text, bytes : Natural }", gpa);
         return .{ .name = "du", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
+    }
+    // nl:    lines -> lines
+    if (std.mem.eql(u8, name, "nl")) {
+        return .{ .name = "nl", .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
+    }
+    // expand: lines -> lines
+    if (std.mem.eql(u8, name, "expand")) {
+        return .{ .name = "expand", .input = .{ .tag = .lines }, .output = .{ .tag = .lines } };
+    }
+    // cksum: bytes -> single { sum, bytes }
+    if (std.mem.eql(u8, name, "cksum")) {
+        const out_t = try parseType("{ sum : Natural, bytes : Natural }", gpa);
+        return .{ .name = "cksum", .input = .{ .tag = .bytes }, .output = Shape.single(out_t) };
+    }
+    // sha256sum: bytes -> single { hash }
+    if (std.mem.eql(u8, name, "sha256sum")) {
+        const out_t = try parseType("{ hash : Text }", gpa);
+        return .{ .name = "sha256sum", .input = .{ .tag = .bytes }, .output = Shape.single(out_t) };
     }
     return error.UnknownCommand;
 }
@@ -325,4 +345,53 @@ test "registry: du |> cat rejected (rows vs bytes)" {
     const du = try builtin("du", t.allocator);
     const cat = try builtin("cat", t.allocator);
     try t.expectError(error.ShapeMismatch, compose(du, cat));
+}
+
+test "registry: grep |> nl |> sort |> uniq |> wc composes" {
+    // grep rows->lines, nl/expand-style text filters lines->lines, wc
+    // lines->single.
+    const grep = try builtin("grep", t.allocator);
+    const nl = try builtin("nl", t.allocator);
+    const sort = try builtin("sort", t.allocator);
+    const uniq = try builtin("uniq", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try compose(grep, nl);
+    try compose(nl, sort);
+    try compose(sort, uniq);
+    try compose(uniq, wc);
+}
+
+test "registry: cat |> cksum and cat |> sha256sum compose" {
+    // cat bytes->bytes, checksums bytes->single.
+    const cat = try builtin("cat", t.allocator);
+    const cksum = try builtin("cksum", t.allocator);
+    const sha256sum = try builtin("sha256sum", t.allocator);
+    try compose(cat, cksum);
+    try compose(cat, sha256sum);
+}
+
+test "registry: grep |> expand |> wc composes" {
+    const grep = try builtin("grep", t.allocator);
+    const expand = try builtin("expand", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try compose(grep, expand);
+    try compose(expand, wc);
+}
+
+test "registry: nl |> find rejected (lines vs single)" {
+    const nl = try builtin("nl", t.allocator);
+    const find = try builtin("find", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(nl, find));
+}
+
+test "registry: cksum |> sort rejected (single vs lines)" {
+    const cksum = try builtin("cksum", t.allocator);
+    const sort = try builtin("sort", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(cksum, sort));
+}
+
+test "registry: wc |> nl rejected (single vs lines)" {
+    const wc = try builtin("wc", t.allocator);
+    const nl = try builtin("nl", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(wc, nl));
 }
