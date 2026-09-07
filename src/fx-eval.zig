@@ -15,7 +15,9 @@
 //            FILE operand (cat/sort/head/tail/uniq/wc/nl/expand/cksum/
 //            sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum);
 //            ls/du are OPERAND stages — argv [--rows + root-from-
-//            args], pipeline input ignored (mirror find).
+//            args], pipeline input ignored (mirror find); basename/dirname/
+//            realpath are TEXT-OPERAND stages — argv [path-value, suffix?]
+//            with the prior stage's single-Text VALUE as the PATH operand.
 //
 // This module is hermetic: its unit tests use .native dispatch + a mkdtemp
 // state dir (the caslog test idiom) so no binaries spawn and $HOME is untouched.
@@ -133,7 +135,9 @@ pub const Diverged = struct {
 /// -b/-t flag from args plus the file operand; the checksum stages (wc/cksum/
 /// sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum) get their
 /// filename token postprocessed (T2); ls/du are OPERAND stages run with --rows
-/// so they emit canonical wire rows.  `idempotent` marks stages where
+/// so they emit canonical wire rows; basename/dirname/realpath are TEXT-OPERAND
+/// stages fed the prior stage's single-Text VALUE as the PATH operand.
+/// `idempotent` marks stages where
 /// f(f(x)) == f(x) (used by --converge); only sort, uniq and expand are so
 /// marked (trivially true, a demonstration not a prover).
 pub const DispatchEntry = struct {
@@ -164,6 +168,9 @@ pub fn dispatchTable() []const DispatchEntry {
         .{ .name = "sum", .dispatch = .{ .exec = .{ .binary = "sum" } }, .idempotent = false },
         .{ .name = "ls", .dispatch = .{ .exec = .{ .binary = "ls" } }, .idempotent = false },
         .{ .name = "du", .dispatch = .{ .exec = .{ .binary = "du" } }, .idempotent = false },
+        .{ .name = "basename", .dispatch = .{ .exec = .{ .binary = "basename" } }, .idempotent = false },
+        .{ .name = "dirname", .dispatch = .{ .exec = .{ .binary = "dirname" } }, .idempotent = false },
+        .{ .name = "realpath", .dispatch = .{ .exec = .{ .binary = "realpath" } }, .idempotent = false },
     };
 }
 
@@ -446,10 +453,14 @@ fn dispatchStage(
 }
 
 /// exec dispatch: run the real fx-<binary> and capture stdout
-/// (std.process.run, stdin=.ignore).  Two argv shapes:
+/// (std.process.run, stdin=.ignore).  Three argv shapes:
 ///   OPERAND stages (ls/du): [bin, "--rows", args?] — the stage args are the
 ///     TREE ROOT (mirror find: the pipeline input is ignored entirely, no file
 ///     operand; in_hash still covers name+args via stageInHash).
+///   TEXT-OPERAND stages (basename/dirname/realpath): [bin, path, suffix?] —
+///     the prior stage's single-Text VALUE is decoded from the bare-Text wire
+///     form and passed as the PATH operand (basename's stage args are the
+///     SUFFIX; dirname/realpath reject args); no CAS blob is materialized.
 ///   file-operand stages: [bin, flags..., cas_path] with the prior stage's CAS
 ///     blob path as the FILE operand.  Per-binary flags: head/tail -n N
 ///     (default 10); nl -b <args> and expand -t <args> when args is non-empty.
@@ -462,9 +473,16 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     // operand stages never see the pipeline input, so no CAS blob is materialized
     const operand_stage = std.mem.eql(u8, binary, "ls") or std.mem.eql(u8, binary, "du");
 
+    // text-operand stages (basename/dirname/realpath) decode the prior
+    // stage's single-Text VALUE and pass it as the PATH operand — the VALUE
+    // rides in argv, so no CAS blob is materialized for them either
+    const text_operand_stage = std.mem.eql(u8, binary, "basename") or
+        std.mem.eql(u8, binary, "dirname") or
+        std.mem.eql(u8, binary, "realpath");
+
     var pb: [std.posix.PATH_MAX]u8 = undefined;
     var cas_path: ?[:0]const u8 = null;
-    if (!operand_stage) {
+    if (!operand_stage and !text_operand_stage) {
         // materialize input as a CAS blob path to pass as the FILE operand
         const in_hex = try caslog.casPut(ctx.state_dir, input);
         cas_path = std.fmt.bufPrintZ(&pb, "{s}/cas/{s}", .{ ctx.state_dir, in_hex[0..64] }) catch
@@ -475,6 +493,12 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     const bin_path = std.fmt.bufPrintZ(&binbuf, "{s}/fx-{s}", .{ bin_dir, binary }) catch
         return error.BadStateDir;
 
+    // decoded single-Text VALUE for text-operand stages — freed at FUNCTION
+    // scope (a defer inside the argv-building block below would free it
+    // before the spawn, leaving argv holding freed memory)
+    var path_text: ?[]const u8 = null;
+    defer if (path_text) |pt| ctx.gpa.free(pt);
+
     // build argv per-binary: [bin, flags..., operand]
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(ctx.gpa);
@@ -484,6 +508,29 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         // ls/du text output is display-only and does not round-trip the type
         argv.append(ctx.gpa, "--rows") catch return error.NoMem;
         if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+    } else if (text_operand_stage) {
+        // the PATH operand is the prior stage's single-Text VALUE, decoded
+        // from the bare-Text wire form — not a CAS blob path
+        const pt = wire.decodeSingleText(ctx.gpa, input) catch |e| {
+            std.debug.print("fx-eval: {s}: input is not a bare-Text single value (e={s})\n", .{ binary, @errorName(e) });
+            return error.StageFailed;
+        };
+        path_text = pt;
+        if (std.mem.indexOfScalar(u8, pt, 0) != null) {
+            std.debug.print("fx-eval: {s}: path value contains a NUL byte (execve argv cannot carry it)\n", .{binary});
+            return error.StageFailed;
+        }
+        // only basename takes stage args (the SUFFIX operand: fx-basename NAME
+        // [SUFFIX]); dirname/realpath with args would pass extra operands and
+        // emit multiple lines, breaking the single-Text output shape
+        if (stage.args.len > 0 and !std.mem.eql(u8, binary, "basename")) {
+            std.debug.print("fx-eval: {s}: stage args '{s}' rejected (extra operands would emit multiple lines)\n", .{ binary, stage.args });
+            return error.StageFailed;
+        }
+        argv.append(ctx.gpa, pt) catch return error.NoMem;
+        if (std.mem.eql(u8, binary, "basename") and stage.args.len > 0) {
+            argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+        }
     } else {
         var cnt: [64]u8 = undefined;
         if (std.mem.eql(u8, binary, "head") or std.mem.eql(u8, binary, "tail")) {
@@ -540,6 +587,9 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     }
     if (std.mem.eql(u8, binary, "sum")) {
         return sumPostProcess(ctx.gpa, res.stdout);
+    }
+    if (text_operand_stage) {
+        return singleTextPostProcess(ctx.gpa, res.stdout);
     }
     return gpa_dupe(ctx.gpa, res.stdout);
 }
@@ -680,6 +730,18 @@ fn sumPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
         .{ .name = "blocks", .value = .{ .natural = blocks } },
     } };
     return wire.encodeSingleOrdered(gpa, single_v, &.{ "checksum", "blocks" }, &.{ .natural, .natural });
+}
+
+/// single-Text postprocess (basename/dirname/realpath): the child's stdout
+/// must be EXACTLY one line — strip the single trailing LF, reject any further
+/// LF or trailing content (extra operands would have emitted multiple lines) —
+/// then re-emit the value as a canonical bare-Text single (the declared
+/// single Text output, S8).
+fn singleTextPostProcess(gpa: Allocator, stdout: []const u8) ![]u8 {
+    if (stdout.len == 0 or stdout[stdout.len - 1] != '\n') return error.StageFailed;
+    const body = stdout[0 .. stdout.len - 1];
+    if (std.mem.indexOfScalar(u8, body, '\n') != null) return error.StageFailed;
+    return wire.encodeSingleText(gpa, body);
 }
 
 fn shapeTagName(s: Shape) []const u8 {
@@ -1454,5 +1516,128 @@ test "exec dispatch: ls/du are --rows operand stages; du|>grep composes (hermeti
         const out = try caslog.casGet(gpa, fix.state, lrep.final_hash);
         defer gpa.free(out);
         try testing.expectEqualStrings("{\"name\":\"ls:1:--rows:\",\"size\":1,\"mode\":2}\n", out);
+    }
+}
+
+test "exec dispatch: basename text-operand argv pin (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // the fake folds $#/$1/$2 into ONE emitted line so the test pins argv
+    // EXACTLY: [path] with no args ($# == 1), [path, suffix] with args
+    // ($# == 2) — and never a CAS file operand.
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "basename", "#!/bin/sh\necho \"bn:$#:$1:$2\"\n");
+
+    const input = try wire.encodeSingleText(gpa, "IN");
+    defer gpa.free(input);
+    {
+        const stages = [_]Stage{.{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("\"bn:1:IN:\"\n", out);
+    }
+    {
+        // stage args ride as the SUFFIX operand (fx-basename NAME [SUFFIX])
+        const stages = [_]Stage{.{ .name = "basename", .args = ".txt", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("\"bn:2:IN:.txt\"\n", out);
+    }
+}
+
+test "exec dispatch: basename |> dirname single-Text chain + replay (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "basename", "#!/bin/sh\necho \"bn:$1\"\n");
+    try writeFakeBin(bin_dir, "dirname", "#!/bin/sh\necho \"dn:$1\"\n");
+
+    // the bare-Text wire VALUE must flow stage-to-stage: basename receives the
+    // decoded initial value, dirname receives basename's re-encoded output.
+    const stages = [_]Stage{
+        .{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } },
+        .{ .name = "dirname", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } },
+    };
+    const input = try wire.encodeSingleText(gpa, "/a/b/c.txt");
+    defer gpa.free(input);
+    const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
+    defer freeRunReport(gpa, &rep);
+    const s0 = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
+    defer gpa.free(s0);
+    try testing.expectEqualStrings("\"bn:/a/b/c.txt\"\n", s0);
+    const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
+    defer gpa.free(final);
+    try testing.expectEqualStrings("\"dn:bn:/a/b/c.txt\"\n", final);
+
+    // determinism gate through the new codec
+    const div = try replay(&rep, fix.state, bin_dir, gpa, testing.io);
+    try testing.expect(div == null);
+}
+
+test "exec dispatch: text-operand stage errors are StageFailed (hermetic)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "basename", "#!/bin/sh\necho \"bn:$1\"\n");
+    try writeFakeBin(bin_dir, "dirname", "#!/bin/sh\necho \"dn:$1\"\n");
+    // a misbehaving child: TWO output lines break the single-Text shape
+    try writeFakeBin(bin_dir, "realpath", "#!/bin/sh\necho a\necho b\n");
+
+    // record-single input (the old wire form, not the bare-Text value)
+    {
+        const stages = [_]Stage{.{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        try testing.expectError(error.StageFailed, run(&stages, "{\"path\":\"/a\"}\n", fix.state, bin_dir, gpa, testing.io));
+    }
+    // NUL byte in the text value — execve argv cannot carry it
+    {
+        const input = try wire.encodeSingleText(gpa, "a\x00b");
+        defer gpa.free(input);
+        const stages = [_]Stage{.{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
+    }
+    // dirname with stage args — the extra operand would emit multiple lines
+    {
+        const input = try wire.encodeSingleText(gpa, "/a/b");
+        defer gpa.free(input);
+        const stages = [_]Stage{.{ .name = "dirname", .args = "x", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
+    }
+    // a child emitting TWO lines
+    {
+        const input = try wire.encodeSingleText(gpa, "/a/b");
+        defer gpa.free(input);
+        const stages = [_]Stage{.{ .name = "realpath", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
     }
 }

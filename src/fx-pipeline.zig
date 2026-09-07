@@ -171,7 +171,9 @@ pub fn resetArena() void {
 /// lines->single {lines,words,bytes}; du single {path} -> rows {path,bytes};
 /// nl/expand lines->lines; cksum bytes->single {sum,bytes}; md5sum/sha1sum/
 /// sha224sum/sha256sum/sha384sum/sha512sum bytes->single {hash}; sum
-/// bytes->single {checksum,blocks}.
+/// bytes->single {checksum,blocks}; basename/dirname/realpath single Text ->
+/// single Text (the bare-Text single VALUE wire form feeds the scalar PATH
+/// operand).
 pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
@@ -254,6 +256,17 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     if (std.mem.eql(u8, name, "sum")) {
         const out_t = try parseType("{ checksum : Natural, blocks : Natural }", gpa);
         return .{ .name = "sum", .input = .{ .tag = .bytes }, .output = Shape.single(out_t) };
+    }
+    // basename/dirname/realpath: single Text -> single Text — the bare-Text
+    // single VALUE wire form (a canonical JSON string, not a record) feeds the
+    // binary's scalar PATH operand; basename's stage args are the SUFFIX
+    if (std.mem.eql(u8, name, "basename") or
+        std.mem.eql(u8, name, "dirname") or
+        std.mem.eql(u8, name, "realpath"))
+    {
+        const in_t = try parseType("Text", gpa);
+        const out_t = try parseType("Text", gpa);
+        return .{ .name = name, .input = Shape.single(in_t), .output = Shape.single(out_t) };
     }
     return error.UnknownCommand;
 }
@@ -421,4 +434,33 @@ test "registry: wc |> nl rejected (single vs lines)" {
     const wc = try builtin("wc", t.allocator);
     const nl = try builtin("nl", t.allocator);
     try t.expectError(error.ShapeMismatch, compose(wc, nl));
+}
+
+test "registry: basename |> dirname |> realpath compose (single Text chain)" {
+    // the three path-text stages are single Text -> single Text, so any chain
+    // of them is strict-alpha-equal end to end.
+    const basename = try builtin("basename", t.allocator);
+    const dirname = try builtin("dirname", t.allocator);
+    const realpath = try builtin("realpath", t.allocator);
+    try compose(basename, dirname);
+    try compose(dirname, realpath);
+    try compose(basename, basename);
+}
+
+test "registry: wc |> basename rejected (SingleMismatch: record vs Text)" {
+    // same shape tag (single) but wc's single is a record {lines,words,bytes}
+    // while basename's input single is the scalar Text — not alpha-equal.
+    const wc = try builtin("wc", t.allocator);
+    const basename = try builtin("basename", t.allocator);
+    try t.expectError(error.SingleMismatch, compose(wc, basename));
+    const cksum = try builtin("cksum", t.allocator);
+    try t.expectError(error.SingleMismatch, compose(cksum, basename));
+}
+
+test "registry: basename |> sort and basename |> wc rejected (single vs lines)" {
+    const basename = try builtin("basename", t.allocator);
+    const sort = try builtin("sort", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(basename, sort));
+    try t.expectError(error.ShapeMismatch, compose(basename, wc));
 }

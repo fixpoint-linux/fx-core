@@ -378,9 +378,13 @@ its own output is a no-op; this is what composes with the journal's roll-forward
 - **fx-compose stage cuts (v1, 2026-08-24):** `paste`/`comm` are out (two-file
   semantics — a second live-path operand passed as stage args breaks hermetic
   replay); `seq`/`echo`/`yes` are out (output generators — no input shape);
-  `basename`/`dirname`/`realpath` are deferred (they need a single-`Text`
+  `basename`/`dirname`/`realpath` were deferred (they need a single-`Text`
   *value* wire form to feed a scalar operand — a wire gap, not a registry
-  rejection); the six remaining checksum flavors (`md5sum`/`sha1sum`/
+  rejection) — **resolved later in the batch:** the bare-Text single VALUE
+  wire form shipped (one canonical JSON string + LF, the same `writeString`
+  escaping as every other wire string), and all three are now staged as
+  single `Text` -> single `Text` (`fx-compose --text /a/b/c.txt basename
+  dirname`); the six remaining checksum flavors (`md5sum`/`sha1sum`/
   `sha224sum`/`sha384sum`/`sha512sum`/`b2sum`) are mechanical clones of
   `cksum`/`sha256sum`. Each is a deliberate cut, not an omission.
 
