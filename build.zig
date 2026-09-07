@@ -506,7 +506,11 @@ pub fn build(b: *std.Build) void {
     // CONFLICT RULE: build.zig is touched ONLY by this block.  Wave-3
     // units (U7 fx-what / U8 fx-why) edit their src/fx-*.zig files
     // exclusively — the exes, run steps and test steps are pre-registered
-    // here so wave 3 never reopens the build graph.
+    // here so wave 3 never reopens the build graph.  (U7 amendment: the
+    // query bodies also open the store db themselves — fx_store_open over
+    // the discovered root — so the shared exe imports below gained the
+    // mirrored store/closure modules; one edit for BOTH cmds, fx-why
+    // never reopens this file.)
     // -----------------------------------------------------------------------
     const packageset_mod = b.createModule(.{
         .root_source_file = b.path("../fxstore/zig/src/packageset.zig"),
@@ -584,6 +588,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "provenance", .module = prov_mod },
+                    .{ .name = "store", .module = store_mod },
+                    .{ .name = "closure", .module = closure_mod },
                 },
             }),
         });
