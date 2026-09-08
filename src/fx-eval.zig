@@ -137,10 +137,13 @@ pub const Diverged = struct {
 /// -b/-t flag from args plus the file operand; the checksum stages (wc/cksum/
 /// sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum) get their
 /// filename token postprocessed (T2); ls/du are OPERAND stages run with --rows
-/// so they emit canonical wire rows; basename/dirname/realpath are TEXT-OPERAND
-/// stages fed the prior stage's single-Text VALUE as the PATH operand; echo/seq
+/// so they emit canonical wire rows; tree/df join them as OPERAND stages (the
+/// stage args are the ROOT/PATH operand; empty args -> the child's default);
+/// basename/dirname/realpath are TEXT-OPERAND stages fed the prior stage's
+/// single-Text VALUE as the PATH operand; echo/seq
 /// are GENERATOR (source) stages — argv [bin, args?], no file operand, no
-/// pipeline input.  `idempotent` marks stages where
+/// pipeline input; ps/top join the generators with argv [bin, --rows, flags?].
+/// `idempotent` marks stages where
 /// f(f(x)) == f(x) (used by --converge); only sort, uniq and expand are so
 /// marked (trivially true, a demonstration not a prover).
 pub const DispatchEntry = struct {
@@ -175,9 +178,13 @@ pub fn dispatchTable() []const DispatchEntry {
         .{ .name = "sum", .dispatch = .{ .exec = .{ .binary = "sum" } }, .idempotent = false },
         .{ .name = "ls", .dispatch = .{ .exec = .{ .binary = "ls" } }, .idempotent = false },
         .{ .name = "du", .dispatch = .{ .exec = .{ .binary = "du" } }, .idempotent = false },
+        .{ .name = "tree", .dispatch = .{ .exec = .{ .binary = "tree" } }, .idempotent = false },
+        .{ .name = "df", .dispatch = .{ .exec = .{ .binary = "df" } }, .idempotent = false },
         .{ .name = "basename", .dispatch = .{ .exec = .{ .binary = "basename" } }, .idempotent = false },
         .{ .name = "dirname", .dispatch = .{ .exec = .{ .binary = "dirname" } }, .idempotent = false },
         .{ .name = "realpath", .dispatch = .{ .exec = .{ .binary = "realpath" } }, .idempotent = false },
+        .{ .name = "ps", .dispatch = .{ .exec = .{ .binary = "ps" } }, .idempotent = false },
+        .{ .name = "top", .dispatch = .{ .exec = .{ .binary = "top" } }, .idempotent = false },
     };
 }
 
@@ -460,16 +467,17 @@ fn dispatchStage(
 }
 
 /// exec dispatch: run the real fx-<binary> and capture stdout
-/// (std.process.run, stdin=.ignore).  Four argv shapes:
-///   OPERAND stages (ls/du): [bin, "--rows", args?] — the stage args are the
-///     TREE ROOT (mirror find: the pipeline input is ignored entirely, no file
-///     operand; in_hash still covers name+args via stageInHash).
+/// (std.process.run, stdin=.ignore).  Five argv shapes:
+///   OPERAND stages (ls/du/tree/df): [bin, "--rows", args?] — the stage args
+///     are the TREE ROOT / PATH operand (mirror find: the pipeline input is
+///     ignored entirely, no file operand; in_hash still covers name+args via
+///     stageInHash).  tree/df default to "."/all-mounts when args is empty.
 ///   TEXT-OPERAND stages (basename/dirname/realpath): [bin, path, suffix?] —
 ///     the prior stage's single-Text VALUE is decoded from the bare-Text wire
 ///     form and passed as the PATH operand (basename's stage args are the
 ///     SUFFIX; dirname/realpath reject args); no CAS blob is materialized.
-///   GENERATOR stages (echo/seq): [bin, args?] — SOURCE stages, no file
-///     operand and no pipeline input at all (valid only at position 0, which
+///   GENERATOR stages (echo/seq/ps/top): SOURCE stages, no file operand and
+///     no pipeline input at all (valid only at position 0, which
 ///     shapeCompatible enforces).  echo passes its stage args as ONE verbatim
 ///     text operand (empty args -> argv [bin] -> a bare newline, GNU echo
 ///     behavior; a leading-dash arg reaches fx-echo's option parser and fails
@@ -477,7 +485,12 @@ fn dispatchStage(
 ///     operands mirroring fx-seq parsePosixArgs, EXCEPT an arg starting with
 ///     '{' passes verbatim as one operand (fx-seq's Dhall-record form); empty
 ///     seq args fail loudly before the spawn (a source with nothing to
-///     generate has no invented default).
+///     generate has no invented default).  ps/top run as [bin, "--rows",
+///     flags?]: the stage args are whitespace-split into flag tokens (e.g.
+///     "top:-n 10" -> ["-n","10"]; "-m" rides through as one) — unknown flags
+///     fail loudly in the child, and the Dhall-record form is NOT reachable
+///     through the pipeline (argv[1] is "--rows", so the child's record-form
+///     branch never fires; use the binary directly for that form).
 ///   TWO-FILE stages (paste/comm): [bin, cas_path, PATH2] — the prior stage's
 ///     CAS blob path is FILE1 and the stage args are the SECOND FILE PATH
 ///     verbatim (live-read at run AND replay — the find/ls/du live-operand
@@ -494,7 +507,8 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     const bin_dir = ctx.bin_dir orelse return error.UnknownCommand;
 
     // operand stages never see the pipeline input, so no CAS blob is materialized
-    const operand_stage = std.mem.eql(u8, binary, "ls") or std.mem.eql(u8, binary, "du");
+    const operand_stage = std.mem.eql(u8, binary, "ls") or std.mem.eql(u8, binary, "du") or
+        std.mem.eql(u8, binary, "tree") or std.mem.eql(u8, binary, "df");
 
     // text-operand stages (basename/dirname/realpath) decode the prior
     // stage's single-Text VALUE and pass it as the PATH operand — the VALUE
@@ -503,9 +517,13 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         std.mem.eql(u8, binary, "dirname") or
         std.mem.eql(u8, binary, "realpath");
 
-    // generator stages (echo/seq) are SOURCES: no pipeline input, no CAS blob
+    // generator stages (echo/seq/ps/top) are SOURCES: no pipeline input, no
+    // CAS blob.  ps/top emit wire rows (argv [--rows, flags?]) instead of
+    // echo/seq's raw lines.
     const generator_stage = std.mem.eql(u8, binary, "echo") or
-        std.mem.eql(u8, binary, "seq");
+        std.mem.eql(u8, binary, "seq") or
+        std.mem.eql(u8, binary, "ps") or
+        std.mem.eql(u8, binary, "top");
 
     // two-file stages (paste/comm): the prior stage's CAS blob is FILE1, the
     // stage args are the SECOND FILE PATH verbatim (live-read at run AND
@@ -570,7 +588,7 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
             // the whole post-':' arg is ONE verbatim text operand (spaces
             // included); empty args -> argv [bin] -> a bare newline
             if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-        } else {
+        } else if (std.mem.eql(u8, binary, "seq")) {
             // seq: fast-fail on empty args before the spawn (mirrors the
             // dirname extra-args rejection above) — fx-seq with no operand is
             // MissingOperand, but the engine rejects it itself so the contract
@@ -604,6 +622,20 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
                     std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
                     return error.StageFailed;
                 }
+            }
+        } else {
+            // ps/top: [bin, "--rows", flags?] — the stage args are
+            // whitespace-split into flag tokens (a single "-m"/"-c" rides
+            // through as one; "top:-n 10" must reach the child as TWO argv
+            // tokens or fx-top's parser rejects "-n 10").  Unknown flags fail
+            // loudly in the child; empty args -> [--rows] -> the child's
+            // default sort/count.  Unlike seq there is no engine-side token
+            // validation: the flags are the child's vocabulary, not the
+            // engine's.
+            argv.append(ctx.gpa, "--rows") catch return error.NoMem;
+            var it = std.mem.tokenizeAny(u8, stage.args, " \t");
+            while (it.next()) |tok| {
+                argv.append(ctx.gpa, tok) catch return error.NoMem;
             }
         }
     } else if (two_file_stage) {
@@ -1608,6 +1640,112 @@ test "exec dispatch: ls/du are --rows operand stages; du|>grep composes (hermeti
         const out = try caslog.casGet(gpa, fix.state, lrep.final_hash);
         defer gpa.free(out);
         try testing.expectEqualStrings("{\"name\":\"ls:1:--rows:\",\"size\":1,\"mode\":2}\n", out);
+    }
+}
+
+test "exec dispatch: tree/df/ps/top --rows argv pin (hermetic fakes)" {
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    // fakes fold $#/$1/$2/$3 into the emitted wire row so the test pins each
+    // argv EXACTLY: tree/df [bin, --rows, operand] / [bin, --rows] (operand
+    // stages, no CAS file operand ever); ps [bin, --rows, flags...] with the
+    // flags whitespace-split ("top:-n 10" must arrive as TWO tokens).
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "tree",
+        \\#!/bin/sh
+        \\echo "{\"path\":\"tree:$#:$1:$2\",\"kind\":\"Dir\",\"size\":1,\"mtime\":2}"
+        \\
+    );
+    try writeFakeBin(bin_dir, "df",
+        \\#!/bin/sh
+        \\echo "{\"fs\":\"df:$#:$1:$2\",\"mount\":\"/\",\"total_kb\":8,\"used_kb\":4,\"avail_kb\":4}"
+        \\
+    );
+    try writeFakeBin(bin_dir, "ps",
+        \\#!/bin/sh
+        \\echo "{\"pid\":$#,\"state\":\"ps:$1:$2\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}"
+        \\
+    );
+    try writeFakeBin(bin_dir, "top",
+        \\#!/bin/sh
+        \\echo "{\"pid\":$#,\"state\":\"top:$1:$2:$3\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}"
+        \\
+    );
+
+    // tree:/root |> grep:tree:[0-9]+ — tree's rows are find's EXACT type, so
+    // the exec stage's canonical wire rows feed the NATIVE DAFSA grep end to
+    // end, exactly like the du|>grep test above.  The pipeline input is
+    // ignored by the operand stage: it appears in no output.
+    {
+        const stages = [_]Stage{
+            .{ .name = "tree", .args = "/root", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+            .{ .name = "grep", .args = "tree:[0-9]+", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+        };
+        const rep = try run(&stages, "GARBAGE-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const tree_out = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
+        defer gpa.free(tree_out);
+        try testing.expectEqualStrings("{\"path\":\"tree:2:--rows:/root\",\"kind\":\"Dir\",\"size\":1,\"mtime\":2}\n", tree_out);
+        const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(final);
+        try testing.expectEqualStrings("tree:2:--rows:/root\n", final);
+    }
+
+    // df: alone (operand stage): [--rows, /] — and empty args -> [--rows]
+    // (the all-mounts default lives in the child).
+    {
+        const stages = [_]Stage{.{ .name = "df", .args = "/", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
+        const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"fs\":\"df:2:--rows:/\",\"mount\":\"/\",\"total_kb\":8,\"used_kb\":4,\"avail_kb\":4}\n", out);
+    }
+    {
+        const stages = [_]Stage{.{ .name = "df", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
+        const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"fs\":\"df:1:--rows:\",\"mount\":\"/\",\"total_kb\":8,\"used_kb\":4,\"avail_kb\":4}\n", out);
+    }
+
+    // ps (generator): bare -> [--rows]; with flags -> [--rows, -m]
+    {
+        const stages = [_]Stage{.{ .name = "ps", .args = "", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
+        const rep = try run(&stages, "GARBAGE-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"pid\":1,\"state\":\"ps:--rows:\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
+    }
+    {
+        const stages = [_]Stage{.{ .name = "ps", .args = "-m", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
+        const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"pid\":2,\"state\":\"ps:--rows:-m\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
+    }
+
+    // top:-n 10 (generator): the args MUST split into two tokens — the fake
+    // folds $3 so a verbatim single "-n 10" arg ($2 == "-n 10", no $3) fails.
+    {
+        const stages = [_]Stage{.{ .name = "top", .args = "-n 10", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
+        const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
+        defer freeRunReport(gpa, &rep);
+        const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{\"pid\":3,\"state\":\"top:--rows:-n:10\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
     }
 }
 

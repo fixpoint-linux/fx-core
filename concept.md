@@ -66,6 +66,27 @@ boundaries, not continuously) becomes a relation that time-travel can as-of quer
 > - `cat`/`head`/`tail` = clean typed binaries that compose as content-addressable
 >   components (`cat` bytes→bytes; `head`/`tail` lines→lines).
 
+> **Implementation status (l1views batch):** `tree`, `df`, `ps`, `top` ship as
+> Lens-1 views, and all four are registered Lens-3 stages (tree/df operand
+> stages over their PATH arg, ps/top source generators). Per command:
+> - `tree` = datalog **reach closure** (fx-find's rules verbatim) over a
+>   walk-side `node` relation; glyph render + GNU footer; `--rows` emits
+>   **find's exact rows type**, so `tree |> grep` composes with zero registry
+>   novelty.
+> - `df` = **pure** statvfs binary (the honest cut: datalog columns are raw
+>   u32 and would wrap on real >16TiB disks); mounts parse + dedup-keep-last +
+>   single-path form; rows `{fs,mount,total_kb,used_kb,avail_kb}`.
+> - `ps` = datalog flat-relation view over live `/proc` (the fx-ls idiom, no
+>   rules); best-effort snapshot (ENOENT mid-walk skips a died process).
+> - `top` = **deterministic single-shot ranking** — the honest cut vs GNU
+>   top's live TUI: no refresh, no cpu% (delta sampling is nondeterministic);
+>   ranks by total cpu ticks, same rows type as ps.
+> - `ps`/`top`/`df` rows carry no `path` field, so the only rows consumer
+>   today (`grep`, reading `path`) **rejects** them at type-check
+>   (MissingField) — they are new leaf row types awaiting their consumers,
+>   not silent grep no-ops. Replay over the live process set / mount list
+>   diverges loudly (the accepted find/ls/du live-operand honesty level).
+
 ---
 
 ## Lens 2 — Two distinct timelines: the store's, and the tree's

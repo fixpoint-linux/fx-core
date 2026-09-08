@@ -183,6 +183,15 @@ pub fn resetArena() void {
 /// single Text (the bare-Text single VALUE wire form feeds the scalar PATH
 /// operand); echo/seq none -> lines (SOURCE generators — no pipeline input;
 /// they can only sit at position 0, enforced by shapeCompatible's .none arm);
+/// tree single {path} -> rows of find's EXACT type (zero registry novelty:
+/// tree|>grep composes exactly like find|>grep); df single {path} -> rows
+/// {fs,mount,total_kb,used_kb,avail_kb} (no `path` field, so grep REJECTS
+/// df's rows — MissingField); ps/top none -> rows {pid,state,ppid,cpu,rss_kb,
+/// comm} (SOURCE generators like echo/seq, position 0 only — their rows also
+/// lack `path`, so grep rejects them until a wider consumer lands; top's rows
+/// are the ranked subset; the live process set / mount list changes between
+/// runs, so Lens-3 replay over them diverges loudly — the find/ls/du
+/// live-operand caveat);
 /// paste/comm lines -> lines (TWO-FILE — the stage args are the SECOND FILE
 /// PATH verbatim, the pipeline input rides the CAS as FILE1; PATH2 is
 /// live-read at run AND replay, the find/ls/du live-operand caveat).
@@ -234,6 +243,24 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         const in_t = try parseType("{ path : Text }", gpa);
         const out_t = try parseType("{ path : Text, bytes : Natural }", gpa);
         return .{ .name = "du", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
+    }
+    // tree:  single { path : Text } -> rows of find's EXACT type — the rows
+    // are wire-identical to find's, so every find consumer (grep) composes
+    // with zero registry novelty.  The stage args are the ROOT operand
+    // (empty args -> the binary's default "."), exactly like ls/du.
+    if (std.mem.eql(u8, name, "tree")) {
+        const in_t = try parseType("{ path : Text }", gpa);
+        const out_t = try parseType("{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }", gpa);
+        return .{ .name = "tree", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
+    }
+    // df:    single { path : Text } -> rows { fs, mount, total_kb, used_kb,
+    // avail_kb } — empty stage args -> the binary's all-mounts default.  The
+    // rows carry no `path` field, so grep's rows-{path} input REJECTS them
+    // (MissingField): a df|>grep pipeline never type-checks.
+    if (std.mem.eql(u8, name, "df")) {
+        const in_t = try parseType("{ path : Text }", gpa);
+        const out_t = try parseType("{ fs : Text, mount : Text, total_kb : Natural, used_kb : Natural, avail_kb : Natural }", gpa);
+        return .{ .name = "df", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     // nl:    lines -> lines
     if (std.mem.eql(u8, name, "nl")) {
@@ -288,6 +315,17 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         std.mem.eql(u8, name, "seq"))
     {
         return .{ .name = name, .input = .{ .tag = .none }, .output = .{ .tag = .lines } };
+    }
+    // ps/top: none -> rows { pid, state, ppid, cpu, rss_kb, comm } — SOURCE
+    // (generator) stages like echo/seq (position 0 only).  top's rows are the
+    // ranked subset; both share one wire type.  SNAPSHOT CAVEAT: the live
+    // process set + tick counters change between runs, so replay re-walks
+    // /proc and diverges loudly (the accepted live-operand honesty level).
+    if (std.mem.eql(u8, name, "ps") or
+        std.mem.eql(u8, name, "top"))
+    {
+        const out_t = try parseType("{ pid : Natural, state : Text, ppid : Natural, cpu : Natural, rss_kb : Natural, comm : Text }", gpa);
+        return .{ .name = name, .input = .{ .tag = .none }, .output = Shape.rows(out_t) };
     }
     // paste/comm: lines -> lines — TWO-FILE stages.  The pipeline input rides
     // the CAS as FILE1; the stage args are the SECOND FILE PATH verbatim
@@ -539,4 +577,73 @@ test "registry: paste/comm are lines -> lines two-file stages" {
     // ...nor can a generator consume them (a two-file stage is never a source)
     const seq = try builtin("seq", t.allocator);
     try t.expectError(error.ShapeMismatch, compose(comm, seq));
+}
+
+// ---------------------------------------------------------------------------
+// Lens-1 view batch (tree/df/ps/top): type-check matrix
+// ---------------------------------------------------------------------------
+
+test "registry: tree |> grep composes (find's EXACT rows type — zero novelty)" {
+    // tree's declared output is byte-for-byte find's rows type, so the find|>grep
+    // composition carries over untouched: width subtyping on `path`.
+    const tree = try builtin("tree", t.allocator);
+    const find = try builtin("find", t.allocator);
+    const grep = try builtin("grep", t.allocator);
+    try compose(tree, grep);
+    // and the tree/find output types are interchangeable both directions
+    try compose(find, grep);
+    try t.expect(tree.output.tag == .rows and find.output.tag == .rows);
+}
+
+test "registry: df |> grep rejected (MissingField — df rows have no path)" {
+    // df emits {fs,mount,total_kb,used_kb,avail_kb}; grep reads {path}.  The
+    // type system rejects what would otherwise be a SILENT no-op at runtime
+    // (nativeGrep matches the `path` field only — a df row has none).
+    const df = try builtin("df", t.allocator);
+    const grep = try builtin("grep", t.allocator);
+    try t.expectError(error.MissingField, compose(df, grep));
+}
+
+test "registry: ps/top |> grep rejected (MissingField — process rows have no path)" {
+    // ps/top emit {pid,state,ppid,cpu,rss_kb,comm}; grep reads {path}.  Same
+    // honest rejection as df: a process/mount row is not a file row, and no
+    // rows consumer for these types exists yet.
+    const ps = try builtin("ps", t.allocator);
+    const top = try builtin("top", t.allocator);
+    const grep = try builtin("grep", t.allocator);
+    try t.expectError(error.MissingField, compose(ps, grep));
+    try t.expectError(error.MissingField, compose(top, grep));
+}
+
+test "registry: ps/top |> wc rejected (rows vs lines)" {
+    const ps = try builtin("ps", t.allocator);
+    const top = try builtin("top", t.allocator);
+    const wc = try builtin("wc", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(ps, wc));
+    try t.expectError(error.ShapeMismatch, compose(top, wc));
+    // df and tree are rejected by wc for the same rows-vs-lines reason
+    const df = try builtin("df", t.allocator);
+    const tree = try builtin("tree", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(df, wc));
+    try t.expectError(error.ShapeMismatch, compose(tree, wc));
+}
+
+test "registry: ps/top are generators (position 0 only); tree/df are {path} operands" {
+    // nothing feeds a generator: a .none input rejects every producer output
+    const sort = try builtin("sort", t.allocator);
+    const ps = try builtin("ps", t.allocator);
+    const top = try builtin("top", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(sort, ps));
+    try t.expectError(error.ShapeMismatch, compose(sort, top));
+    // and ps/top feed no operand stage either (rows vs single)
+    const find = try builtin("find", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(ps, find));
+    try t.expectError(error.ShapeMismatch, compose(top, find));
+    // tree/df take the same single {path} input as find/ls/du — but unlike
+    // tree (whose rows ARE find's type), df's rows feed no current consumer
+    const tree = try builtin("tree", t.allocator);
+    const df = try builtin("df", t.allocator);
+    const grep = try builtin("grep", t.allocator);
+    try t.expectError(error.ShapeMismatch, compose(grep, tree));
+    try t.expectError(error.ShapeMismatch, compose(grep, df));
 }
