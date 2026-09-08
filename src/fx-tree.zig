@@ -503,6 +503,7 @@ test "evalDhallArgs ill-typed record rejected" {
 
 fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
     var o = Options{};
+    var root_dupe = false; // o.root starts as the static default "."
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -526,7 +527,13 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
             std.debug.print("fx-tree: unknown option '{s}'\n", .{a});
             return error.UnknownOption;
         } else {
+            if (root_dupe) {
+                gpa.free(o.root);
+                std.debug.print("fx-tree: extra operand '{s}'\n", .{a});
+                return error.TooManyOperands; // fx-df precedent: no silent overwrite
+            }
             o.root = try gpa.dupe(u8, a);
+            root_dupe = true;
         }
     }
     return o;
@@ -569,6 +576,11 @@ test "parsePosixArgs --rows" {
 test "parsePosixArgs unknown option rejected" {
     const args = [_][:0]const u8{"fx-tree", "-x"};
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+}
+
+test "parsePosixArgs second ROOT operand rejected" {
+    const two = [_][:0]const u8{ "fx-tree", "/a", "/b" };
+    try std.testing.expectError(error.TooManyOperands, parsePosixArgs(&two, std.testing.allocator));
 }
 
 test "parsePosixArgs bad -L rejected" {

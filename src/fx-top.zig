@@ -18,13 +18,16 @@
 // dl_iter enumerates ascending; a Zig reverse yields the ranked order
 // (cpu desc, rss desc, pid ASC) because pidc = 0xFFFFFFFF - pid inverts pid
 // under reversal — every ranking's final tie-break is pid ASCENDING.  state
-// is the interned 1-char status letter; comm is NOT an engine column (raw
-// u32) — it rides a Zig pid->comm map filled during the walk.
+// is the raw 1-char status letter (char code as u32, fx-ps's encoding);
+// comm is NOT an engine column (raw u32) — it rides a Zig pid->comm map
+// filled during the walk.
 //
 // Source: readdir /proc numeric dirs + /proc/<pid>/stat per the pinned fx-ps
 // spec — comm parsed between '(' and the LAST ')' (comm may contain ')' and
-// spaces), state=3 ppid=4 utime=14 stime=15 rss=24 (1-based fields; rss in
-// PAGES, converted to KiB Zig-side); ENOENT mid-walk (process died) -> skip,
+// spaces; an EMPTY comm is rejected, like fx-ps), state=3 ppid=4 utime=14
+// stime=15 rss=24 (1-based fields; rss in PAGES, converted to KiB Zig-side
+// via sysconf _SC_PAGESIZE with 4096 fallback — fx-ps's pageSize/rssKb,
+// duplicated per the house pattern); ENOENT mid-walk (process died) -> skip,
 // best-effort snapshot; cpu = utime+stime saturated at u32 (4.29e9 ticks ~
 // 497 CPU-days/process, stderr warning, du precedent); kernel threads
 // included (rss=0, [bracketed] comm).
@@ -67,12 +70,15 @@ extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+extern fn sysconf(name: c_int) c_long;
+
+// glibc _SC_PAGESIZE.
+const SC_PAGESIZE: c_int = 30;
 
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const proc_root = "/proc"; // snapshot source (walk root, injectable for tests)
-const page_kib = 4; // rss pages -> KiB, 4 KiB pages (documented assumption)
 
 // ---------------------------------------------------------------------------
 // CLI option model
@@ -332,6 +338,7 @@ fn parseStatLine(buf: []const u8) ?ParsedStat {
     if (rparen <= lparen) return null;
     const pid = std.fmt.parseInt(u32, std.mem.trim(u8, buf[0..lparen], " \t"), 10) catch return null;
     const comm = buf[lparen + 1 .. rparen];
+    if (comm.len == 0) return null; // prctl(PR_SET_NAME, "") -> skip, like fx-ps
 
     // Tokens after ") ": 0-based token k is 1-based field k+3.
     var it = std.mem.tokenizeAny(u8, buf[rparen + 1 ..], " \t\n");
@@ -368,6 +375,20 @@ fn parseStatLine(buf: []const u8) ?ParsedStat {
         .stime = stime,
         .rss_pages = if (rss > 0xFFFFFFFF) 0xFFFFFFFF else @intCast(rss),
     };
+}
+
+/// Page size in bytes (sysconf; 4096 fallback if the query misbehaves).
+/// fx-ps's pageSize(), duplicated per the house pattern so both units emit
+/// identical rss_kb on any page-size host.
+fn pageSize() u64 {
+    const ps = sysconf(SC_PAGESIZE);
+    if (ps <= 0) return 4096;
+    return @intCast(ps);
+}
+
+/// rss in KiB, computed Zig-side in u64 so pages*pagesize can never wrap.
+fn rssKb(pages: u32) u64 {
+    return @as(u64, pages) * pageSize() / 1024;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,15 +435,16 @@ fn buildFacts(db: *dl.dl_db, comms: *std.AutoHashMapUnmanaged(u32, []u8), dir_pa
             std.debug.print("fx-top: warning: pid {d} exceeds u32 cpu ticks; cpu saturated\n", .{stt.pid});
         }
 
-        const state_z = [1:0]u8{stt.state};
-        const state_sym = dl.dl_intern_str(db, &state_z);
+        // state rides the relation as the RAW char code (u32), fx-ps's
+        // encoding — no interned-string column.
+        const state_u: u32 = stt.state;
         const pidc: u32 = 0xFFFFFFFF - stt.pid;
 
         // Facts into BOTH relations (costs 2x facts; documents the two free
         // orderings; reversed iteration makes pid ASC the final tie-break).
-        var ccols = [_]u32{ cpu, stt.rss_pages, pidc, stt.ppid, state_sym };
+        var ccols = [_]u32{ cpu, stt.rss_pages, pidc, stt.ppid, state_u };
         _ = dl.dl_add_fact(db, "procc", &ccols, 5);
-        var mcols = [_]u32{ stt.rss_pages, cpu, pidc, stt.ppid, state_sym };
+        var mcols = [_]u32{ stt.rss_pages, cpu, pidc, stt.ppid, state_u };
         _ = dl.dl_add_fact(db, "procm", &mcols, 5);
 
         const comm = gpa.dupe(u8, stt.comm) catch return error.Oom;
@@ -439,7 +461,7 @@ fn buildFacts(db: *dl.dl_db, comms: *std.AutoHashMapUnmanaged(u32, []u8), dir_pa
 
 const Row = struct {
     pid: u32,
-    state: []const u8, // gpa-owned
+    state: [1]u8, // raw status char (fx-ps ProcRow encoding)
     ppid: u32,
     cpu: u32,
     rss_pages: u32,
@@ -448,7 +470,6 @@ const Row = struct {
 
 fn freeRows(gpa: Allocator, rows: []const Row) void {
     for (rows) |r| {
-        gpa.free(r.state);
         gpa.free(r.comm);
     }
 }
@@ -466,16 +487,14 @@ fn collectRanked(gpa: Allocator, db: *dl.dl_db, rel: [*c]const u8, cpu_major: bo
         const rss = if (cpu_major) cols[1] else cols[0];
         const pidc = cols[2];
         const ppid = cols[3];
-        const state = std.mem.span(dl.dl_intern_str_of(db, cols[4]));
+        const state = [1]u8{@intCast(cols[4])};
         const pid = 0xFFFFFFFF - pidc;
         const comm = comms.get(pid) orelse return error.MissingComm;
-        const state_dup = try gpa.dupe(u8, state);
-        errdefer gpa.free(state_dup);
         const comm_dup = try gpa.dupe(u8, comm);
         errdefer gpa.free(comm_dup);
         try out.append(gpa, .{
             .pid = pid,
-            .state = state_dup,
+            .state = state,
             .ppid = ppid,
             .cpu = cpu,
             .rss_pages = rss,
@@ -500,11 +519,10 @@ fn rankAndLimit(gpa: Allocator, rows: *std.ArrayList(Row), count: u32) void {
 // ---------------------------------------------------------------------------
 
 /// One display line: 'PID STATE PPID CPU RSS_KB COMM' (plan-pinned fx-ps
-/// column widths).  RSS is rendered in KiB (pages * 4, 4 KiB pages).
-/// Returns null when the line exceeds `buf`.
+/// column widths).  RSS is rendered in KiB (rssKb: sysconf page size, 4096
+/// fallback).  Returns null when the line exceeds `buf`.
 fn formatTextLine(buf: []u8, r: Row) ?[]const u8 {
-    const rss_kb = @as(u64, r.rss_pages) * page_kib;
-    return std.fmt.bufPrint(buf, "{d:>7} {s:1} {d:>7} {d:>10} {d:>10} {s}\n", .{ r.pid, r.state, r.ppid, r.cpu, rss_kb, r.comm }) catch null;
+    return std.fmt.bufPrint(buf, "{d:>7} {s:1} {d:>7} {d:>10} {d:>10} {s}\n", .{ r.pid, r.state[0..], r.ppid, r.cpu, rssKb(r.rss_pages), r.comm }) catch null;
 }
 
 /// Encode the ranked subset as canonical wire rows for `top_rows_src` (one
@@ -524,14 +542,17 @@ fn encodeRowsWire(gpa: Allocator, rows: []const Row) ![]u8 {
         for (wrows.items) |r| gpa.free(r.fields);
         wrows.deinit(gpa);
     }
-    for (rows) |r| {
+    // |*e|, not |r|: state is an inline [1]u8 array — a by-value loop copy
+    // would leave every .text slice pointing at one reused stack slot
+    // (fx-ps.zig encodeRowsWire, same fix).
+    for (rows) |*e| {
         const fields = try gpa.alloc(wire.Field, 6);
-        fields[0] = .{ .name = "pid", .value = .{ .natural = r.pid } };
-        fields[1] = .{ .name = "state", .value = .{ .text = r.state } };
-        fields[2] = .{ .name = "ppid", .value = .{ .natural = r.ppid } };
-        fields[3] = .{ .name = "cpu", .value = .{ .natural = r.cpu } };
-        fields[4] = .{ .name = "rss_kb", .value = .{ .natural = @as(u64, r.rss_pages) * page_kib } };
-        fields[5] = .{ .name = "comm", .value = .{ .text = r.comm } };
+        fields[0] = .{ .name = "pid", .value = .{ .natural = e.pid } };
+        fields[1] = .{ .name = "state", .value = .{ .text = e.state[0..] } };
+        fields[2] = .{ .name = "ppid", .value = .{ .natural = e.ppid } };
+        fields[3] = .{ .name = "cpu", .value = .{ .natural = e.cpu } };
+        fields[4] = .{ .name = "rss_kb", .value = .{ .natural = rssKb(e.rss_pages) } };
+        fields[5] = .{ .name = "comm", .value = .{ .text = e.comm } };
         try wrows.append(gpa, .{ .fields = fields });
     }
     return wire.encodeRowsOrdered(gpa, .{ .records = wrows.items }, kk.names, kk.kinds);
@@ -562,6 +583,7 @@ test "parseStatLine: comm with spaces and parens (last-')' rule)" {
 test "parseStatLine: malformed lines rejected" {
     try testing.expect(parseStatLine("1234 no parens here") == null); // no comm
     try testing.expect(parseStatLine("1234 (x") == null); // unterminated comm
+    try testing.expect(parseStatLine("1234 () R 0 1 2 3 4 5 6 7 8 9 100 200 0 0 0 0 0 0 0 0 42") == null); // empty comm
     try testing.expect(parseStatLine("abc (x) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0") == null); // bad pid
     try testing.expect(parseStatLine("1234 (x) R 0 0 0 0 0 0 0 0 0 0 0") == null); // ends before rss
 }
@@ -601,12 +623,10 @@ test "procc/procm ranking fixture: cpu/rss desc + pid-asc tie-break + count limi
         const nm = std.fmt.bufPrint(&nbuf, "p{d}", .{p.pid}) catch unreachable;
         const comm = try gpa.dupe(u8, nm);
         try comms.put(gpa, p.pid, comm);
-        const state_z = [1:0]u8{p.state};
-        const sym = dl.dl_intern_str(db, &state_z);
         const pidc: u32 = 0xFFFFFFFF - p.pid;
-        var ccols = [_]u32{ p.cpu, p.rss, pidc, 1, sym };
+        var ccols = [_]u32{ p.cpu, p.rss, pidc, 1, p.state };
         _ = dl.dl_add_fact(db, "procc", &ccols, 5);
-        var mcols = [_]u32{ p.rss, p.cpu, pidc, 1, sym };
+        var mcols = [_]u32{ p.rss, p.cpu, pidc, 1, p.state };
         _ = dl.dl_add_fact(db, "procm", &mcols, 5);
     }
 
@@ -624,7 +644,7 @@ test "procc/procm ranking fixture: cpu/rss desc + pid-asc tie-break + count limi
     try testing.expectEqual(@as(u32, 90), rows.items[0].cpu);
     try testing.expectEqual(@as(u32, 10), rows.items[0].rss_pages);
     try testing.expectEqualStrings("p2", rows.items[0].comm);
-    try testing.expectEqualStrings("R", rows.items[0].state);
+    try testing.expectEqual(@as(u8, 'R'), rows.items[0].state[0]);
     // cpu tie (50): rss desc puts pid 8/9 (rss 500) before pid 7 (rss 300).
     try testing.expectEqual(@as(u32, 500), rows.items[1].rss_pages);
     try testing.expectEqual(@as(u32, 300), rows.items[3].rss_pages);
@@ -733,7 +753,7 @@ test "buildFacts: fake /proc fixture (numeric dirs, skips, comm parse)" {
     try testing.expectEqual(@as(u32, 10), rows.items[0].cpu);
     try testing.expectEqual(@as(u32, 1), rows.items[0].ppid);
     try testing.expectEqual(@as(u32, 256), rows.items[0].rss_pages);
-    try testing.expectEqualStrings("S", rows.items[0].state);
+    try testing.expectEqual(@as(u8, 'S'), rows.items[0].state[0]);
     try testing.expectEqualStrings("kworker/0:1", rows.items[1].comm); // kernel thread included
     try testing.expectEqual(@as(u32, 0), rows.items[1].cpu);
     try testing.expectEqual(@as(u32, 0), rows.items[1].rss_pages);
@@ -756,30 +776,38 @@ fn expectPids(rows: []const Row, want: []const u32) !void {
 
 test "formatTextLine pins the column bytes" {
     var buf: [256]u8 = undefined;
+    // rss_kb is page-size dependent; pin the FORMAT, compute the value
+    // (fx-ps.zig formatLine test idiom).
+    var want_buf: [128]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "   1234 R       1        700 {d:>10} worker one\n", .{rssKb(256)}) catch unreachable;
     const line = formatTextLine(&buf, .{
         .pid = 1234,
-        .state = "R",
+        .state = .{'R'},
         .ppid = 1,
         .cpu = 700,
         .rss_pages = 256,
         .comm = "worker one",
     }) orelse return error.NoFit;
-    try testing.expectEqualStrings("   1234 R       1        700       1024 worker one\n", line);
+    try testing.expectEqualStrings(want, line);
 }
 
 test "rows mode: ranked subset emits canonical wire rows that decode back" {
     const gpa = testing.allocator;
-    const rows = [_]Row{
-        .{ .pid = 2, .state = "R", .ppid = 1, .cpu = 90, .rss_pages = 10, .comm = "p2" },
-        .{ .pid = 8, .state = "S", .ppid = 0, .cpu = 50, .rss_pages = 500, .comm = "p8" },
+    var rows = [_]Row{
+        .{ .pid = 2, .state = .{'R'}, .ppid = 1, .cpu = 90, .rss_pages = 10, .comm = "p2" },
+        .{ .pid = 8, .state = .{'S'}, .ppid = 0, .cpu = 50, .rss_pages = 500, .comm = "p8" },
     };
     const bytes = try encodeRowsWire(gpa, &rows);
     defer gpa.free(bytes);
 
-    // Keys in DECLARED registry order, rss_kb converted pages -> KiB.
-    const want =
-        "{\"pid\":2,\"state\":\"R\",\"ppid\":1,\"cpu\":90,\"rss_kb\":40,\"comm\":\"p2\"}\n" ++
-        "{\"pid\":8,\"state\":\"S\",\"ppid\":0,\"cpu\":50,\"rss_kb\":2000,\"comm\":\"p8\"}\n";
+    // Keys in DECLARED registry order, rss_kb converted pages -> KiB
+    // (page-size dependent: pin the FORMAT, compute the value).
+    var want_buf: [256]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf,
+        "{{\"pid\":2,\"state\":\"R\",\"ppid\":1,\"cpu\":90,\"rss_kb\":{d},\"comm\":\"p2\"}}\n" ++
+            "{{\"pid\":8,\"state\":\"S\",\"ppid\":0,\"cpu\":50,\"rss_kb\":{d},\"comm\":\"p8\"}}\n",
+        .{ rssKb(10), rssKb(500) },
+    );
     try testing.expectEqualStrings(want, bytes);
 
     // Round-trip through the SAME declared type downstream dispatch uses.
@@ -796,7 +824,7 @@ test "rows mode: ranked subset emits canonical wire rows that decode back" {
             try testing.expectEqual(@as(usize, 2), r.records.len);
             try testing.expectEqual(@as(u64, 2), r.records[0].fields[0].value.natural);
             try testing.expectEqualStrings("R", r.records[0].fields[1].value.text);
-            try testing.expectEqual(@as(u64, 40), r.records[0].fields[4].value.natural);
+            try testing.expectEqual(rssKb(10), r.records[0].fields[4].value.natural);
             try testing.expectEqualStrings("p8", r.records[1].fields[5].value.text);
         },
         else => unreachable,
