@@ -44,6 +44,19 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // fx-cli: the single-schema command-interface module (schemas/*.dhall ->
+    // { ty, dflt, posix } view + the completed-record merge).  Pure module;
+    // tests only in STEP 0 (the STEP-1 generator tool will import it).
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "fx-find",
         .root_module = b.createModule(.{
@@ -129,6 +142,10 @@ pub fn build(b: *std.Build) void {
     // The Lens 3 wire/codec layer's test blocks (canonical JSON, T1, width subtyping).
     const wire_tests = b.addTest(.{ .root_module = wire_mod });
     const run_wire_tests = b.addRunArtifact(wire_tests);
+    // The single-schema CLI module's test blocks (schema eval + the
+    // completed-record round-trip proof — STEP 0).
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
@@ -136,6 +153,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_diff_tests.step);
     test_step.dependOn(&run_pipeline_tests.step);
     test_step.dependOn(&run_wire_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
 
     // Fast feedback loop for JUST the Lens 3 pipeline type-checker (avoids the
     // hour-long datalog-dafsa test run).  `zig build run-pipeline-test`.
