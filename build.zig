@@ -155,6 +155,86 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wire_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 
+    // -----------------------------------------------------------------------
+    // STEP 1: the schema->Zig code generator (src/tools/fx-clijson.zig).
+    //
+    // BUILD DECISION (the plan's open question): generated files are COMMITTED
+    // under src/generated/ and gated by a regen-no-op CHECK, not produced in
+    // the build graph via a GenerativeModule.  Reasons: (a) the generator
+    // imports the whole dhall-c core — wiring it into the build graph would
+    // make every `zig build` (even the check) compile the interpreter, and
+    // would tempt wiring the generated modules as dependencies of the command
+    // binaries, embedding dhall at runtime (the exact RISK-4 outcome the
+    // pure-Zig emission exists to avoid); (b) the committed file + byte-
+    // identical check gives the same drift guarantee with zero build-graph
+    // coupling; (c) GenerativeModule ergonomic risk was the plan's flagged
+    // unknown — this needs none of it.  `zig build gen-cli` regenerates in
+    // place; `zig build gen-cli-check` (wired into `test`) fails when a
+    // committed cli_*.zig is missing or stale.
+    // -----------------------------------------------------------------------
+    const clijson_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/fx-clijson.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "fx-cli", .module = cli_mod },
+        },
+    });
+
+    const gen_schemas = [_][]const u8{"ls"}; // STEP 3 grows this table
+    const gen_cli_step = b.step("gen-cli", "Regenerate src/generated/cli_<name>.zig from schemas/<name>.dhall (commit the result)");
+    const gen_cli_check_step = b.step("gen-cli-check", "Verify committed src/generated/cli_*.zig match their schemas (regen no-op gate)");
+    test_step.dependOn(gen_cli_check_step);
+    inline for (gen_schemas) |schema_name| {
+        const out_path = std.fmt.comptimePrint("src/generated/cli_{s}.zig", .{schema_name});
+        const schema_path = std.fmt.comptimePrint("schemas/{s}.dhall", .{schema_name});
+
+        // generate: run the tool with CWD = repo root so it writes the
+        // committed file in place (src/generated/cli_<name>.zig); running in
+        // the source tree is the point — the developer then commits the diff
+        const gen_tool = b.addExecutable(.{ .name = "fx-clijson", .root_module = clijson_mod });
+        const gen_run = b.addRunArtifact(gen_tool);
+        gen_run.setCwd(b.path("."));
+        gen_run.addArg("generate");
+        gen_run.addArg(schema_name);
+        gen_run.addArg(schema_path);
+        gen_run.addArg(out_path);
+        gen_cli_step.dependOn(&gen_run.step);
+
+        // check: re-run the tool in check mode over the COMMITTED file — an
+        // edited schema or a hand-edited generated file fails the build until
+        // regen+commit (the diff-gate proper)
+        const chk_tool = b.addExecutable(.{ .name = "fx-clijson", .root_module = clijson_mod });
+        const chk_run = b.addRunArtifact(chk_tool);
+        chk_run.setCwd(b.path("."));
+        chk_run.addArg("check");
+        chk_run.addArg(schema_name);
+        chk_run.addArg(schema_path);
+        chk_run.addArg(out_path);
+        gen_cli_check_step.dependOn(&chk_run.step);
+    }
+
+    // The generator tool's own unit tests (identifier/escape helpers).
+    const clijson_tests = b.addTest(.{ .root_module = clijson_mod });
+    const run_clijson_tests = b.addRunArtifact(clijson_tests);
+    test_step.dependOn(&run_clijson_tests.step);
+
+    // The generated parsers' own test blocks (pure std; no module imports).
+    inline for (gen_schemas) |schema_name| {
+        const out_path = std.fmt.comptimePrint("src/generated/cli_{s}.zig", .{schema_name});
+        const gen_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(out_path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        const run_gen_tests = b.addRunArtifact(gen_tests);
+        test_step.dependOn(&run_gen_tests.step);
+    }
+
     // Fast feedback loop for JUST the Lens 3 pipeline type-checker (avoids the
     // hour-long datalog-dafsa test run).  `zig build run-pipeline-test`.
     const pipeline_test_step = b.step("run-pipeline-test", "Run fx-pipeline type-checker tests only");
