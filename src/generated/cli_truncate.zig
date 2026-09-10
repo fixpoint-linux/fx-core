@@ -94,6 +94,20 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             seen |= 1 << 0;
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--size")) {
+            if ((seen & (1 << 1)) != 0) {
+                std.debug.print("fx-truncate: options '-s' and '-r' are mutually exclusive\n", .{});
+                return error.Conflict;
+            }
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-truncate: option '-s' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.size = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            seen |= 1 << 0;
+            matched = true;
+        }
         if (!matched and std.mem.eql(u8, a, "-r")) {
             if ((seen & (1 << 0)) != 0) {
                 std.debug.print("fx-truncate: options '-r' and '-s' are mutually exclusive\n", .{});
@@ -114,6 +128,20 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
                 return error.Conflict;
             }
             o.ref = gpa.dupe(u8, args[i][12..]) catch return error.OutOfMemory;
+            seen |= 1 << 1;
+            matched = true;
+        }
+        if (!matched and std.mem.eql(u8, a, "--reference")) {
+            if ((seen & (1 << 0)) != 0) {
+                std.debug.print("fx-truncate: options '-r' and '-s' are mutually exclusive\n", .{});
+                return error.Conflict;
+            }
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-truncate: option '-r' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.ref = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
             seen |= 1 << 1;
             matched = true;
         }
@@ -199,6 +227,15 @@ test "cli_truncate: --size=value binds size" {
     try std.testing.expectEqualStrings("v", o.size.?);
 }
 
+test "cli_truncate: --size value (two-token form) binds size" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-truncate", "--size", "v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.size.?);
+}
+
 test "cli_truncate: value short -r does not cluster" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -212,6 +249,15 @@ test "cli_truncate: --reference=value binds ref" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-truncate", "--reference=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.ref.?);
+}
+
+test "cli_truncate: --reference value (two-token form) binds ref" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-truncate", "--reference", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.ref.?);
 }

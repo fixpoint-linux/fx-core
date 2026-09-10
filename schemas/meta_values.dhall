@@ -8,9 +8,8 @@
 --   * Value flags of every numeric flavor: Natural (-n), Integer (-i),
 --     Double (-d), plus their long forms (--num, --int, --dbl)
 --   * a NON-optional Text Value flag, long-only (--name): pins the binds-test
---     emission for the plain Text shape AND the --long=value argv spelling
---     such a flag's binds test must use (a bare "--name v" two-token argv
---     is UnknownOption in the generated parser)
+--     emission for the plain Text shape AND both --long=value / two-token
+--     `--name v` argv spellings such a flag's binds tests must use
 --   * Optional fields: Text (--tail), Natural (-o), Integer (--oi),
 --     Double (--od) — one Value flag per Optional shape, so a per-shape
 --     binds test is emitted for each (this is the exact hole that let the

@@ -54,15 +54,36 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             continue;
         }
         var matched = false;
-        if (!matched and (std.mem.startsWith(u8, a, "--as-of="))) {
+        if (!matched and std.mem.startsWith(u8, a, "--as-of=")) {
             o.as_of = std.fmt.parseInt(u64, args[i][8..], 10) catch {
                 std.debug.print("fx-what: option '--as-of': '{s}' is not a Natural (u64)\n", .{ args[i][8..] });
                 return error.BadValue;
             };
             matched = true;
         }
-        if (!matched and (std.mem.startsWith(u8, a, "--store="))) {
+        if (!matched and std.mem.eql(u8, a, "--as-of")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-what: option '--as-of' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.as_of = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("fx-what: option '--as-of': '{s}' is not a Natural (u64)\n", .{ args[i] });
+                return error.BadValue;
+            };
+            matched = true;
+        }
+        if (!matched and std.mem.startsWith(u8, a, "--store=")) {
             o.store = gpa.dupe(u8, args[i][8..]) catch return error.OutOfMemory;
+            matched = true;
+        }
+        if (!matched and std.mem.eql(u8, a, "--store")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-what: option '--store' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.store = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
             matched = true;
         }
         if (!matched) {
@@ -127,11 +148,29 @@ test "cli_what: --as-of=value binds as_of" {
     try std.testing.expectEqual(@as(u64, 7), o.as_of.?);
 }
 
+test "cli_what: --as-of value (two-token form) binds as_of" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-what", "--as-of", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(u64, 7), o.as_of.?);
+}
+
 test "cli_what: --store=value binds store" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-what", "--store=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.store.?);
+}
+
+test "cli_what: --store value (two-token form) binds store" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-what", "--store", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.store.?);
 }

@@ -43,13 +43,15 @@
 //   (a) short clustering of ARGUMENTLESS shorts: -la == -l -a.  A Value
 //       short never clusters — its argument boundary would be ambiguous —
 //       so `-n7` rejects with UnknownOption;
-//   (b) `--long=value` inline values for Value-kind long options (the
-//       separate-token `--long value` form stays valid too).
+//   (b) `--long=value` inline values AND the separate-token `--long value`
+//       form for Value-kind long options (the hand parsers accepted the
+//       two-token form; the first generated emission dropped it — restored
+//       in the final fix round, each Value-long parser pins both spellings).
 // Both are UNCONDITIONAL generator vocabulary, not per-command schema
 // options: per-command variance here would re-create the drift this
-// architecture exists to kill (plan RISK 8).  They are a deliberate
-// strengthening over the hand parsers (exact tokens only) — the STEP-2+
-// differential tests must not assert the old rejection of these forms.
+// architecture exists to kill (plan RISK 8).  Clustering (a) remains a
+// deliberate strengthening over the hand parsers (exact tokens only) —
+// the STEP-2+ differential tests must not assert its old rejection.
 // Operands that begin with '-' still need `--` (strict-getopt parity).
 //
 // POSITIONALS: single (many=False) Text fields fill in declared order (an
@@ -154,15 +156,15 @@ fn writeFile(gpa: Allocator, path: []const u8, bytes: []const u8) GenError!void 
 
 fn isKeyword(name: []const u8) bool {
     const kw = [_][]const u8{
-        "type",        "align",     "section",    "addrspace", "enum",
-        "error",       "test",      "opaque",     "export",    "extern",
-        "threadlocal", "allowzero", "noalias",    "noinline",  "inline",
-        "callconv",    "noreturn",  "struct",     "union",     "const",
-        "var",         "fn",        "pub",        "defer",     "errdefer",
-        "comptime",    "if",        "else",       "for",       "while",
-        "switch",      "return",    "break",      "continue",  "suspend",
-        "resume",      "async",     "await",      "catch",     "try",
-        "orelse",      "unreachable", "and",      "or",
+        "type",        "align",       "section", "addrspace", "enum",
+        "error",       "test",        "opaque",  "export",    "extern",
+        "threadlocal", "allowzero",   "noalias", "noinline",  "inline",
+        "callconv",    "noreturn",    "struct",  "union",     "const",
+        "var",         "fn",          "pub",     "defer",     "errdefer",
+        "comptime",    "if",          "else",    "for",       "while",
+        "switch",      "return",      "break",   "continue",  "suspend",
+        "resume",      "async",       "await",   "catch",     "try",
+        "orelse",      "unreachable", "and",     "or",
     };
     for (kw) |k| {
         if (std.mem.eql(u8, k, name)) return true;
@@ -1130,24 +1132,30 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
             defer cond.deinit(gpa);
             var parts: usize = 0;
 
-            // A Value flag with BOTH spellings needs two separate arms: the
-            // short form takes the NEXT argv token, the long form reads its
-            // inline =value tail — one binding expression cannot serve both
-            // (the meta_values gate fixture caught this: -n matched the long
-            // prefix test but sliced the token at the long's offset).
-            const split_value_arms = f.kind == .value and f.short != null and f.long != null;
+            // A Value flag with a long needs separate arms per spelling: the
+            // short form and the two-token long form take the NEXT argv
+            // token, the long inline form reads its =value tail — one
+            // binding expression cannot serve both (the meta_values gate
+            // fixture caught this: -n matched the long prefix test but
+            // sliced the token at the long's offset).
+            const split_value_arms = f.kind == .value and f.long != null;
 
             if (split_value_arms) {
                 // short arm: exact -<c> token, value from the next argv token
-                try cond.appendSlice(gpa, "        if (!matched and std.mem.eql(u8, a, \"");
-                try cond.appendSlice(gpa, f.short.?);
-                try cond.appendSlice(gpa, "\")) {\n");
-                try out.put(cond.items);
-                const short_body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .next);
-                defer gpa.free(short_body);
-                try out.put(short_body);
-                try out.put("            matched = true;\n        }\n");
-                // long arm: --long=value only
+                if (f.short) |sh| {
+                    try cond.appendSlice(gpa, "        if (!matched and std.mem.eql(u8, a, \"");
+                    try cond.appendSlice(gpa, sh);
+                    try cond.appendSlice(gpa, "\")) {\n");
+                    try out.put(cond.items);
+                    const short_body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .next);
+                    defer gpa.free(short_body);
+                    try out.put(short_body);
+                    try out.put("            matched = true;\n        }\n");
+                    cond.clearRetainingCapacity();
+                }
+                // long arm: --long=value inline AND the separate-token
+                // --long value form the hand parsers accepted (parity; the
+                // BindingValue.next doc names this spelling)
                 var lcnd = std.ArrayList(u8).empty;
                 defer lcnd.deinit(gpa);
                 try lcnd.appendSlice(gpa, "        if (!matched and std.mem.startsWith(u8, a, \"");
@@ -1159,6 +1167,17 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
                 const long_body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .{ .inline_long = eq });
                 defer gpa.free(long_body);
                 try out.put(long_body);
+                try out.put("            matched = true;\n        }\n");
+                // two-token long arm: exact --long token, value from the
+                // next argv token (same binding as the short arm)
+                cond.clearRetainingCapacity();
+                try cond.appendSlice(gpa, "        if (!matched and std.mem.eql(u8, a, \"");
+                try cond.appendSlice(gpa, f.long.?);
+                try cond.appendSlice(gpa, "\")) {\n");
+                try out.put(cond.items);
+                const long_next_body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .next);
+                defer gpa.free(long_next_body);
+                try out.put(long_next_body);
                 try out.put("            matched = true;\n        }\n");
                 continue;
             }
@@ -1868,6 +1887,27 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
                     },
                     else => unreachable,
                 }
+                try out.put(line.items);
+                try out.put("}\n");
+                // (5b) separate-token two-token long form: the hand parsers
+                // accepted `--long value`; the generated parser keeps it
+                // (generator vocabulary, not a per-schema option).  Shares
+                // test (5)'s assertion block.
+                try out.put("\ntest \"cli_");
+                try out.put(name);
+                try out.put(": ");
+                try out.put(f.long.?);
+                try out.put(" value (two-token form) binds ");
+                try out.put(f.field);
+                try out.put("\" {\n");
+                try out.put(prologue);
+                try out.put("    const argv = [_][]const u8{ \"");
+                try out.put(disp);
+                try out.put("\", \"");
+                try out.put(f.long.?);
+                try out.put("\", \"");
+                try out.put(val);
+                try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n");
                 try out.put(line.items);
                 try out.put("}\n");
             }

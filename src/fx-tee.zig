@@ -217,43 +217,19 @@ fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
 /// would be a list CONTAINING the type, which term_to_json rejects).  The
 /// guard skips brackets inside string literals (a bracket adjacent to `"` or
 /// preceded by an ident char is content, not syntax).
-fn repairBareEmptyList(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "[]") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 2 <= src.len and src[i] == '[' and src[i + 1] == ']' and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 2 == src.len or !isIdentByte(src[i + 2])))
-        {
-            @memcpy(buf[n .. n + 14], "[] : List Text");
-            n += 14;
-            i += 2;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
-fn isIdentByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
-}
-
+/// The rewrite itself is cli.repairDhallRecordSpellings (shared,
+/// heap-backed, unit-tested in fx-cli.zig): records of any size are safe.
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
-    // Repair unparseable rendered-record spellings before the C parser sees
-    // them (see repairBareEmptyList / the du repairBareNone precedent).
-    // parse_source wants a C string, so the repaired copy is bufPrintZ'd;
-    // the unrepaired fast path passes `src` straight through.
-    var nb: [512]u8 = undefined;
-    var zbuf: [512:0]u8 = undefined;
-    const repaired = repairBareEmptyList(&nb, src);
-    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
-        src
-    else
-        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+    // Repair the unparseable bare spelling(s) the differential runner's
+    // rendered records carry (see the doc comment above); the shared
+    // rewrite heap-builds the result, so records of any size are safe.
+    // On the untouched fast path it returns `src` and no free happens.
+    const zsrc = try cli.repairDhallRecordSpellings(
+        gpa,
+        src,
+        .{ .list_payload = "Text" },
+    );
+    defer if (zsrc.ptr != src.ptr) gpa.free(zsrc);
 
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);

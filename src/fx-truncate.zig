@@ -264,18 +264,16 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 }
 
 fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
-    // Repair the bare `None` spelling renderDhallRecord emits for the two
-    // Optional Text defaults (size/ref): the dhall-c grammar rejects it with
-    // no payload — give it the schema's payload (the fx-env/fx-du idiom).
-    // A Text value can never legally place a bare `None` between
-    // non-identifier bytes, so the rewrite is unambiguous.
-    var nb: [512]u8 = undefined;
-    var zbuf: [512:0]u8 = undefined;
-    const repaired = repairBareNone(&nb, src);
-    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
-        src
-    else
-        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+    // Repair the unparseable bare spelling(s) the differential runner's
+    // rendered records carry (see the doc comment above); the shared
+    // rewrite heap-builds the result, so records of any size are safe.
+    // On the untouched fast path it returns `src` and no free happens.
+    const zsrc = try cli.repairDhallRecordSpellings(
+        gpa,
+        src,
+        .{ .none_payload = " Text" },
+    );
+    defer if (zsrc.ptr != src.ptr) gpa.free(zsrc);
 
     // The record is checked against the schema's ty, spelled inline (single
     // source of truth: schemas/truncate.dhall): the annotation makes the
@@ -350,42 +348,8 @@ fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
 /// The bare-`None` repair (the fx-env/fx-du idiom): renderDhallRecord's
 /// Optional arm emits `None` with no payload, which does not parse — give it
 /// the schema's payload (`size`/`ref : Optional Text`).
-fn repairBareNone(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "None") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 4 == src.len or !isIdentByte(src[i + 4])))
-        {
-            // already annotated ("None Text", ...)?  The next non-space char
-            // of an annotated form is a letter.
-            var j = i + 4;
-            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-            if (j < src.len and std.ascii.isAlphabetic(src[j])) {
-                @memcpy(buf[n .. n + 4], "None");
-                n += 4;
-                i += 4;
-                continue;
-            }
-            const rep = "None Text";
-            @memcpy(buf[n .. n + rep.len], rep);
-            n += rep.len;
-            i += 4;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
-fn isIdentByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
-}
-
+/// The rewrite itself is cli.repairDhallRecordSpellings (shared,
+/// heap-backed, unit-tested in fx-cli.zig): records of any size are safe.
 // ---------------------------------------------------------------------------
 // Size parsing
 // ---------------------------------------------------------------------------

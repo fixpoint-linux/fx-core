@@ -72,6 +72,18 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             };
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--lines")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-head: option '-n' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.n = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("fx-head: option '-n': '{s}' is not a Natural (u64)\n", .{ args[i] });
+                return error.BadValue;
+            };
+            matched = true;
+        }
         if (!matched) {
             if (a.len > 1 and a[0] == '-') {
                 std.debug.print("fx-head: unknown option '{s}'\n", .{ a });
@@ -121,6 +133,15 @@ test "cli_head: --lines=value binds n" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-head", "--lines=7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(u64, 7), o.n);
+}
+
+test "cli_head: --lines value (two-token form) binds n" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-head", "--lines", "7" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqual(@as(u64, 7), o.n);
 }

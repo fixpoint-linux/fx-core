@@ -380,9 +380,23 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > differential matrix (the same template).
 
 > **Single-schema file map (2026-09, cmdif STEP 4):** all 56 commands have
-> migrated (the per-command hand `parsePosixArgs`/`usage`/`Options` are
-> gone; every command carries its differential matrix), so the full data
+> migrated to the generated-parser + shared-evaluator architecture (the
+> per-command hand `parsePosixArgs`/`usage`/`Options` are gone everywhere
+> the migration's vocabulary could express the surface), so the full data
 > flow is visible in one picture —
+> **EXCEPTIONS — read before editing a schema expecting POSIX behavior to
+> change:** fx-find.zig:594, fx-grep.zig:78 and fx-seq.zig:262 keep their
+> FULL hand POSIX parser on main's path — their schemas declare
+> `flags=[]`/`positionals=[]`, a dead spec for that POSIX surface (each is
+> documented at the site).  fx-what/fx-why are POSIX-only (no runtime
+> record evaluator; fx-what's shared-runner wrapper is intentionally never
+> called, fx-what.zig:86-96), so none of find/grep/seq/what/why runs the
+> shared runner today.  Also cut in migration: fx-basename's `-a`
+> operand-routing arm (schemas/basename.dhall cannot express its
+> mode-dependent operand semantics; the flag field exists but routes
+> nothing).  Their schemas still carry honest VOCABULARY GAP notes
+> (find/grep/nl/seq/echo).  Everything else: the hand parser is gone and
+> the differential matrix is the proof.
 >
 >     schemas/<name>.dhall          SINGLE SOURCE OF TRUTH per command:
 >                                   one { ty, dflt, posix } Dhall record

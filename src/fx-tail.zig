@@ -252,7 +252,7 @@ fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) 
 
 test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
     // --- defaults: n = 10 (the GNU tail default), input = "" (stdin) ---
-    try expectPosixEqualsRecord(&.{ "fx-tail" }, "{ }");
+    try expectPosixEqualsRecord(&.{"fx-tail"}, "{ }");
 
     // --- the -n Value flag: next-token binding, 0 and a larger count ---
     try expectPosixEqualsRecord(&.{ "fx-tail", "-n", "0" }, "{ n = 0 }");
@@ -321,8 +321,10 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
     // documented scope cut; the record form cannot express it at all)
     try std.testing.expectError(error.UnexpectedOperand, cli_tail.parsePosix(&.{ "fx-tail", "a", "b" }, gpa));
 
-    // the bare --lines spelling (no '='): a Value long binds inline ONLY
-    try std.testing.expectError(error.UnknownOption, cli_tail.parsePosix(&.{ "fx-tail", "--lines", "7" }, gpa));
+    // the two-token --lines spelling: VALID generator vocabulary (the hand
+    // parsers' `--long value` form, restored in the final fix round)
+    const twotok = try cli_tail.parsePosix(&.{ "fx-tail", "--lines", "7" }, gpa);
+    try std.testing.expectEqual(@as(u64, 7), twotok.n);
 
     // the record form's own rejections, at completion time: unknown field,
     // wrong field type; `{ input = None Text }` is ill-typed against the
@@ -440,7 +442,7 @@ const LineRing = struct {
     n: usize,
     lines: []std.ArrayList(u8),
     count: usize = 0, // number of valid lines accumulated so far
-    next: usize = 0,  // slot to overwrite next (when full, the oldest)
+    next: usize = 0, // slot to overwrite next (when full, the oldest)
 
     fn init(gpa: Allocator, n: usize) !LineRing {
         const lines = try gpa.alloc(std.ArrayList(u8), n);
@@ -601,4 +603,3 @@ pub fn main(init: std.process.Init) !void {
 
     try tailFd(opt_alloc, fd, @intCast(opts.n), stdout_file, init.io);
 }
-

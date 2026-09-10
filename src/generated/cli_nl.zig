@@ -69,6 +69,15 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             o.body = gpa.dupe(u8, args[i][17..]) catch return error.OutOfMemory;
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--body-numbering")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-nl: option '-b' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.body = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            matched = true;
+        }
         if (!matched and std.mem.eql(u8, a, "-s")) {
             if (i + 1 >= args.len) {
                 std.debug.print("fx-nl: option '-s' requires a value\n", .{});
@@ -80,6 +89,15 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
         }
         if (!matched and std.mem.startsWith(u8, a, "--number-separator=")) {
             o.sep = gpa.dupe(u8, args[i][19..]) catch return error.OutOfMemory;
+            matched = true;
+        }
+        if (!matched and std.mem.eql(u8, a, "--number-separator")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-nl: option '-s' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.sep = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
             matched = true;
         }
         if (!matched and std.mem.eql(u8, a, "-w")) {
@@ -101,6 +119,18 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             };
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--number-width")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-nl: option '-w' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.width = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("fx-nl: option '-w': '{s}' is not a Natural (u64)\n", .{ args[i] });
+                return error.BadValue;
+            };
+            matched = true;
+        }
         if (!matched and std.mem.eql(u8, a, "-n")) {
             if (i + 1 >= args.len) {
                 std.debug.print("fx-nl: option '-n' requires a value\n", .{});
@@ -112,6 +142,15 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
         }
         if (!matched and std.mem.startsWith(u8, a, "--number-format=")) {
             o.fmt = gpa.dupe(u8, args[i][16..]) catch return error.OutOfMemory;
+            matched = true;
+        }
+        if (!matched and std.mem.eql(u8, a, "--number-format")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-nl: option '-n' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.fmt = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
             matched = true;
         }
         if (!matched) {
@@ -179,11 +218,29 @@ test "cli_nl: --body-numbering=value binds body" {
     try std.testing.expectEqualStrings("v", o.body);
 }
 
+test "cli_nl: --body-numbering value (two-token form) binds body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-nl", "--body-numbering", "v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.body);
+}
+
 test "cli_nl: --number-separator=value binds sep" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-nl", "--number-separator=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.sep);
+}
+
+test "cli_nl: --number-separator value (two-token form) binds sep" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-nl", "--number-separator", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.sep);
 }
@@ -197,11 +254,29 @@ test "cli_nl: --number-width=value binds width" {
     try std.testing.expectEqual(@as(u64, 7), o.width);
 }
 
+test "cli_nl: --number-width value (two-token form) binds width" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-nl", "--number-width", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(u64, 7), o.width);
+}
+
 test "cli_nl: --number-format=value binds fmt" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-nl", "--number-format=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.fmt);
+}
+
+test "cli_nl: --number-format value (two-token form) binds fmt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-nl", "--number-format", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.fmt);
 }

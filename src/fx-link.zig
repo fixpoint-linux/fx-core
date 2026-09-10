@@ -548,14 +548,16 @@ pub fn main(init: std.process.Init) !void {
         // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
     }
-    const old = opts.old orelse {
+    const old = opts.old;
+    if (old.len == 0) {
         std.debug.print("fx-link: missing OLD operand\n", .{});
         return error.MissingOperand;
-    };
-    const new = opts.new orelse {
+    }
+    const new = opts.new;
+    if (new.len == 0) {
         std.debug.print("fx-link: missing NEW operand\n", .{});
         return error.MissingOperand;
-    };
+    }
     const args_json = posixArgsJson(aa, opts) catch {
         std.debug.print("fx-link: internal error building args\n", .{});
         return error.BadArgs;

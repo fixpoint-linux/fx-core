@@ -81,6 +81,15 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             o.delim = gpa.dupe(u8, args[i][13..]) catch return error.OutOfMemory;
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--delimiters")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-paste: option '-d' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.delim = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            matched = true;
+        }
         if (!matched and (std.mem.eql(u8, a, "-s") or std.mem.eql(u8, a, "--serial"))) {
             o.serial = true;
             matched = true;
@@ -157,6 +166,15 @@ test "cli_paste: --delimiters=value binds delim" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-paste", "--delimiters=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.delim);
+}
+
+test "cli_paste: --delimiters value (two-token form) binds delim" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-paste", "--delimiters", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.delim);
 }

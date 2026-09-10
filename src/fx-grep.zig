@@ -639,7 +639,7 @@ pub fn main(init: std.process.Init) !void {
     } else {
         opts = try parsePosixArgs(args, opt_alloc);
     }
-    if (opts.pattern == null or opts.pattern.?.len == 0) {
+    if (opts.pattern.len == 0) {
         std.debug.print("fx-grep: empty pattern\n", .{});
         return error.EmptyPattern;
     }
@@ -663,7 +663,7 @@ pub fn main(init: std.process.Init) !void {
     // pattern is grouped so a top-level `|` keeps alternation inside one
     // substring match (without the group, `.*a|b.*` would parse as
     // `(.*a)|(b.*)` and only match lines that START or END with a branch).
-    const pat = opts.pattern.?;
+    const pat = opts.pattern;
     const wrapped = std.fmt.allocPrint(init.arena.allocator(), ".*({s}).*", .{pat}) catch unreachable;
     const wrapped_z = init.arena.allocator().dupeZ(u8, wrapped) catch unreachable;
     const dfa = dl.regex_compile(wrapped_z.ptr);

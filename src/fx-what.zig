@@ -111,15 +111,20 @@ test "DIFFERENTIAL: generated parsePosix equals the schema record (matrix)" {
 
     // --- the full surface: PATH positional + both Value flags, flags in
     // any position (the generated parser's deliberate strengthening: the
-    // hand parser required PATH at argv[1]).  NOTE: --as-of/--store are
-    // LONG-ONLY Value flags (no short), so the generated parser binds them
-    // INLINE only (--as-of=3); the bare "--as-of 3" two-token form is
-    // UnknownOption — the v1 long-only emission shape (meta_values --tail
-    // precedent), pinned in the rejection matrix below. ---
+    // hand parser required PATH at argv[1]).  --as-of/--store bind inline
+    // (--as-of=3) AND as separate tokens (--as-of 3 — the hand-parser
+    // spelling, restored in the final fix round). ---
     const full = try parsePosixArgs(&.{ "fx-what", "/bin/hello", "--as-of=3", "--store=/var/fx/store" }, gpa);
     try std.testing.expectEqualStrings("/bin/hello", full.operand);
     try std.testing.expectEqual(@as(u64, 3), full.as_of.?);
     try std.testing.expectEqualStrings("/var/fx/store", full.store.?);
+
+    // the two-token long spellings (generator vocabulary, pinned per parser
+    // in cli_what.zig; re-pinned here with a real command shape)
+    const twotok = try parsePosixArgs(&.{ "fx-what", "/bin/hello", "--as-of", "3", "--store", "/var/fx/store" }, gpa);
+    try std.testing.expectEqualStrings("/bin/hello", twotok.operand);
+    try std.testing.expectEqual(@as(u64, 3), twotok.as_of.?);
+    try std.testing.expectEqualStrings("/var/fx/store", twotok.store.?);
 
     // flags BEFORE the positional — the hand parser rejected this class
     const reordered = try parsePosixArgs(&.{ "fx-what", "--store=/s", "--as-of=7", "/etc/motd" }, gpa);
@@ -137,12 +142,11 @@ test "DIFFERENTIAL: rejection parity — the generated parser fails loudly" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
-    // unknown option; a long-only Value flag with NO inline value is
-    // UnknownOption (the generator emits only --long=value for long-only
-    // Value flags — the meta_values --tail shape); a bad Natural
+    // unknown option; a long-only Value flag with a MISSING value (the
+    // two-token arm's MissingValue guard); a bad Natural
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-what", "/x", "--bogus" }, gpa));
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-what", "/x", "--as-of" }, gpa));
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-what", "/x", "--store" }, gpa));
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-what", "/x", "--as-of" }, gpa));
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-what", "/x", "--store" }, gpa));
     try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-what", "/x", "--as-of=n" }, gpa));
     // a SECOND positional: UnexpectedOperand (the record form cannot
     // express one at all)
@@ -241,8 +245,8 @@ pub fn main(init: std.process.Init) !void {
     var err_out = std.ArrayList(u8).empty;
     // as_of: the engine's snapshot version is u32 — narrow the parser's u64
     // (a value above u32 max cannot name a snapshot; BadValue-style reject)
-    const as_of: ?u32 = if (opts.as_of) |n|
-        (std.math.cast(u32, n) orelse {
+    const as_of: ?u64 = if (opts.as_of) |n|
+        (std.math.cast(u64, n) orelse {
             std.debug.print("fx-what: --as-of value out of range\n", .{});
             std.process.exit(2);
         })

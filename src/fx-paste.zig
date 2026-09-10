@@ -186,48 +186,19 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 /// The differential runner's record side renders completed schema values
 /// from fx-cli.renderDhallRecord, whose List arm emits the bare form, so the
 /// empty-default `files` would die at INFER time in evalDhallArgs on the
-/// all-defaults vector.  Repair the spelling at this command's single
-/// record-form entry point (fx-echo's repairBareList verbatim): an empty list
-/// whose neighbors are not identifier-ish gets the schema's `List Text`
-/// payload; a non-empty list is untouched (its elements carry the type).
-fn repairBareList(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "[]") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 2 == src.len or !isIdentByte(src[i + 2])))
-        {
-            const rep = "[] : List Text";
-            @memcpy(buf[n .. n + rep.len], rep);
-            n += rep.len;
-            i += 2;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
-fn isIdentByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
-}
-
+/// The rewrite itself is cli.repairDhallRecordSpellings (shared,
+/// heap-backed, unit-tested in fx-cli.zig): records of any size are safe.
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
-    // Repair a bare `[]` before the C parser sees it (see repairBareList —
-    // the differential runner's rendered records carry the untypeable
-    // spelling).  parse_source wants a C string, so the repaired copy is
-    // dupeZ'd; the unrepaired fast path passes `src` straight through.
-    var nb: [512]u8 = undefined;
-    var zbuf: [512:0]u8 = undefined;
-    const repaired = repairBareList(&nb, src);
-    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
-        src
-    else
-        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+    // Repair the unparseable bare spelling(s) the differential runner's
+    // rendered records carry (see the doc comment above); the shared
+    // rewrite heap-builds the result, so records of any size are safe.
+    // On the untouched fast path it returns `src` and no free happens.
+    const zsrc = try cli.repairDhallRecordSpellings(
+        gpa,
+        src,
+        .{ .list_payload = "Text" },
+    );
+    defer if (zsrc.ptr != src.ptr) gpa.free(zsrc);
 
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
@@ -291,7 +262,8 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 // cli_paste.zig).  Deliberate deltas vs the hand parser it replaced: `-dX`
 // (the attached value form) is now error.UnknownOption — a Value short never
 // clusters (schemas/README.md; the paste.dhall note verbatim) — `-d` without
-// a following token is error.MissingValue, `--delimiters=X` binds inline, and
+// a following token is error.MissingValue, `--delimiters=X` binds inline AND
+// the two-token `--delimiters X` spelling is valid generator vocabulary, and
 // `--` ends flag parsing.
 
 // ---------------------------------------------------------------------------
@@ -316,11 +288,10 @@ test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" 
     try expectPosixEqualsRecord(&.{"fx-paste"}, "{ }");
     // -d with a separate-token value (the only -d spelling; -dx is unrepresentable)
     try expectPosixEqualsRecord(&.{ "fx-paste", "-d", "," }, "{ delim = \",\" }");
-    // the Value long is inline-only (--delimiters=X; separate-token --delimiters
-    // is unknown in the generated surface)
+    // the Value long: inline spelling, then the separate-token two-token
+    // form (generator vocabulary — both bind `delim`)
     try expectPosixEqualsRecord(&.{ "fx-paste", "--delimiters=:" }, "{ delim = \":\" }");
-    // inline --long=value for the Value long
-    try expectPosixEqualsRecord(&.{ "fx-paste", "--delimiters=|" }, "{ delim = \"|\" }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "--delimiters", ":" }, "{ delim = \":\" }");
     // -s alone, the --serial long alias, then composed with -d
     try expectPosixEqualsRecord(&.{ "fx-paste", "-s" }, "{ serial = True }");
     try expectPosixEqualsRecord(&.{ "fx-paste", "--serial" }, "{ serial = True }");
@@ -475,7 +446,7 @@ pub fn main(init: std.process.Init) !void {
         const stdout_file = std.Io.File.stdout();
         var out = std.ArrayList(u8).empty;
         defer out.deinit(aa);
-        try pasteParallel(&.{lines}, opts.delim, &out, aa);
+        try pasteParallel(&.{lines}, if (opts.delim.len > 0) opts.delim[0] else '\t', &out, aa);
         _ = std.Io.File.writeStreamingAll(stdout_file, init.io, out.items) catch return error.WriteFailed;
         return;
     }

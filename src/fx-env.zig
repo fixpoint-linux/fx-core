@@ -197,88 +197,23 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 /// The differential runner's record side renders completed schema values
 /// from fx-cli.renderDhallRecord, whose List arm emits the bare form, so the
 /// empty-default `sets` would die at INFER time in evalDhallArgs on every
-/// all-defaults vector.  Repair the spelling at this command's single
-/// record-form entry point: an empty list whose neighbors are not
-/// identifier-ish gets the schema's `List Text` payload; a non-empty list is
-/// untouched (its elements carry the type).  A Text value can never legally
-/// place a bare `[]` between non-identifier bytes (the wrapping quotes are
-/// identifier-ish on the inside), so the rewrite is unambiguous.
-fn repairBareList(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "[]") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 2 == src.len or !isIdentByte(src[i + 2])))
-        {
-            const rep = "[] : List Text";
-            @memcpy(buf[n .. n + rep.len], rep);
-            n += rep.len;
-            i += 2;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
-fn isIdentByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
-}
-
-/// The bare-`None` twin of repairBareList (fx-du's idiom): renderDhallRecord's
-/// Optional arm emits `None` with no payload, which does not parse — give it
-/// the schema's payload (`unset : Optional Text`).
-fn repairBareNone(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "None") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 4 == src.len or !isIdentByte(src[i + 4])))
-        {
-            // already annotated ("None Text", ...)?  The next non-space char
-            // of an annotated form is a letter.
-            var j = i + 4;
-            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-            if (j < src.len and std.ascii.isAlphabetic(src[j])) {
-                @memcpy(buf[n .. n + 4], "None");
-                n += 4;
-                i += 4;
-                continue;
-            }
-            const rep = "None Text";
-            @memcpy(buf[n .. n + rep.len], rep);
-            n += rep.len;
-            i += 4;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
+/// all-defaults vector.  The rewrite now lives in
+/// cli.repairDhallRecordSpellings (shared, heap-backed, unit-tested there).
+/// The bare-`None` twin (renderDhallRecord's Optional arm emits `None` with
+/// no payload, which does not parse — give it the schema's payload
+/// `unset : Optional Text`) and `isIdentByte` moved with it.
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     // Repair the spellings the differential runner's rendered records carry
-    // that the dhall-c grammar rejects bare: `[]` (repairBareList) and `None`
-    // (repairBareNone — env has BOTH an empty List Text default and an
-    // Optional Text default).  parse_source wants a C string, so the repaired
-    // copy is dupeZ'd; the untouched fast path passes `src` straight through.
-    var nb: [512]u8 = undefined;
-    var nb2: [512]u8 = undefined;
-    var zbuf: [512:0]u8 = undefined;
-    const repaired = repairBareList(&nb, src);
-    const repaired2 = repairBareNone(&nb2, repaired);
-    const zsrc: [:0]const u8 = if (repaired2.ptr == src.ptr)
-        src
-    else
-        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired2}) catch return error.DhallFields;
+    // that the dhall-c grammar rejects bare: `[]` (the List Text default)
+    // and `None` (the Optional Text default — env has BOTH).  The shared
+    // repair heap-builds the result, so records of any size are safe; on
+    // the untouched fast path it returns `src` and no free happens.
+    const zsrc = try cli.repairDhallRecordSpellings(
+        gpa,
+        src,
+        .{ .none_payload = " Text", .list_payload = "Text" },
+    );
+    defer if (zsrc.ptr != src.ptr) gpa.free(zsrc);
 
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);

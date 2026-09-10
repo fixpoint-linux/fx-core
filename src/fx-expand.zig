@@ -484,8 +484,10 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
     try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "-t4" }, gpa));
     try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "--bogus" }, gpa));
 
-    // the bare --tabs spelling (no '='): a Value long binds inline ONLY
-    try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "--tabs", "7" }, gpa));
+    // the two-token --tabs spelling: VALID generator vocabulary (the hand
+    // parsers' `--long value` form, restored in the final fix round)
+    const twotok = try cli_expand.parsePosix(&.{ "fx-expand", "--tabs", "7" }, gpa);
+    try std.testing.expectEqual(@as(u64, 7), twotok.tabstop);
 
     // the record form's own rejections, at completion time: unknown field,
     // wrong field type, and the LEGACY singular `input` spelling

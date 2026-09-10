@@ -800,7 +800,7 @@ fn renderValue(gpa: Allocator, out: *std.ArrayList(u8), v: *const Value, ty: *co
             };
             out.append(gpa, '"') catch return error.OutOfMemory;
         },
-                .natural, .integer, .double => {
+        .natural, .integer, .double => {
             var nb: [32]u8 = undefined;
             const txt = switch (v.*) {
                 .natural => |n| std.fmt.bufPrint(&nb, "{d}", .{n}) catch unreachable,
@@ -850,6 +850,88 @@ fn renderValue(gpa: Allocator, out: *std.ArrayList(u8), v: *const Value, ty: *co
             out.append(gpa, ']') catch return error.OutOfMemory;
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// record-spelling repair (the per-command evalDhallArgs entry points)
+// ---------------------------------------------------------------------------
+
+/// What to rewrite, i.e. which untypeable spellings renderDhallRecord can
+/// emit and the dhall-c grammar rejects bare.  `none_payload` annotates a
+/// bare `None` (`None` -> `None <payload>`); `list_payload` annotates a bare
+/// `[]` (`[]` -> `[] : List <payload>`).  Only set what the command's schema
+/// actually carries; each field name appears at most once in a rendered
+/// record, so the rewrite is unambiguous (a Text literal can never place a
+/// bare `None`/`[]` between non-identifier bytes — the wrapping quotes are
+/// identifier-ish on the inside).
+pub const RepairSpellings = struct {
+    none_payload: ?[]const u8 = null,
+    list_payload: ?[]const u8 = null,
+};
+
+/// Rewrite the spellings named by `spell` in the dhall record `src`,
+/// heap-building the result so records of ANY size are safe (the per-command
+/// `[512]` stack copies this replaced had none: a >512-byte record holding a
+/// `None`/`[]` overflowed them — Debug/ReleaseSafe panic, ReleaseFast
+/// corruption).  Returns `src` itself on the untouched fast path (nothing to
+/// repair); otherwise the caller owns the returned gpa allocation and must
+/// free it.  An already-annotated `None <T>` / `[] : List <T>` is left alone.
+pub fn repairDhallRecordSpellings(
+    gpa: Allocator,
+    src: [:0]const u8,
+    spell: RepairSpellings,
+) Error![:0]const u8 {
+    const need_none = spell.none_payload != null and
+        std.mem.indexOf(u8, src, "None") != null;
+    const need_list = spell.list_payload != null and
+        std.mem.indexOf(u8, src, "[]") != null;
+    if (!need_none and !need_list) return src;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    // The rewrites only ever grow the text; this reservation is a heuristic
+    // (bare per-field spellings are short), correctness never depends on it.
+    out.ensureTotalCapacity(gpa, src.len + 32) catch return error.OutOfMemory;
+
+    var i: usize = 0;
+    while (i < src.len) {
+        if (need_none and i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 4 == src.len or !isIdentByte(src[i + 4])))
+        {
+            // already annotated ("None Text", ...)?  The next non-space char
+            // of an annotated form is a letter.
+            var j = i + 4;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+            const annotated = j < src.len and std.ascii.isAlphabetic(src[j]);
+            out.appendSlice(gpa, "None") catch return error.OutOfMemory;
+            if (!annotated) out.appendSlice(gpa, spell.none_payload.?) catch return error.OutOfMemory;
+            i += 4;
+        } else if (need_list and i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 2 == src.len or !isIdentByte(src[i + 2])))
+        {
+            // already annotated ("[] : List Text", ...)?  The next non-space
+            // char of an annotated form is the ascription colon.
+            var j = i + 2;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+            const annotated = j < src.len and src[j] == ':';
+            out.appendSlice(gpa, "[]") catch return error.OutOfMemory;
+            if (!annotated) {
+                out.appendSlice(gpa, " : List ") catch return error.OutOfMemory;
+                out.appendSlice(gpa, spell.list_payload.?) catch return error.OutOfMemory;
+            }
+            i += 2;
+        } else {
+            out.append(gpa, src[i]) catch return error.OutOfMemory;
+            i += 1;
+        }
+    }
+    return out.toOwnedSliceSentinel(gpa, 0) catch return error.OutOfMemory;
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1237,95 @@ const testing = std.testing;
 fn lsSchemaSrc() [:0]u8 {
     return readSchemaFile(testing.allocator, &.{ "schemas/ls.dhall", "fx-core/schemas/ls.dhall" }) catch
         @panic("cannot locate schemas/ls.dhall (run tests from the fx-core root)");
+}
+
+test "repairDhallRecordSpellings: bare None and [] annotated, annotated forms untouched" {
+    const gpa = testing.allocator;
+    // both spellings in one record (the fx-env shape)
+    {
+        const out = try repairDhallRecordSpellings(
+            gpa,
+            "{ unset = None, sets = [] }",
+            .{ .none_payload = " Text", .list_payload = "Text" },
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings(
+            "{ unset = None Text, sets = [] : List Text }",
+            out,
+        );
+    }
+    // none-only config must not touch `[]` even when present in a literal
+    {
+        const out = try repairDhallRecordSpellings(
+            gpa,
+            "{ maxdepth = None, note = \"x[]y\" }",
+            .{ .none_payload = " Natural" },
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{ maxdepth = None Natural, note = \"x[]y\" }", out);
+    }
+    // list-only config must not touch `None` even when present in a literal
+    {
+        const out = try repairDhallRecordSpellings(
+            gpa,
+            "{ files = [], note = \"None\" }",
+            .{ .list_payload = "Text" },
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{ files = [] : List Text, note = \"None\" }", out);
+    }
+    // already-annotated forms pass through byte-identical
+    {
+        const src = "{ a = None Text, b = [] : List Natural }";
+        const out = try repairDhallRecordSpellings(
+            gpa,
+            src,
+            .{ .none_payload = " Text", .list_payload = "Natural" },
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings(src, out);
+    }
+    // fast path: nothing to repair returns src itself (no allocation)
+    {
+        const src = "{ files = [ \"a\" ] }";
+        const out = try repairDhallRecordSpellings(gpa, src, .{ .list_payload = "Text" });
+        try testing.expectEqual(src.ptr, out.ptr);
+    }
+}
+
+test "repairDhallRecordSpellings: record larger than the old 512-byte stack buffer" {
+    const gpa = testing.allocator;
+    // ~600-byte Text value (the overflow class: >512 total with a bare [])
+    var big: [600]u8 = undefined;
+    @memset(&big, 'x');
+    var src: [701:0]u8 = undefined;
+    const rec = try std.fmt.bufPrintZ(&src, "{{ note = \"{s}\", files = [] }}", .{big});
+    const out = try repairDhallRecordSpellings(gpa, rec, .{ .list_payload = "Text" });
+    defer gpa.free(out);
+    try testing.expectEqualStrings(" [] : List Text }", out[out.len - 17 ..]);
+    try testing.expectEqual(@as(usize, rec.len + 12), out.len);
+}
+
+test "repairDhallRecordSpellings: end-to-end dhall eval of a repaired record" {
+    const gpa = testing.allocator;
+    const src = try repairDhallRecordSpellings(
+        gpa,
+        "{ unset = None, sets = [ \"A=1\" ] }",
+        .{ .none_payload = " Text" },
+    );
+    defer gpa.free(src);
+    const schema_src = envSchemaSrcForRepair(gpa);
+    defer gpa.free(schema_src);
+    var c = try completeSrc(gpa, schema_src, src);
+    defer c.deinit(gpa);
+    // the repaired record typechecks and normalizes (values survive the round trip)
+    try testing.expectEqualStrings("A=1", c.value.findField("sets").?.list[0].text);
+    try testing.expect(c.value.findField("unset").? == .none_);
+}
+
+fn envSchemaSrcForRepair(gpa: Allocator) [:0]u8 {
+    return readSchemaFile(gpa, &.{ "schemas/env.dhall", "fx-core/schemas/env.dhall" }) catch
+        @panic("cannot locate schemas/env.dhall (run tests from the fx-core root)");
 }
 
 test "evalSchemaSrc: ls.dhall projects ty/dflt/posix" {

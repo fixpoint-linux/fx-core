@@ -932,7 +932,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        opts = try parsePosixArgs(args);
+        opts = try parsePosixArgs(args, opt_alloc);
     }
 
     // Unique transient db dir (mkdtemp, mirrors fx-ls/fx-find).

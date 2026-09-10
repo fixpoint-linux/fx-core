@@ -85,6 +85,15 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             o.unset = gpa.dupe(u8, args[i][8..]) catch return error.OutOfMemory;
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--unset")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-env: option '-u' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.unset = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            matched = true;
+        }
         if (!matched) {
             if (a.len > 1 and a[0] == '-') {
                 std.debug.print("fx-env: unknown option '{s}'\n", .{ a });
@@ -157,6 +166,15 @@ test "cli_env: --unset=value binds unset" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-env", "--unset=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.unset.?);
+}
+
+test "cli_env: --unset value (two-token form) binds unset" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-env", "--unset", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.unset.?);
 }

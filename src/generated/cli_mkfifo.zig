@@ -68,6 +68,15 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             o.mode = gpa.dupe(u8, args[i][7..]) catch return error.OutOfMemory;
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--mode")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-mkfifo: option '-m' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.mode = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            matched = true;
+        }
         if (!matched) {
             if (a.len > 1 and a[0] == '-') {
                 std.debug.print("fx-mkfifo: unknown option '{s}'\n", .{ a });
@@ -114,6 +123,15 @@ test "cli_mkfifo: --mode=value binds mode" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-mkfifo", "--mode=v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.mode.?);
+}
+
+test "cli_mkfifo: --mode value (two-token form) binds mode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-mkfifo", "--mode", "v" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqualStrings("v", o.mode.?);
 }

@@ -189,19 +189,18 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     // The hand-record spelling of stdin (`{ input = None Text }`) predates the
     // schema and is ill-typed against plain Text; rewrite it at this single
     // boundary to the schema spelling (an omitted field — the "" placeholder
-    // default; the head.dhall divergence note verbatim).
+    // default; the head.dhall divergence note verbatim).  Heap-built, so
+    // records of any size are safe (the [512] stack copy had no bound).
     if (std.mem.indexOf(u8, src, "input = None") != null) {
         const needle = "input = None Text";
         if (std.mem.indexOf(u8, src, needle)) |pos| {
-            var buf: [512]u8 = undefined;
-            var n: usize = 0;
-            n += pos;
-            @memcpy(buf[0..n], src[0..pos]);
-            const rest = src[pos + needle.len ..];
-            @memcpy(buf[n .. n + rest.len], rest);
-            n += rest.len;
-            var zbuf: [512:0]u8 = undefined;
-            const rewritten = std.fmt.bufPrintZ(&zbuf, "{s}", .{buf[0..n]}) catch return error.DhallFields;
+            const rewritten = std.fmt.allocPrintSentinel(
+                gpa,
+                "{s}{s}",
+                .{ src[0..pos], src[pos + needle.len ..] },
+                0,
+            ) catch return error.OutOfMemory;
+            defer gpa.free(rewritten);
             return evalDhallArgsSchema(rewritten, gpa);
         }
     }

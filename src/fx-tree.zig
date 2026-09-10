@@ -386,58 +386,19 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 /// whose Optional arm emits the bare form (fx-cli.zig renderValue .none_ is
 /// type-blind), so `fx-tree '{ maxdepth = None }'` (and every None-default
 /// matrix vector) would die at PARSE time before the schema annotation could
-/// fix the type.  Repair the spelling at this command's single record-form
-/// entry point: `None` NOT followed by an identifier is given the schema's
-/// Optional payload type; an already-annotated `None Natural` is untouched.
-/// A real record literal can never legally contain a bare `None`, so the
-/// rewrite is unambiguous.
-fn repairBareNone(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "None") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 4 == src.len or !isIdentByte(src[i + 4])))
-        {
-            // already annotated ("None Natural", "None Text", ...)?  The
-            // next non-space char of an annotated form is a letter.
-            var j = i + 4;
-            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-            if (j < src.len and std.ascii.isAlphabetic(src[j])) {
-                @memcpy(buf[n .. n + 4], "None");
-                n += 4;
-                i += 4;
-                continue;
-            }
-            @memcpy(buf[n .. n + 12], "None Natural");
-            n += 12;
-            i += 4;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
-fn isIdentByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
-}
-
+/// The rewrite itself is cli.repairDhallRecordSpellings (shared,
+/// heap-backed, unit-tested in fx-cli.zig): records of any size are safe.
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
-    // Repair a bare `None` before the C parser sees it (see repairBareNone —
-    // the differential runner's rendered records carry the unparseable
-    // spelling).  parse_source wants a C string, so the repaired copy is
-    // dupeZ'd; the unrepaired fast path passes `src` straight through.
-    var nb: [512:0]u8 = undefined;
-    var zbuf: [512:0]u8 = undefined;
-    const repaired = repairBareNone(&nb, src);
-    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
-        src
-    else
-        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+    // Repair the unparseable bare spelling(s) the differential runner's
+    // rendered records carry (see the doc comment above); the shared
+    // rewrite heap-builds the result, so records of any size are safe.
+    // On the untouched fast path it returns `src` and no free happens.
+    const zsrc = try cli.repairDhallRecordSpellings(
+        gpa,
+        src,
+        .{ .none_payload = " Natural" },
+    );
+    defer if (zsrc.ptr != src.ptr) gpa.free(zsrc);
 
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
@@ -620,8 +581,8 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
     const gpa = arena_state.allocator();
 
     // unknown option; -L with no value; -L with a non-Natural value
-    try std.testing.expectError(error.UnknownOption, cli_tree.parsePosix(&.{"fx-tree", "-x"}, gpa));
-    try std.testing.expectError(error.MissingValue, cli_tree.parsePosix(&.{"fx-tree", "-L"}, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_tree.parsePosix(&.{ "fx-tree", "-x" }, gpa));
+    try std.testing.expectError(error.MissingValue, cli_tree.parsePosix(&.{ "fx-tree", "-L" }, gpa));
     try std.testing.expectError(error.BadValue, cli_tree.parsePosix(&.{ "fx-tree", "-L", "x" }, gpa));
     // a second ROOT operand: the generated single-slot binding rejects it
     // (the hand parser's TooManyOperands analogue)
@@ -1068,16 +1029,15 @@ test "tree pipeline: FS fixture renders the exact glyph bytes" {
     // z.txt; children of b: c.txt, d; child of d: e.txt.  d is b's LAST
     // child, so e.txt's level indents with the pipe + 4-space gap (the
     // last-child continuation), not a second pipe.
-    const want = try std.fmt.allocPrint(gpa,
-        "{s}\n" ++
-            "\u{251C}\u{2500}\u{2500} a.txt\n" ++
-            "\u{251C}\u{2500}\u{2500} b\n" ++
-            "\u{2502}   \u{251C}\u{2500}\u{2500} c.txt\n" ++
-            "\u{2502}   \u{2514}\u{2500}\u{2500} d\n" ++
-            "\u{2502}       \u{2514}\u{2500}\u{2500} e.txt\n" ++
-            "\u{2514}\u{2500}\u{2500} z.txt\n" ++
-            "\n" ++
-            "2 directories, 4 files\n", .{tpath});
+    const want = try std.fmt.allocPrint(gpa, "{s}\n" ++
+        "\u{251C}\u{2500}\u{2500} a.txt\n" ++
+        "\u{251C}\u{2500}\u{2500} b\n" ++
+        "\u{2502}   \u{251C}\u{2500}\u{2500} c.txt\n" ++
+        "\u{2502}   \u{2514}\u{2500}\u{2500} d\n" ++
+        "\u{2502}       \u{2514}\u{2500}\u{2500} e.txt\n" ++
+        "\u{2514}\u{2500}\u{2500} z.txt\n" ++
+        "\n" ++
+        "2 directories, 4 files\n", .{tpath});
     defer gpa.free(want);
     try std.testing.expectEqualStrings(want, out.items);
 }
@@ -1095,17 +1055,16 @@ test "tree pipeline: -a lists the dotfile first" {
     try renderTree(&out, gpa, tpath, nodes.items);
 
     // '.' (0x2E) sorts before 'a'; .hidden is a file => 5 files now.
-    const want = try std.fmt.allocPrint(gpa,
-        "{s}\n" ++
-            "\u{251C}\u{2500}\u{2500} .hidden\n" ++
-            "\u{251C}\u{2500}\u{2500} a.txt\n" ++
-            "\u{251C}\u{2500}\u{2500} b\n" ++
-            "\u{2502}   \u{251C}\u{2500}\u{2500} c.txt\n" ++
-            "\u{2502}   \u{2514}\u{2500}\u{2500} d\n" ++
-            "\u{2502}       \u{2514}\u{2500}\u{2500} e.txt\n" ++
-            "\u{2514}\u{2500}\u{2500} z.txt\n" ++
-            "\n" ++
-            "2 directories, 5 files\n", .{tpath});
+    const want = try std.fmt.allocPrint(gpa, "{s}\n" ++
+        "\u{251C}\u{2500}\u{2500} .hidden\n" ++
+        "\u{251C}\u{2500}\u{2500} a.txt\n" ++
+        "\u{251C}\u{2500}\u{2500} b\n" ++
+        "\u{2502}   \u{251C}\u{2500}\u{2500} c.txt\n" ++
+        "\u{2502}   \u{2514}\u{2500}\u{2500} d\n" ++
+        "\u{2502}       \u{2514}\u{2500}\u{2500} e.txt\n" ++
+        "\u{2514}\u{2500}\u{2500} z.txt\n" ++
+        "\n" ++
+        "2 directories, 5 files\n", .{tpath});
     defer gpa.free(want);
     try std.testing.expectEqualStrings(want, out.items);
 }
@@ -1124,12 +1083,11 @@ test "tree pipeline: -d lists dirs only but still descends" {
 
     // b is <t>'s only listed child => elbow; d is b's last (only) child,
     // indented by the 4-space last-child gap.
-    const want = try std.fmt.allocPrint(gpa,
-        "{s}\n" ++
-            "\u{2514}\u{2500}\u{2500} b\n" ++
-            "    \u{2514}\u{2500}\u{2500} d\n" ++
-            "\n" ++
-            "2 directories, 0 files\n", .{tpath});
+    const want = try std.fmt.allocPrint(gpa, "{s}\n" ++
+        "\u{2514}\u{2500}\u{2500} b\n" ++
+        "    \u{2514}\u{2500}\u{2500} d\n" ++
+        "\n" ++
+        "2 directories, 0 files\n", .{tpath});
     defer gpa.free(want);
     try std.testing.expectEqualStrings(want, out.items);
 }
@@ -1146,13 +1104,12 @@ test "tree pipeline: -L 1 caps depth (and pins the always-plural footer)" {
     defer out.deinit(gpa);
     try renderTree(&out, gpa, tpath, nodes.items);
 
-    const want = try std.fmt.allocPrint(gpa,
-        "{s}\n" ++
-            "\u{251C}\u{2500}\u{2500} a.txt\n" ++
-            "\u{251C}\u{2500}\u{2500} b\n" ++
-            "\u{2514}\u{2500}\u{2500} z.txt\n" ++
-            "\n" ++
-            "1 directories, 2 files\n", .{tpath});
+    const want = try std.fmt.allocPrint(gpa, "{s}\n" ++
+        "\u{251C}\u{2500}\u{2500} a.txt\n" ++
+        "\u{251C}\u{2500}\u{2500} b\n" ++
+        "\u{2514}\u{2500}\u{2500} z.txt\n" ++
+        "\n" ++
+        "1 directories, 2 files\n", .{tpath});
     defer gpa.free(want);
     try std.testing.expectEqualStrings(want, out.items);
 }
@@ -1219,13 +1176,12 @@ test "tree pipeline: symlinked dir is a file leaf, never followed" {
     // link classifies as a non-dir (AT_SYMLINK_NOFOLLOW) => listed before
     // sub (lex) as a FILE, and sub's f appears exactly once (no cycle, no
     // double listing through the symlink).
-    const want = try std.fmt.allocPrint(gpa,
-        "{s}\n" ++
-            "\u{251C}\u{2500}\u{2500} link\n" ++
-            "\u{2514}\u{2500}\u{2500} sub\n" ++
-            "    \u{2514}\u{2500}\u{2500} f\n" ++
-            "\n" ++
-            "1 directories, 2 files\n", .{tpath});
+    const want = try std.fmt.allocPrint(gpa, "{s}\n" ++
+        "\u{251C}\u{2500}\u{2500} link\n" ++
+        "\u{2514}\u{2500}\u{2500} sub\n" ++
+        "    \u{2514}\u{2500}\u{2500} f\n" ++
+        "\n" ++
+        "1 directories, 2 files\n", .{tpath});
     defer gpa.free(want);
     try std.testing.expectEqualStrings(want, out.items);
 }

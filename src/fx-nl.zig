@@ -435,7 +435,8 @@ pub fn main(init: std.process.Init) !void {
     const num = numberingOf(opts);
 
     var data: []u8 = undefined;
-    if (opts.file) |f| {
+    if (opts.file.len > 0) {
+        const f = opts.file;
         const z = std.posix.toPosixPath(f) catch return error.BadPath;
         const fd = open(&z, O_RDONLY, 0);
         if (fd < 0) {

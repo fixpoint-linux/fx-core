@@ -24,18 +24,21 @@ per-command variance would re-create the drift this architecture kills):
 - short clustering of ARGUMENTLESS shorts: `-la` == `-l -a`.  A Value short
   never clusters (its value boundary would be ambiguous) — `-n7` is
   UnknownOption, use `-n 7` or `--num=7`
-- inline `--long=value` for Value-kind longs (the separate-token
-  `--long value` form stays valid too)
+- inline `--long=value` for Value-kind longs, and the separate-token
+  `--long value` form (both spellings accepted; the hand parsers' two-token
+  form is kept — the first generated emission dropped it, restored in the
+  final fix round, pinned per parser)
 
 These are a deliberate strengthening over the hand parsers (exact tokens
-only).  Differential tests (STEP 2+) must not assert the old rejection of
-these forms.  Each generated parser pins them with tests (cluster binds
-both, cluster across a mutually-exclusive group conflicts, unknown-letter
-cluster rejected, value short does not cluster, `--long=value` binds).
+only) for CLUSTERING.  Differential tests (STEP 2+) must not assert the old
+rejection of these forms.  Each generated parser pins them with tests
+(cluster binds both, cluster across a mutually-exclusive group conflicts,
+unknown-letter cluster rejected, value short does not cluster,
+`--long=value` binds, two-token `--long value` binds).
 
 ## meta_*.dhall — generator gate fixtures, NOT commands
 
-`meta_values` / `meta_many` / `meta_noflags` are fixtures for the GENERATOR
+`meta_values` / `meta_many` / `meta_noflags` / `meta_boolflags` are fixtures for the GENERATOR
 META-GATE: at `zig build test` time each is generated into the local build
 cache (`.zig-cache/gen-meta/`), `build-obj`d, and its test blocks RUN — so a
 non-compiling OR runtime-failing emission of ANY shape fails the gate instead

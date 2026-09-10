@@ -216,38 +216,8 @@ const DhallArgs = struct {
 /// The differential runner's record side renders completed schema values
 /// from fx-cli.renderDhallRecord, whose List arm emits the bare form, so the
 /// empty-default `paths` would die at INFER time in evalDhallArgs on every
-/// all-defaults vector.  Repair the spelling at this command's single
-/// record-form entry point: an empty list whose neighbors are not
-/// identifier-ish gets the schema's `List Text` payload; a non-empty list is
-/// untouched (its elements carry the type).  A Text value can never legally
-/// place a bare `[]` between non-identifier bytes (the wrapping quotes are
-/// identifier-ish on the inside), so the rewrite is unambiguous.
-fn repairBareList(buf: []u8, src: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, src, "[]") == null) return src;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < src.len) {
-        if (i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
-            (i == 0 or !isIdentByte(src[i - 1])) and
-            (i + 2 == src.len or !isIdentByte(src[i + 2])))
-        {
-            const rep = "[] : List Text";
-            @memcpy(buf[n .. n + rep.len], rep);
-            n += rep.len;
-            i += 2;
-        } else {
-            buf[n] = src[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return buf[0..n];
-}
-
-fn isIdentByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
-}
-
+/// The rewrite itself is cli.repairDhallRecordSpellings (shared,
+/// heap-backed, unit-tested in fx-cli.zig): records of any size are safe.
 /// Options-returning evaluator — the differential runner calls THIS (the
 /// shared expectPosixEqualsRecord needs function record-literal -> Options);
 /// main() uses evalDhallRecordFull below (it also needs the canonical
@@ -257,17 +227,16 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 }
 
 fn evalDhallRecordFull(src: [:0]const u8, gpa: Allocator) !DhallArgs {
-    // Repair a bare `[]` before the C parser sees it (see repairBareList —
-    // the differential runner's rendered records carry the untypeable
-    // spelling).  parse_source wants a C string, so the repaired copy is
-    // dupeZ'd; the unrepaired fast path passes `src` straight through.
-    var nb: [512]u8 = undefined;
-    var zbuf: [512:0]u8 = undefined;
-    const repaired = repairBareList(&nb, src);
-    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
-        src
-    else
-        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+    // Repair the unparseable bare spelling(s) the differential runner's
+    // rendered records carry (see the doc comment above); the shared
+    // rewrite heap-builds the result, so records of any size are safe.
+    // On the untouched fast path it returns `src` and no free happens.
+    const zsrc = try cli.repairDhallRecordSpellings(
+        gpa,
+        src,
+        .{ .list_payload = "Text" },
+    );
+    defer if (zsrc.ptr != src.ptr) gpa.free(zsrc);
 
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
@@ -941,7 +910,7 @@ pub fn main(init: std.process.Init) !void {
     var opts: Options = undefined;
     var args_json: []const u8 = undefined;
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
-        const d = try evalDhallArgs(args[1], aa);
+        const d = try evalDhallRecordFull(args[1], aa);
         opts = d.opts;
         // Normalize the Dhall form to the SAME canonical args_json schema as the
         // POSIX form: {"paths":[...],"recursive":<bool>}.  (The raw Dhall record

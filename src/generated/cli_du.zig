@@ -86,6 +86,18 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             };
             matched = true;
         }
+        if (!matched and std.mem.eql(u8, a, "--max-depth")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-du: option '-d' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.maxdepth = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("fx-du: option '-d': '{s}' is not a Natural (u64)\n", .{ args[i] });
+                return error.BadValue;
+            };
+            matched = true;
+        }
         if (!matched and (std.mem.eql(u8, a, "-s") or std.mem.eql(u8, a, "--summarize"))) {
             o.summary = true;
             matched = true;
@@ -169,6 +181,15 @@ test "cli_du: --max-depth=value binds maxdepth" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
     const argv = [_][]const u8{ "fx-du", "--max-depth=7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(u64, 7), o.maxdepth.?);
+}
+
+test "cli_du: --max-depth value (two-token form) binds maxdepth" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-du", "--max-depth", "7" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expectEqual(@as(u64, 7), o.maxdepth.?);
 }

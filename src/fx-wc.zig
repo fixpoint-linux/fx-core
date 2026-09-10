@@ -605,7 +605,8 @@ pub fn main(init: std.process.Init) !void {
     var content = std.ArrayList(u8).empty;
     defer content.deinit(gpa);
     var filename: ?[]const u8 = null;
-    if (opts.input) |path| {
+    if (opts.input.len > 0) {
+        const path = opts.input;
         const z = std.posix.toPosixPath(path) catch return error.BadPath;
         const fd = open(&z, O_RDONLY, 0);
         if (fd < 0) {

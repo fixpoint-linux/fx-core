@@ -31,10 +31,10 @@
 // evalDhallArgs): the hand parser was POSIX-only, so the migration swaps in
 // the generated parser and pins it with direct rejection/behavior tests
 // instead of the differential matrix.  Deliberate changes against the hand
-// parser: flags are long-only INLINE-VALUE (--as-of=N / --store=DIR; the
-// hand separate-token spelling is gone), a missing PKG is a runtime
-//BadArgs in main (the schema's "." placeholder default), and `--`-escaping
-// a leading-dash PKG is accepted.
+// parser: `--as-of N` / `--store DIR` bind by the generated parser's
+// vocabulary (inline --as-of=N AND the hand's two-token spelling), a
+// missing PKG is a runtime BadArgs in main (the schema's "." placeholder
+// default), and `--`-escaping a leading-dash PKG is accepted.
 
 const std = @import("std");
 const prov = @import("provenance");
@@ -196,12 +196,15 @@ test "parsePosix: rejections" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
 
-    // unknown options: short, long, and the separate-token flag spelling the
-    // hand parser accepted (--as-of N is now --as-of=N only)
+    // unknown options: short and long (the separate-token `--as-of 3` /
+    // `--store /s` spellings are VALID generator vocabulary again — pinned
+    // by the generated `two-token form` tests in cli_why.zig)
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "-x" }, aa));
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "--bogus" }, aa));
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "--as-of", "3" }, aa));
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "--store", "/s" }, aa));
+    const two_token = try parsePosixArgs(&.{ "fx-why", "hello", "--as-of", "3" }, aa);
+    try std.testing.expectEqual(@as(u64, 3), two_token.as_of.?);
+    const two_token_store = try parsePosixArgs(&.{ "fx-why", "hello", "--store", "/s" }, aa);
+    try std.testing.expectEqualStrings("/s", two_token_store.store.?);
 
     // a second operand overflows the single PKG slot (the hand parser took
     // operand from args[1] and rejected the REST as UnknownArg)
