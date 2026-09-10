@@ -7,8 +7,18 @@
 -- shipped invisible).  It pins:
 --   * Value flags of every numeric flavor: Natural (-n), Integer (-i),
 --     Double (-d), plus their long forms (--num, --int, --dbl)
+--   * a NON-optional Text Value flag, long-only (--name): pins the binds-test
+--     emission for the plain Text shape AND the --long=value argv spelling
+--     such a flag's binds test must use (a bare "--name v" two-token argv
+--     is UnknownOption in the generated parser)
 --   * Optional fields: Text (--tail), Natural (-o), Integer (--oi),
---     Double (--od)
+--     Double (--od) — one Value flag per Optional shape, so a per-shape
+--     binds test is emitted for each (this is the exact hole that let the
+--     broken `o.f.?` (no semicolon) binds emission ship: the generator used
+--     to emit at most ONE Value binds test per schema, and meta_values'
+--     first Value flag (-n) is non-optional)
+--   * a Some-defaulted Optional Text field (mopt, bound by no flag): pins
+--     the dflt-assert emission for Some optionals (o.mopt.? unwrap)
 --   * short clustering (-x -y -> -xy; both are argumentless)
 --   * inline --long=value (--num=5, --tail=5)
 --   * a mutually_exclusive pair sharing one union field
@@ -33,6 +43,8 @@ in
     , optnum : Optional Natural
     , optint : Optional Integer
     , optdbl : Optional Double
+    , mopt : Optional Text
+    , name : Text
     , src : Text
     , x : Bool
     , y : Bool
@@ -46,6 +58,8 @@ in
     , optnum = None Natural
     , optint = None Integer
     , optdbl = None Double
+    , mopt = Some "dflt"
+    , name = "n"
     , src = "."
     , x = False
     , y = False
@@ -59,6 +73,7 @@ in
         , { short = Some "-o", long = None Text, field = "optnum", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
         , { short = None Text, long = Some "--oi", field = "optint", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
         , { short = None Text, long = Some "--od", field = "optdbl", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = None Text, long = Some "--name", field = "name", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
         , { short = Some "-A", long = None Text, field = "mode", kind = < Flag | Value | Enum : Text >.Enum "Asc", value = None Text }
         , { short = Some "-D", long = None Text, field = "mode", kind = < Flag | Value | Enum : Text >.Enum "Desc", value = None Text }
         , { short = Some "-x", long = None Text, field = "x", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }

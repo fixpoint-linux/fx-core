@@ -1376,7 +1376,7 @@ fn defaultAssert(out: *Out, gpa: Allocator, fname: []const u8, ty: *const cli.Ty
                     try line.appendSlice(gpa, e);
                     try line.appendSlice(gpa, "\", o.");
                     try line.appendSlice(gpa, id);
-                    try line.appendSlice(gpa, ".?)\n");
+                    try line.appendSlice(gpa, ".?);\n");
                 } else {
                     try line.appendSlice(gpa, "    try std.testing.expect(o.");
                     try line.appendSlice(gpa, id);
@@ -1436,6 +1436,35 @@ fn defaultAssert(out: *Out, gpa: Allocator, fname: []const u8, ty: *const cli.Ty
     try out.put(line.items);
 }
 
+/// Dedup key for the per-flag binds tests: one test per flag kind AND field
+/// shape, not per kind.  Per-kind dedup is how the broken Optional
+/// Value-flag emission shipped invisible: only a schema's FIRST Value flag
+/// got a binds test, and that first flag is rarely the Optional shape — so
+/// the Optional arms were never emitted for the meta gate to compile.
+fn bindsShapeBit(f: cli.Flag, fty: *const cli.TypeExpr) u16 {
+    return switch (f.kind) {
+        .flag => 1 << 0, // kind Flag always binds a Bool field
+        .enum_ => 1 << 1, // kind Enum always binds a union field
+        .value => switch (fty.*) {
+            .text => 1 << 2,
+            .natural => 1 << 3,
+            .integer => 1 << 4,
+            .double => 1 << 5,
+            .optional => |inner| switch (inner.*) {
+                .text => 1 << 6,
+                .natural => 1 << 7,
+                .integer => 1 << 8,
+                .double => 1 << 9,
+                // unreachable: valueBindingSrc already failed generation on
+                // any other Optional inner (emitParsePosix runs before this)
+                else => unreachable,
+            },
+            // unreachable: validateBindings rejects the rest for kind Value
+            else => unreachable,
+        },
+    };
+}
+
 fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) GenError!void {
     const disp = try displayName(gpa, name);
     defer gpa.free(disp);
@@ -1463,23 +1492,13 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
     }
     try out.put("}\n");
 
-    // ---- one test per flag kind (Flag / Value / Enum) ----
-    var did_flag = false;
-    var did_value = false;
-    var did_enum = false;
+    // ---- one binds test per flag kind AND field shape (see bindsShapeBit) ----
+    var did_shapes: u16 = 0;
     for (s.posix.flags) |f| {
-        const wanted = switch (f.kind) {
-            .flag => !did_flag,
-            .value => !did_value,
-            .enum_ => !did_enum,
-        };
-        if (!wanted) continue;
-        switch (f.kind) {
-            .flag => did_flag = true,
-            .value => did_value = true,
-            .enum_ => did_enum = true,
-        }
         const fty = s.ty.findField(f.field).?;
+        const bit = bindsShapeBit(f, fty);
+        if (did_shapes & bit != 0) continue;
+        did_shapes |= bit;
         const id = try ident(gpa, f.field);
         defer if (id.ptr != f.field.ptr) gpa.free(id);
         const tok = flagToken(f);
@@ -1521,9 +1540,19 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
                 try body.appendSlice(gpa, "    const argv = [_][]const u8{ \"");
                 try body.appendSlice(gpa, disp);
                 try body.appendSlice(gpa, "\", \"");
-                try body.appendSlice(gpa, tok);
-                try body.appendSlice(gpa, "\", \"");
-                try body.appendSlice(gpa, val);
+                // the accepted spelling differs by shape: a short (or
+                // short+long) Value flag takes the next argv token, a
+                // long-only one accepts ONLY --long=value (the generated
+                // parser matches the "=" prefix, never the bare long)
+                if (f.short) |sh| {
+                    try body.appendSlice(gpa, sh);
+                    try body.appendSlice(gpa, "\", \"");
+                    try body.appendSlice(gpa, val);
+                } else {
+                    try body.appendSlice(gpa, f.long.?);
+                    try body.appendSlice(gpa, "=");
+                    try body.appendSlice(gpa, val);
+                }
                 try body.appendSlice(gpa, "\" };\n    const o = try parsePosix(&argv, gpa);\n");
                 switch (fty.*) {
                     .text => {
@@ -1550,22 +1579,22 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
                         .natural => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqual(@as(u64, 7), o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, ".?)\n");
+                            try body.appendSlice(gpa, ".?);\n");
                         },
                         .integer => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqual(@as(i64, -7), o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, ".?)\n");
+                            try body.appendSlice(gpa, ".?);\n");
                         },
                         .double => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqual(@as(f64, 0.5), o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, ".?)\n");
+                            try body.appendSlice(gpa, ".?);\n");
                         },
                         else => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"v\", o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, ".?)\n");
+                            try body.appendSlice(gpa, ".?);\n");
                         },
                     },
                     else => unreachable,
