@@ -31,6 +31,14 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "snapshot running processes as a datalog-backed view"
+, out =
+    { pid : Natural
+    , state : Text
+    , ppid : Natural
+    , cpu : Natural
+    , rss_kb : Natural
+    , comm : Text
+    }
 , ty =
     { rows : Bool
     , sort : < Pid | Cpu | Mem >

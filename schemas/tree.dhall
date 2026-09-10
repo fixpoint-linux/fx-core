@@ -33,6 +33,12 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "render a directory closure as a tree (Datalog descent)"
+, out =
+    { path : Text
+    , kind : < File | Dir >
+    , size : Natural
+    , mtime : Natural
+    }
 , ty =
     { all : Bool
     , dirs_only : Bool

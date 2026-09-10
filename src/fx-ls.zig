@@ -77,11 +77,12 @@ const SortTag = cli_ls.sort; // Dhall < Name | Size | MTime >
 const Options = cli_ls.Options;
 const parsePosixArgs = cli_ls.parsePosix; // the generated POSIX parser
 
-/// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
-/// registry's builtin("ls") output type ("{ name : Text, size : Natural,
-/// mode : Natural }") — the declared order pins the canonical JSON key order
-/// (single source of truth: the Lens-3 registry table).
-const ls_rows_src = "{ name : Text, size : Natural, mode : Natural }";
+/// The rows-mode wire record type: the GENERATED declared output type
+/// (schemas/ls.dhall's `out`, rendered by fx-clijson into cli_ls) — the
+/// SAME literal the fx-pipeline registry's builtin("ls") parses, so the
+/// encoder's type and the compose() type-check's type are one string.  The
+/// declared order pins the canonical JSON key order.
+const ls_rows_src = cli_ls.out_type_src;
 
 // ---------------------------------------------------------------------------
 // mode-string helper (long format)

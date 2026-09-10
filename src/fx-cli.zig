@@ -125,6 +125,17 @@ pub const Schema = struct {
     /// docs-data generator (src/tools/fx-clidocs.zig) reads it; the parser
     /// generator ignores it.
     doc: ?[]const u8 = null,
+    /// OPTIONAL declared pipeline OUTPUT type (schemas' `out` section — a
+    /// Dhall record TYPE like ty, e.g. ls's `{ name : Text, size : Natural,
+    /// mode : Natural }`).  null when absent: the command's pipeline output
+    /// is a bare tag (bytes/lines) or has no schema-declared shape — the
+    /// meta_* fixtures and every pre-`out` schema must keep loading.  The
+    /// parser generator (fx-clijson) renders it (in the schema's DECLARED
+    /// field order, see outTypeSrcOrdered) into the generated file's
+    /// `out_type_src` string constant, which the fx-pipeline registry parses
+    /// for builtin(name) — so the type compose() type-checks against and
+    /// the type the producers' wire encoders enforce are ONE literal.
+    out: ?*TypeExpr = null,
 
     pub fn deinit(self: *Schema, gpa: Allocator) void {
         self.ty.deinit(gpa);
@@ -132,6 +143,10 @@ pub const Schema = struct {
         valueDeinit(&self.dflt, gpa);
         posixDeinit(&self.posix, gpa);
         if (self.doc) |d| gpa.free(d);
+        if (self.out) |o| {
+            o.deinit(gpa);
+            gpa.destroy(o);
+        }
     }
 };
 
@@ -684,6 +699,136 @@ pub fn usageLine(gpa: Allocator, name: []const u8, s: *const Schema) Error![]con
     return line.toOwnedSlice(gpa) catch return error.OutOfMemory;
 }
 
+// ---------------------------------------------------------------------------
+// Dhall-type rendering (shared: fx-clijson's out_type_src emission and
+// fx-clidocs's per-field "type" strings render through this ONE function,
+// so the generated constant and the docs dataset can never drift)
+// ---------------------------------------------------------------------------
+
+/// A cli.TypeExpr rendered as Dhall source text.  Record fields render in
+/// the TypeExpr's (dhall-c sorted) order — fine for docs and for types the
+/// registry PARSES (alpha_eq is order-insensitive), but NOT for the wire
+/// rows literal, whose field order pins the canonical JSON key order
+/// (fx-wire.declaredFieldKinds scans the source); use outTypeSrcOrdered for
+/// that.
+pub fn renderType(gpa: Allocator, ty: *const TypeExpr) Error![]const u8 {
+    var s = std.ArrayList(u8).empty;
+    errdefer s.deinit(gpa);
+    try renderTypeInto(gpa, &s, ty);
+    return s.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
+pub fn renderTypeInto(gpa: Allocator, s: *std.ArrayList(u8), ty: *const TypeExpr) Error!void {
+    switch (ty.*) {
+        .bool_ => try s.appendSlice(gpa, "Bool"),
+        .text => try s.appendSlice(gpa, "Text"),
+        .natural => try s.appendSlice(gpa, "Natural"),
+        .integer => try s.appendSlice(gpa, "Integer"),
+        .double => try s.appendSlice(gpa, "Double"),
+        .optional => |inner| {
+            try s.appendSlice(gpa, "Optional ");
+            try renderTypeInto(gpa, s, inner);
+        },
+        .list => |inner| {
+            try s.appendSlice(gpa, "List ");
+            try renderTypeInto(gpa, s, inner);
+        },
+        .record => |fs| {
+            if (fs.len == 0) {
+                try s.appendSlice(gpa, "{ }");
+                return;
+            }
+            try s.appendSlice(gpa, "{ ");
+            for (fs, 0..) |f, i| {
+                if (i != 0) try s.appendSlice(gpa, ", ");
+                try s.appendSlice(gpa, f.name);
+                try s.appendSlice(gpa, " : ");
+                try renderTypeInto(gpa, s, f.ty);
+            }
+            try s.appendSlice(gpa, " }");
+        },
+        .union_ => |alts| {
+            try s.appendSlice(gpa, "< ");
+            for (alts, 0..) |alt, i| {
+                if (i != 0) try s.appendSlice(gpa, " | ");
+                try s.appendSlice(gpa, alt);
+            }
+            try s.appendSlice(gpa, " >");
+        },
+    }
+}
+
+/// The declared pipeline OUTPUT type rendered as the Dhall record-type
+/// source the generated file's `out_type_src` constant carries — the SINGLE
+/// string both the producers' wire encoders (fx-wire.declaredFieldKinds
+/// derives the canonical JSON key order from it) and the fx-pipeline
+/// registry's builtin() parse.
+///
+/// ORDER IS LOAD-BEARING: dhall-c sorts record fields on parse
+/// (parser.zig sort_fields), so `schema.out`'s TypeExpr carries the SORTED
+/// order and cannot tell us the declared one.  We recover DECLARED order by
+/// re-parsing the schema source (the PARSED term — normalize rebuilds
+/// composite field types like unions with SPAN_NONE, discarding their
+/// source positions) and ordering `out`'s fields by their field TYPE term's
+/// source position (every field of a record type is `label : type`, so the
+/// type term's start position orders the fields unambiguously).
+/// UNION ALTERNATIVES render in dhall-c's sorted order (their declared
+/// order is unrecoverable — alternatives carry no source spans): harmless,
+/// since alpha_eq compares alternatives order-insensitively and
+/// fx-wire.declaredFieldKinds maps ANY union type to a text kind, so the
+/// wire bytes do not depend on it.
+/// One whole-arena transaction, like evalSchemaSrc.
+pub fn outTypeSrcOrdered(gpa: Allocator, schema_src: [:0]const u8, s: *const Schema) Error![]const u8 {
+    const out = s.out orelse return error.SchemaShape;
+    if (out.* != .record or out.record.len == 0) return error.SchemaShape;
+
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    arena.arena_reset(arena.dhall_arena.?);
+    errdefer arena.arena_reset(arena.dhall_arena.?);
+
+    var err: dhall.DhallError = undefined;
+    const parsed = try parseInfer(schema_src, &err);
+    var body = parsed;
+    while (body.tag == .TmLet) body = body.as.let_.body orelse return error.SchemaShape;
+    if (body.tag != .TmRecordLit) return error.SchemaShape;
+    const out_t = recField(body, "out") orelse return error.SchemaShape;
+    if (out_t.tag != .TmRecordType) return error.SchemaShape;
+
+    // declared order: sort the (sorted) field-type terms by source position
+    const n: usize = @intCast(out_t.as.rec.n);
+    var order = gpa.alloc(usize, n) catch return error.OutOfMemory;
+    defer gpa.free(order);
+    for (0..n) |i| order[i] = i;
+    const Ctx = struct {
+        fs: [*]dhall.Field,
+        fn lt(self: @This(), a: usize, b: usize) bool {
+            const sa = self.fs[a].type.?.loc;
+            const sb = self.fs[b].type.?.loc;
+            if (sa.line != sb.line) return sa.line < sb.line;
+            return sa.col < sb.col;
+        }
+    };
+    std.mem.sort(usize, order, Ctx{ .fs = out_t.as.rec.fs.? }, Ctx.lt);
+
+    // render in declared order, keyed off the gpa-owned (sorted) TypeExpr
+    // so the two views cannot disagree on shapes
+    var s2 = std.ArrayList(u8).empty;
+    errdefer s2.deinit(gpa);
+    try s2.appendSlice(gpa, "{ ");
+    for (order, 0..) |oi, i| {
+        const label = std.mem.span(out_t.as.rec.fs.?[oi].label.?);
+        const fty = out.findField(label) orelse return error.SchemaShape;
+        if (i != 0) try s2.appendSlice(gpa, ", ");
+        try s2.appendSlice(gpa, label);
+        try s2.appendSlice(gpa, " : ");
+        try renderTypeInto(gpa, &s2, fty);
+    }
+    try s2.appendSlice(gpa, " }");
+
+    arena.arena_reset(arena.dhall_arena.?);
+    return s2.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
 /// Evaluate a schema source into the gpa-owned view.  One whole-arena
 /// transaction (see the header): reset, parse+typecheck+normalize, deep-copy
 /// the three sections out, reset again.
@@ -719,8 +864,22 @@ pub fn evalSchemaSrc(gpa: Allocator, src: [:0]const u8) Error!Schema {
         doc = try copyOptText(gpa, doc_t);
     }
 
+    // out : a Dhall record TYPE (like ty) — ABSENT means null (bare-tag
+    // outputs need no declared shape).  Never required, same additive rule
+    // as doc.  A non-record out is a schema-shape violation: the section
+    // exists precisely to declare the rows wire shape.
+    var out: ?*TypeExpr = null;
+    errdefer if (out) |o| {
+        o.deinit(gpa);
+        gpa.destroy(o);
+    };
+    if (recField(nf, "out")) |out_t| {
+        if (out_t.tag != .TmRecordType) return error.SchemaShape;
+        out = try copyType(gpa, out_t);
+    }
+
     arena.arena_reset(arena.dhall_arena.?);
-    return .{ .ty = ty, .dflt = dflt, .posix = posix, .doc = doc };
+    return .{ .ty = ty, .dflt = dflt, .posix = posix, .doc = doc, .out = out };
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,4 +1922,48 @@ test "GROUND-TRUTH: encodeOptionsWire == vendored term_to_json bytes (all shapes
     defer w.deinit(gpa);
 
     try testing.expectEqualStrings(w.items, ob.items);
+}
+
+// ---------------------------------------------------------------------------
+// the OPTIONAL `out` section (U8: the declared pipeline OUTPUT type)
+// ---------------------------------------------------------------------------
+
+test "evalSchemaSrc: optional out section loads, preserves declared order via outTypeSrcOrdered" {
+    const gpa = testing.allocator;
+
+    // ls.dhall's out: { name : Text, size : Natural, mode : Natural }
+    // (DECLARED order — not dhall-sorted order, which would be mode first)
+    const src = lsSchemaSrc();
+    defer gpa.free(src);
+    var s = try evalSchemaSrc(gpa, src);
+    defer s.deinit(gpa);
+
+    try testing.expect(s.out != null);
+    try testing.expect(s.out.?.* == .record);
+    try testing.expectEqual(@as(usize, 3), s.out.?.record.len);
+    try testing.expect(s.out.?.findField("name").?.* == .text);
+    try testing.expect(s.out.?.findField("size").?.* == .natural);
+    try testing.expect(s.out.?.findField("mode").?.* == .natural);
+
+    const lit = try outTypeSrcOrdered(gpa, src, &s);
+    defer gpa.free(lit);
+    try testing.expectEqualStrings(
+        "{ name : Text, size : Natural, mode : Natural }",
+        lit,
+    );
+
+    // a schema WITHOUT out (the meta fixtures' shape) loads with out == null
+    const no_out_src =
+        \\{ ty = { path : Text }
+        \\, dflt = { path = "." }
+        \\, posix = { flags = [] : List { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
+        \\    , mutually_exclusive = [] : List (List Text)
+        \\    , positionals = [] : List { field : Text, display : Text, many : Bool } } }
+        \\
+    ;
+    var buf: [1024:0]u8 = undefined;
+    const no_out = std.fmt.bufPrintZ(&buf, "{s}", .{no_out_src}) catch unreachable;
+    var s2 = try evalSchemaSrc(gpa, no_out);
+    defer s2.deinit(gpa);
+    try testing.expect(s2.out == null);
 }

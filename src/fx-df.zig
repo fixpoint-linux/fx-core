@@ -42,12 +42,10 @@
 // skipped silently.  Capacity prints 0% when used+avail == 0 (dummy fs).
 //
 // --rows (Lens-3 dispatch): canonical wire rows instead of display text.
-// The rows-mode record type MUST stay identical to the fx-pipeline
-// registry's builtin("fx-df") output type — the declared order pins the
-// canonical JSON key order (single source of truth: the Lens-3 registry
-// table, landing in unit U5):
-//   '{ fs : Text, mount : Text, total_kb : Natural, used_kb : Natural,
-//      avail_kb : Natural }'
+// The rows-mode record type is the GENERATED declared output type
+// (schemas/df.dhall's `out` -> cli_df.out_type_src; see df_rows_src below)
+// — the SAME literal the fx-pipeline registry's builtin("df") parses, so
+// the encoder's type and the compose() type-check's type are one string.
 //
 // SNAPSHOT CAVEAT: the mount list (and its free counters) change BETWEEN
 // runs — output is a deterministic function of the snapshot; Lens-3 replay
@@ -554,7 +552,7 @@ fn renderText(gpa: Allocator, rows: []const FsRow, out: *std.ArrayList(u8)) !voi
 // wire-rows emission (--rows mode)
 // ---------------------------------------------------------------------------
 
-const df_rows_src = "{ fs : Text, mount : Text, total_kb : Natural, used_kb : Natural, avail_kb : Natural }";
+const df_rows_src = cli_df.out_type_src;
 
 /// Encode rows as canonical wire rows for `df_rows_src`: one canonical JSON
 /// object per line, LF-terminated, keys in DECLARED order, values

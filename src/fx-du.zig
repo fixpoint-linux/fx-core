@@ -108,11 +108,12 @@ const Allocator = std.mem.Allocator;
 const Options = cli_du.Options;
 const parsePosixArgs = cli_du.parsePosix; // the generated POSIX parser
 
-/// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
-/// registry's builtin("du") output type ("{ path : Text, bytes : Natural }")
-/// — the declared order pins the canonical JSON key order (single source of
-/// truth: the Lens-3 registry table).
-const du_rows_src = "{ path : Text, bytes : Natural }";
+/// The rows-mode wire record type: the GENERATED declared output type
+/// (schemas/du.dhall's `out`, rendered by fx-clijson into cli_du) — the
+/// SAME literal the fx-pipeline registry's builtin("du") parses, so the
+/// encoder's type and the compose() type-check's type are one string.  The
+/// declared order pins the canonical JSON key order.
+const du_rows_src = cli_du.out_type_src;
 
 // ---------------------------------------------------------------------------
 // Depth / row-filter helpers (Zig-side maxdepth + summary)

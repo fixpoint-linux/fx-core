@@ -30,6 +30,14 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "single-shot process ranking by total cpu ticks or memory"
+, out =
+    { pid : Natural
+    , state : Text
+    , ppid : Natural
+    , cpu : Natural
+    , rss_kb : Natural
+    , comm : Text
+    }
 , ty =
     { count : Natural
     , sort : < Cpu | Mem >

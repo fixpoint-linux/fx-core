@@ -28,6 +28,21 @@
 const std = @import("std");
 const dh = @import("dhall");
 
+// GENERATED parser/output-type modules — imported by FILE PATH (the
+// fx-eval/fx-compose sibling idiom), because fx-pipeline deliberately
+// carries no build-graph wiring for them: the generated files are pure std
+// (no dhall), so a relative import adds no dependency to this module while
+// giving builtin() the SINGLE-SOURCED out_type_src literals (U8: the
+// declared output type lives in schemas/<name>.dhall, is rendered by
+// fx-clijson into these files, and is consumed by BOTH the producers' wire
+// encoders and this registry — one literal, no hand-written twin to drift).
+const cli_ls = @import("generated/cli_ls.zig");
+const cli_du = @import("generated/cli_du.zig");
+const cli_tree = @import("generated/cli_tree.zig");
+const cli_df = @import("generated/cli_df.zig");
+const cli_ps = @import("generated/cli_ps.zig");
+const cli_top = @import("generated/cli_top.zig");
+
 const dhall = dh.dhall;
 const arena = dh.arena;
 const ast = dh.ast;
@@ -236,9 +251,11 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
         return .{ .name = "grep", .input = Shape.rows(in_t), .output = .{ .tag = .lines } };
     }
     // ls:    single { path : Text } -> rows { name, size, mode }
+    // (the OUTPUT literal is schemas/ls.dhall's `out`, rendered by fx-clijson
+    // into the generated file — single-sourced with fx-ls's wire encoder)
     if (std.mem.eql(u8, name, "ls")) {
         const in_t = try parseType("{ path : Text }", gpa);
-        const out_t = try parseType("{ name : Text, size : Natural, mode : Natural }", gpa);
+        const out_t = try parseType(cli_ls.out_type_src, gpa);
         return .{ .name = "ls", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     // cat:   bytes -> bytes (honest-cut content-addressable component)
@@ -269,7 +286,7 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // du:    single { path : Text } -> rows { path, bytes }
     if (std.mem.eql(u8, name, "du")) {
         const in_t = try parseType("{ path : Text }", gpa);
-        const out_t = try parseType("{ path : Text, bytes : Natural }", gpa);
+        const out_t = try parseType(cli_du.out_type_src, gpa);
         return .{ .name = "du", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     // tree:  single { path : Text } -> rows of find's EXACT type — the rows
@@ -278,7 +295,7 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // (empty args -> the binary's default "."), exactly like ls/du.
     if (std.mem.eql(u8, name, "tree")) {
         const in_t = try parseType("{ path : Text }", gpa);
-        const out_t = try parseType("{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }", gpa);
+        const out_t = try parseType(cli_tree.out_type_src, gpa);
         return .{ .name = "tree", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     // df:    single { path : Text } -> rows { fs, mount, total_kb, used_kb,
@@ -287,7 +304,7 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // (MissingField): a df|>grep pipeline never type-checks.
     if (std.mem.eql(u8, name, "df")) {
         const in_t = try parseType("{ path : Text }", gpa);
-        const out_t = try parseType("{ fs : Text, mount : Text, total_kb : Natural, used_kb : Natural, avail_kb : Natural }", gpa);
+        const out_t = try parseType(cli_df.out_type_src, gpa);
         return .{ .name = "df", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     // nl:    lines -> lines
@@ -352,7 +369,7 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     if (std.mem.eql(u8, name, "ps") or
         std.mem.eql(u8, name, "top"))
     {
-        const out_t = try parseType("{ pid : Natural, state : Text, ppid : Natural, cpu : Natural, rss_kb : Natural, comm : Text }", gpa);
+        const out_t = try parseType(if (std.mem.eql(u8, name, "ps")) cli_ps.out_type_src else cli_top.out_type_src, gpa);
         return .{ .name = name, .input = .{ .tag = .none }, .output = Shape.rows(out_t) };
     }
     // paste/comm: lines -> lines — TWO-FILE stages.  The pipeline input rides
@@ -674,4 +691,75 @@ test "registry: ps/top are generators (position 0 only); tree/df are {path} oper
     const grep = try builtin("grep", t.allocator);
     try t.expectError(error.ShapeMismatch, compose(grep, tree));
     try t.expectError(error.ShapeMismatch, compose(grep, df));
+}
+
+// ---------------------------------------------------------------------------
+// U8: the DECLARED-OUTPUT-TYPE DRIFT TEST — the soundness pin of the unit.
+//
+// Before U8, the declared output type was written TWICE (the producer's
+// hand-written _rows_src and this registry's hand-written parseType string)
+// with nothing asserting equality: the encoder enforced type A while
+// compose() type-checked against type B.  Now both sides consume the
+// generated out_type_src (schemas/<name>.dhall's `out` -> fx-clijson ->
+// cli_<name>.zig), and this test asserts the registry's parsed output type
+// is alpha-equivalent to the type the SCHEMA declares — parsed here from
+// the same generated literal the producers' wire encoders consume.  A drift
+// (an edited schema not regenerated, a hand-tweaked generated file, a
+// registry arm re-duplicated as a hand-written string that diverges) fails
+// THIS test.
+//
+// find/grep are deliberately absent: their literals still live in
+// fx-eval.zig (peer-owned this unit) — single-sourcing them is the recorded
+// follow-up.
+// ---------------------------------------------------------------------------
+
+test "drift: builtin outputs match the schema-declared out types (U8 single-source)" {
+    // (name, generated literal from the committed cli_<name>.zig) — one
+    // entry per schema carrying an `out` section
+    const cases = [_]struct { name: []const u8, src: [:0]const u8 }{
+        .{ .name = "ls", .src = cli_ls.out_type_src },
+        .{ .name = "du", .src = cli_du.out_type_src },
+        .{ .name = "tree", .src = cli_tree.out_type_src },
+        .{ .name = "df", .src = cli_df.out_type_src },
+        .{ .name = "ps", .src = cli_ps.out_type_src },
+        .{ .name = "top", .src = cli_top.out_type_src },
+    };
+    for (cases) |c| {
+        const cmd = try builtin(c.name, t.allocator);
+        // the schema-declared type, parsed exactly like the registry parses
+        // it (same arena, same parseType — the comparison is then purely
+        // about the two literals' content)
+        const declared = try parseType(c.src, t.allocator);
+        try t.expect(cmd.output.tag == .rows);
+        try t.expect(cmd.output.ty != null);
+        if (!ast.alpha_eq(declared, cmd.output.ty.?)) {
+            std.debug.print(
+                "drift: builtin(\"{s}\").output is not the schema-declared out type (generated literal: {s})\n",
+                .{ c.name, c.src },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "drift: the generated out literals keep their declared (wire key) order" {
+    // The literal's textual field order pins the canonical wire JSON key
+    // order (fx-wire.declaredFieldKinds scans the source), and dhall-c
+    // SORTS record fields on parse — so a generator regression that falls
+    // back to the sorted TypeExpr order would silently re-order every
+    // producer's wire bytes.  Pin the literals byte-for-byte; ls is the
+    // canary (its declared order name,size,mode is NOT sorted — mode would
+    // sort first).
+    try t.expect(std.mem.startsWith(u8, cli_ls.out_type_src, "{ name : Text, size : Natural, mode : Natural }"));
+    try t.expect(std.mem.startsWith(u8, cli_tree.out_type_src, "{ path : Text, kind : < Dir | File >, size : Natural, mtime : Natural }"));
+    try t.expect(std.mem.startsWith(u8, cli_du.out_type_src, "{ path : Text, bytes : Natural }"));
+    try t.expect(std.mem.startsWith(u8, cli_df.out_type_src, "{ fs : Text, mount : Text, total_kb : Natural, used_kb : Natural, avail_kb : Natural }"));
+    try t.expect(std.mem.startsWith(u8, cli_ps.out_type_src, "{ pid : Natural, state : Text, ppid : Natural, cpu : Natural, rss_kb : Natural, comm : Text }"));
+    try t.expect(std.mem.startsWith(u8, cli_top.out_type_src, "{ pid : Natural, state : Text, ppid : Natural, cpu : Natural, rss_kb : Natural, comm : Text }"));
+    // ps/top historically shared ONE registry arm and ONE wire shape (their
+    // two command files declared byte-identical strings).  They now declare
+    // `out` independently in their schemas; the drift test above keeps each
+    // honest against its OWN registry arm, and THIS keeps the shared-shape
+    // invariant from silently forking.
+    try t.expect(std.mem.eql(u8, cli_ps.out_type_src, cli_top.out_type_src));
 }

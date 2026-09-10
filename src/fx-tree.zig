@@ -115,11 +115,15 @@ const Allocator = std.mem.Allocator;
 
 const Options = cli_tree.Options; // maxdepth is Natural (u64), per the schema
 
-/// The rows-mode wire record type.  MUST stay identical to find's registry
-/// type (fx-eval.zig:196 / fx-pipeline builtin("find")) — the declared order
-/// pins the canonical JSON key order, and identity with find is what makes
-/// tree|>grep compose with zero registry novelty.
-const tree_rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
+/// The rows-mode wire record type: the GENERATED declared output type
+/// (schemas/tree.dhall's `out`, rendered by fx-clijson into cli_tree) — the
+/// SAME literal the fx-pipeline registry's builtin("tree") parses.  It is
+/// DECLARED IDENTICAL to find's rows type (fx-eval.zig's find_rows_src —
+/// still a hand-written twin pending the fx-eval single-sourcing follow-up,
+/// peer-owned this unit): the declared order pins the canonical JSON key
+/// order, and type identity with find is what makes tree|>grep compose with
+/// zero registry novelty.
+const tree_rows_src = cli_tree.out_type_src;
 
 // ---------------------------------------------------------------------------
 // Render: DFS over the collected out rows

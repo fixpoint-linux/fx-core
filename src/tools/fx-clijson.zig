@@ -415,7 +415,7 @@ fn validateBindings(s: *const cli.Schema) GenError!void {
 
     // union fields become file-scope enum decls named after the field — they
     // must not collide with the emitted file's fixed decls
-    const reserved = [_][]const u8{ "std", "Allocator", "Options", "ParseError", "parsePosix", "usage", "bindOperand" };
+    const reserved = [_][]const u8{ "std", "Allocator", "Options", "ParseError", "parsePosix", "usage", "bindOperand", "out_type_src" };
     for (s.ty.record) |f| {
         if (f.ty.* != .union_) continue;
         for (reserved) |r| {
@@ -1361,6 +1361,38 @@ fn emitUsage(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
     try out.put("\";\n}\n");
 }
 
+/// Emit the schema's declared pipeline OUTPUT type as the file-scope
+/// `out_type_src` string constant — the SINGLE literal both the producer's
+/// wire encoder (fx-wire.declaredFieldKinds derives the canonical JSON key
+/// order from it) and the fx-pipeline registry's builtin() parse, so the
+/// type compose() checks against and the type the encoder enforces cannot
+/// drift.  EMITTED ONLY WHEN the schema has an `out` section: a command
+/// without one has a bare-tag (bytes/lines) output and no constant.
+/// Rendering goes through cli.outTypeSrcOrdered (declared field order —
+/// order is load-bearing, see its header).
+fn emitOutType(out: *Out, gpa: Allocator, name: []const u8, schema_src: [:0]const u8, s: *const cli.Schema) GenError!void {
+    if (s.out == null) return;
+    const src = cli.outTypeSrcOrdered(gpa, schema_src, s) catch |e| {
+        std.debug.print("fx-clijson: {s}: out section rendering failed: {s}\n", .{ name, @errorName(e) });
+        return error.Schema;
+    };
+    defer gpa.free(src);
+    const e = try zigEscape(gpa, src);
+    defer gpa.free(e);
+    try out.put(
+        \\
+        \\/// The declared pipeline OUTPUT type (this schema's `out` section,
+        \\/// rendered in DECLARED field order — the order pins the canonical
+        \\/// wire JSON key order).  SINGLE SOURCE shared with the fx-pipeline
+        \\/// registry's builtin(): the producers' wire encoders and the
+        \\/// compose() type-checker both consume THIS literal.
+        \\
+    );
+    try out.put("pub const out_type_src = \"");
+    try out.put(e);
+    try out.put("\";\n");
+}
+
 // ---------------------------------------------------------------------------
 // generated self-tests (compile + pin the emitted parser; STEP 2 adds the
 // real differential vs evalDhallArgs in the command's own file)
@@ -2011,7 +2043,7 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
 /// flags/positionals/groups keep their schema list order, and nothing
 /// timestamped is emitted (the regen diff-gate depends on byte-stable
 /// output).
-fn emit(gpa: Allocator, name: []const u8, s: *const cli.Schema) GenError![]u8 {
+fn emit(gpa: Allocator, name: []const u8, schema_src: [:0]const u8, s: *const cli.Schema) GenError![]u8 {
     var out = Out{ .gpa = gpa, .buf = .empty };
     errdefer out.buf.deinit(gpa);
 
@@ -2044,6 +2076,7 @@ fn emit(gpa: Allocator, name: []const u8, s: *const cli.Schema) GenError![]u8 {
 
     try emitEnumDecls(&out, gpa, s);
     try emitOptions(&out, gpa, s);
+    try emitOutType(&out, gpa, name, schema_src, s);
     try emitParsePosix(&out, gpa, name, s);
     try emitUsage(&out, gpa, name, s);
     try emitTests(&out, gpa, name, s);
@@ -2098,7 +2131,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     completed.deinit(gpa);
 
-    const emitted = try emit(gpa, name, &schema);
+    const emitted = try emit(gpa, name, src, &schema);
     defer gpa.free(emitted);
 
     if (check_mode) {

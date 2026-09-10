@@ -31,6 +31,13 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "report filesystem usage in 1K blocks via statvfs"
+, out =
+    { fs : Text
+    , mount : Text
+    , total_kb : Natural
+    , used_kb : Natural
+    , avail_kb : Natural
+    }
 , ty =
     { path : Text
     , rows : Bool

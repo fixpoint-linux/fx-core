@@ -37,6 +37,10 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "estimate file space usage as Datalog-backed stat rows"
+, out =
+    { path : Text
+    , bytes : Natural
+    }
 , ty =
     { path : Text
     , maxdepth : Optional Natural

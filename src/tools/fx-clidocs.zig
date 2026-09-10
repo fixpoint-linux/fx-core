@@ -185,55 +185,18 @@ const Json = struct {
 // (fx-cli has renderDhallRecord for COMPLETED record values; the docs need
 // per-field renderings — types standalone, defaults against their field's
 // type.  Same spellings renderDhallRecord uses, so the two agree.)
+//
+// TYPES render through fx-cli's SHARED cli.renderType (deduplicated in the
+// U8 declared-output-type unit: fx-clijson's out_type_src emission renders
+// through the same function, so the generated constant and this dataset
+// cannot drift).  Only VALUE rendering (defaults against their field type)
+// stays local — fx-cli's renderDhallRecord is the COMPLETED-record form.
 // ---------------------------------------------------------------------------
 
 /// A Dhall TYPE rendered as its source-shaped text.  Dhall names, not Zig
 /// ones: the dataset describes the schema, not the emitted parser.
 fn renderType(gpa: Allocator, ty: *const cli.TypeExpr) DocError![]const u8 {
-    var s = std.ArrayList(u8).empty;
-    errdefer s.deinit(gpa);
-    try renderTypeInto(gpa, &s, ty);
-    return s.toOwnedSlice(gpa) catch return error.OutOfMemory;
-}
-
-fn renderTypeInto(gpa: Allocator, s: *std.ArrayList(u8), ty: *const cli.TypeExpr) DocError!void {
-    switch (ty.*) {
-        .bool_ => try s.appendSlice(gpa, "Bool"),
-        .text => try s.appendSlice(gpa, "Text"),
-        .natural => try s.appendSlice(gpa, "Natural"),
-        .integer => try s.appendSlice(gpa, "Integer"),
-        .double => try s.appendSlice(gpa, "Double"),
-        .optional => |inner| {
-            try s.appendSlice(gpa, "Optional ");
-            try renderTypeInto(gpa, s, inner);
-        },
-        .list => |inner| {
-            try s.appendSlice(gpa, "List ");
-            try renderTypeInto(gpa, s, inner);
-        },
-        .record => |fs| {
-            if (fs.len == 0) {
-                try s.appendSlice(gpa, "{ }");
-                return;
-            }
-            try s.appendSlice(gpa, "{ ");
-            for (fs, 0..) |f, i| {
-                if (i != 0) try s.appendSlice(gpa, ", ");
-                try s.appendSlice(gpa, f.name);
-                try s.appendSlice(gpa, " : ");
-                try renderTypeInto(gpa, s, f.ty);
-            }
-            try s.appendSlice(gpa, " }");
-        },
-        .union_ => |alts| {
-            try s.appendSlice(gpa, "< ");
-            for (alts, 0..) |alt, i| {
-                if (i != 0) try s.appendSlice(gpa, " | ");
-                try s.appendSlice(gpa, alt);
-            }
-            try s.appendSlice(gpa, " >");
-        },
-    }
+    return cli.renderType(gpa, ty) catch return error.OutOfMemory;
 }
 
 /// A dflt VALUE rendered as Dhall source against its field's type: "text",
@@ -290,10 +253,10 @@ fn renderValueInto(gpa: Allocator, s: *std.ArrayList(u8), v: *const cli.Value, t
             const payload = if (ty.* == .optional) ty.optional else ty;
             if (payload.* == .list or payload.* == .optional or payload.* == .record) {
                 try s.append(gpa, '(');
-                try renderTypeInto(gpa, s, payload);
+                cli.renderTypeInto(gpa, s, payload) catch return error.OutOfMemory;
                 try s.append(gpa, ')');
             } else {
-                try renderTypeInto(gpa, s, payload);
+                cli.renderTypeInto(gpa, s, payload) catch return error.OutOfMemory;
             }
         },
         .union_ctor => |c| {
@@ -327,7 +290,7 @@ fn renderValueInto(gpa: Allocator, s: *std.ArrayList(u8), v: *const cli.Value, t
             if (items.len == 0) {
                 if (ty.* != .list) return fail("empty list value against a non-list type", .{});
                 try s.appendSlice(gpa, "[] : List ");
-                try renderTypeInto(gpa, s, ty.list);
+                cli.renderTypeInto(gpa, s, ty.list) catch return error.OutOfMemory;
                 return;
             }
             try s.append(gpa, '[');

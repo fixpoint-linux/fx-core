@@ -97,10 +97,13 @@ const SortTag = cli_top.sort; // Dhall < Cpu | Mem >
 const Options = cli_top.Options;
 const parsePosixArgs = cli_top.parsePosix; // the generated POSIX parser
 
-/// The rows-mode wire record type.  MUST stay identical to fx-ps's
-/// (fx-pipeline registry type for both) — the declared order pins the
-/// canonical JSON key order.
-const top_rows_src = "{ pid : Natural, state : Text, ppid : Natural, cpu : Natural, rss_kb : Natural, comm : Text }";
+/// The rows-mode wire record type: the GENERATED declared output type
+/// (schemas/top.dhall's `out`, rendered by fx-clijson into cli_top) — the
+/// SAME literal the fx-pipeline registry's builtin("top") parses, so the
+/// encoder's type and the compose() type-check's type are one string.  The
+/// declared order pins the canonical JSON key order.  fx-ps declares the
+/// same `out` in its schema (both files' rows share the wire shape).
+const top_rows_src = cli_top.out_type_src;
 
 // ---------------------------------------------------------------------------
 // Dhall arg evaluation -> Options (fx-ls/fx-du idiom: parse, typecheck,

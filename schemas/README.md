@@ -15,6 +15,19 @@ description; `src/tools/fx-clidocs.zig` reads it for `docs/commands.json`
 generator ignores it — a schema with or without `doc` emits the same
 parser.
 
+`out = { ... }` (OPTIONAL, a Dhall record TYPE) declares the command's
+pipeline OUTPUT type — e.g. ls's `{ name : Text, size : Natural,
+mode : Natural }`.  `fx-clijson` renders it into the generated file's
+`out_type_src` string constant in the schema's DECLARED field order; the
+producers' wire encoders (fx-wire.declaredFieldKinds derives the canonical
+JSON key order from it) and the fx-pipeline registry's builtin() both
+consume THAT ONE literal (U8: no hand-written twin to drift).  Absent means
+the output is a bare tag (bytes/lines) — the meta_* fixtures and every
+command without a structured output keep loading.  The declared FIELD ORDER
+is load-bearing (wire key order) and pin-tested in fx-pipeline.zig's drift
+tests.  `find`/`grep` carry no `out` yet: their literals live in
+fx-eval.zig (the recorded single-sourcing follow-up).
+
 ## Validation rule
 
 NEVER validate schemas with the committed `dhall.com` APE binary — it is

@@ -35,6 +35,11 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "list a directory's entries as Datalog-backed stat rows"
+, out =
+    { name : Text
+    , size : Natural
+    , mode : Natural
+    }
 , ty =
     { all : Bool
     , long : Bool
