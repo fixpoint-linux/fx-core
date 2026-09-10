@@ -183,10 +183,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // gen_schemas: the COMMITTED generated parsers (regen no-op gates +
-    // test wiring).  ls is the only real command migrated so far; STEP 3
-    // grows this table.  The meta_* fixtures live in meta_schemas below —
-    // they are NOT commands and are never committed under src/generated/.
-    const gen_schemas = [_][]const u8{"ls"};
+    // test wiring).  ls (STEP 2) and whoami (STEP 3, the degenerate no-arg
+    // command) are migrated; further STEP-3 commands grow this table.  The
+    // meta_* fixtures live in meta_schemas below — they are NOT commands
+    // and are never committed under src/generated/.
+    const gen_schemas = [_][]const u8{ "ls", "whoami" };
     const gen_cli_step = b.step("gen-cli", "Regenerate src/generated/cli_<name>.zig from schemas/<name>.dhall (commit the result)");
     const gen_cli_check_step = b.step("gen-cli-check", "Verify committed src/generated/cli_*.zig match their schemas (regen no-op gate)");
     test_step.dependOn(gen_cli_check_step);
@@ -631,6 +632,10 @@ pub fn build(b: *std.Build) void {
     // no caslog linkage).  NOTE: fx-hostname is an inetutils program, not a
     // GNU coreutils binary — GNU coreutils has no `hostname`; we implement it
     // anyway as a print-only tool (see fx-hostname.zig).
+    // fx-whoami (STEP 3, first system-batch migration) additionally imports
+    // its COMMITTED generated POSIX parser (src/generated/cli_whoami.zig —
+    // a pure-std module of its own, never the dhall core; plan RISK 4) and,
+    // for its differential test, the fx-cli schema evaluator.
     // -----------------------------------------------------------------------
     const system_cmds = [_][]const u8{
         "fx-id",       "fx-whoami",  "fx-hostname", "fx-env",
@@ -638,15 +643,28 @@ pub fn build(b: *std.Build) void {
     };
     inline for (system_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "fx-whoami"))
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+                .{ .name = "cli-whoami", .module = b.createModule(.{
+                    .root_source_file = b.path("src/generated/cli_whoami.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }) },
+                .{ .name = "fx-cli", .module = cli_mod },
+            }
+        else
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+            };
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "dhall", .module = dhall_mod },
-                },
+                .imports = imports,
             }),
         });
         cmd_exe.root_module.link_libc = true;

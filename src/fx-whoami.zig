@@ -4,12 +4,19 @@
 // Pure libc + the dhall module for typed args — no datalog / journal
 // dependency.
 //
-// Two arg forms:
+// Two arg forms (STEP 3: both derived from schemas/whoami.dhall — the
+// fx-ls migration template applied to the degenerate no-arg command):
 //   fx-whoami '{ }'            Dhall record (empty — no real args)
 //   fx-whoami                  POSIX (none)
 //
 // - Dhall: an empty record is accepted (`{ }`); any unknown field is ignored.
-// - POSIX: no options/operands.
+// - POSIX: no options/operands.  The POSIX form is parsed by the GENERATED
+//   parser (src/generated/cli_whoami.zig, emitted from schemas/whoami.dhall
+//   by src/tools/fx-clijson.zig — pure Zig, no dhall at runtime; `zig build
+//   gen-cli-check` gates the regen).  Deliberate strengthening over the hand
+//   parser it replaced: an unknown option is error.UnknownOption (with a
+//   usage-shaped diagnostic) rather than the hand parser's blanket
+//   TooManyOperands, and the diagnostic names the offending token.
 //
 // Behavior (GNU-grounded, verified against host coreutils): whoami resolves
 // getpwuid(geteuid()) -> pw_name.  It uses the EFFECTIVE uid (unlike `id`
@@ -20,6 +27,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_whoami = @import("cli-whoami");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -38,13 +47,11 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/whoami.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // whoami takes no options or operands.
-    nothing: bool = true,
-};
+const Options = cli_whoami.Options;
+const parsePosixArgs = cli_whoami.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {};
 
@@ -184,14 +191,6 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return Options{};
 }
 
-fn parsePosixArgs(args: []const [:0]const u8) !Options {
-    if (args.len > 1) {
-        std.debug.print("fx-whoami: extra operand '{s}'\n", .{args[1]});
-        return error.TooManyOperands;
-    }
-    return Options{};
-}
-
 test "jsonParseOpts empty record" {
     var buf: [1024]u8 = undefined;
     _ = jsonParseOpts("{}", &buf) orelse return error.TestUnexpectedResult;
@@ -202,8 +201,51 @@ test "evalDhallArgs empty record" {
     _ = try evalDhallArgs("{ }", std.testing.allocator);
 }
 
-test "parsePosixArgs no args" {
-    _ = try parsePosixArgs(&.{});
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-ls template
+// applied to the no-arg command)
+// ---------------------------------------------------------------------------
+//
+// The generated POSIX parser and the Dhall-record form both reduce to the
+// same void Options; the differential matrix pins them equal through the
+// SHARED runner (fx-cli.expectPosixEqualsRecord) so a future flag added to
+// schemas/whoami.dhall fails here until the matrix covers it.
+
+/// One differential vector (the shared generic runner; see fx-ls.zig).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_whoami, &.{ "schemas/whoami.dhall", "fx-core/schemas/whoami.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    try expectPosixEqualsRecord(&.{ "fx-whoami" }, "{ }");
+    try expectPosixEqualsRecord(&.{ "fx-whoami" }, "{ nothing = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option / operand: whoami accepts NOTHING beyond argv[0]
+    // (the record form cannot express either at all)
+    try std.testing.expectError(error.UnknownOption, cli_whoami.parsePosix(&.{ "fx-whoami", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_whoami.parsePosix(&.{ "fx-whoami", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_whoami.parsePosix(&.{ "fx-whoami", "op" }, gpa));
+    // `--` alone ends flag parsing; a token AFTER it is a bare operand
+    try std.testing.expectError(error.UnexpectedOperand, cli_whoami.parsePosix(&.{ "fx-whoami", "--", "op" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX form has no spelling that could reach
+    // either (its analogue is -Zz above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/whoami.dhall", "fx-core/schemas/whoami.dhall" }) catch
+        @panic("cannot locate schemas/whoami.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ nothing = 5 }"));
 }
 
 test "whoamiName effective uid lookup" {
@@ -239,7 +281,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         _ = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        _ = try parsePosixArgs(args);
+        // the GENERATED parser (schemas/whoami.dhall ->
+        // src/generated/cli_whoami.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
+        _ = try parsePosixArgs(args, opt_alloc);
     }
 
     const stdout_file = std.Io.File.stdout();
