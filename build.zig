@@ -492,6 +492,29 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_eval_tests.step);
     compose_test_step.dependOn(&run_eval_tests.step);
 
+    // fx-shell: the fxsh LIBRARY SEAM (tokenizer + buildStage/buildPlan + a
+    // run delegate onto fx-eval).  Imports the eval module by name (engine's
+    // libdatalog directives aggregate); pipeline/caslog/stages are imported
+    // BY PATH inside fx-shell.zig (the fx-eval/fx-compose sibling idiom), so
+    // this module's table must also carry `dhall` for those file copies'
+    // own named imports to resolve.  This wiring is ONLY the module + its
+    // own test block (the fx-sh binary is U5).
+    const shell_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-shell.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "fx-eval", .module = eval_mod },
+        },
+    });
+    // The seam's test blocks (the tokenizer matrix + the plan type-checks).
+    const shell_tests = b.addTest(.{ .root_module = shell_mod });
+    const run_shell_tests = b.addRunArtifact(shell_tests);
+    test_step.dependOn(&run_shell_tests.step);
+    compose_test_step.dependOn(&run_shell_tests.step);
+
     // fx-compose: the typed pipeline ENGINE frontend executable.  Imports all of
     // dhall + caslog + pipeline + wire + eval; links libc (exec dispatch shells
     // to real fx-* binaries) plus libdatalog inherited transitively from
