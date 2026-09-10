@@ -7,3 +7,7 @@ fxprobe
 node_modules/
 elm-stuff/
 dist/
+
+# Staged @mfe framework build (copied from vendor/mfe-framework by
+# scripts/copy-mfe.mjs; rebuilt by the dhake vendor-mfe target)
+vendor/@mfe/

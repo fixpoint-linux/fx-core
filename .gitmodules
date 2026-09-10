@@ -4,3 +4,6 @@
 [submodule "vendor/dhake"]
 	path = vendor/dhake
 	url = https://github.com/fixpoint-linux/dhake.git
+[submodule "vendor/mfe-framework"]
+	path = vendor/mfe-framework
+	url = https://github.com/fixpoint-linux/mfe-framework.git

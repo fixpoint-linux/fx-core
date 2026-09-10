@@ -64,7 +64,18 @@ type alias Flag =
 type alias Model =
     { commands : List Command
     , error : Maybe String
+    , route : Route
+    , basePath : String
     }
+
+
+{-| Which page to render. The MFE shell mounts ONE Elm app for every route and
+hands it the current `pathname`; the app selects the page from it.
+-}
+type Route
+    = Index
+    | Detail Command
+    | NotFound String
 
 
 type Msg
@@ -73,12 +84,72 @@ type Msg
 
 init : D.Value -> ( Model, Cmd Msg )
 init flags =
-    case D.decodeValue commandsDecoder flags of
-        Ok cmds ->
-            ( { commands = cmds, error = Nothing }, Cmd.none )
+    case D.decodeValue flagsDecoder flags of
+        Ok { pathname, commands } ->
+            ( { commands = commands
+              , error = Nothing
+              , route = routeFor pathname commands
+              , basePath = basePathOf pathname
+              }
+            , Cmd.none
+            )
 
         Err err ->
-            ( { commands = [], error = Just (D.errorToString err) }, Cmd.none )
+            ( { commands = [], error = Just (D.errorToString err), route = Index, basePath = "/" }
+            , Cmd.none
+            )
+
+
+{-| The site is served under a base path (e.g. `/fx-core`); the sub-path after
+it names the command. `''`, `/` and the base itself are the index; anything
+else is `/fx-core/<name>`. Unknown names fall through to NotFound.
+-}
+routeFor : String -> List Command -> Route
+routeFor pathname commands =
+    case slugOf pathname of
+        "" ->
+            Index
+
+        slug ->
+            case List.filter (\c -> c.name == slug) commands of
+                cmd :: _ ->
+                    Detail cmd
+
+                [] ->
+                    NotFound slug
+
+
+{-| The site's base path — the first path segment (e.g. `/fx-core`), which is
+where the docs are served. Links are built from it so they stay correct whether
+the current page is the index (`/fx-core/`) or a command (`/fx-core/ls`).
+-}
+basePathOf : String -> String
+basePathOf pathname =
+    case String.split "/" (String.trimRight pathname) |> List.filter (\s -> s /= "") of
+        first :: _ ->
+            "/" ++ first
+
+        [] ->
+            ""
+
+
+slugOf : String -> String
+slugOf pathname =
+    let
+        trimmed =
+            String.split "/" (String.trimRight pathname) |> List.filter (\s -> s /= "")
+    in
+    case List.reverse trimmed of
+        [] ->
+            ""
+
+        last :: _ ->
+            -- the index page itself ("fx-core") is not a command
+            if List.length trimmed == 1 && last == "fx-core" then
+                ""
+
+            else
+                last
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -91,9 +162,11 @@ subscriptions _ =
     Sub.none
 
 
-commandsDecoder : D.Decoder (List Command)
-commandsDecoder =
-    D.field "commands" (D.list commandDecoder)
+flagsDecoder : D.Decoder { pathname : String, commands : List Command }
+flagsDecoder =
+    D.map2 (\p c -> { pathname = p, commands = c })
+        (D.field "pathname" D.string)
+        (D.field "commands" (D.list commandDecoder))
 
 
 commandDecoder : D.Decoder Command
@@ -142,7 +215,7 @@ view model =
         Styled.div []
             [ Style.stylesheet
             , Fixpoint.Nav.view
-                { brand = Styled.text "fx-core"
+                { brand = Styled.a [ href model.basePath, css [ brandLinkS ] ] [ Styled.text "fx-core" ]
                 , links =
                     [ Fixpoint.Nav.link "https://fixpointlinux.org" "fixpoint-linux.org"
                     , Fixpoint.Nav.link "https://github.com/fixpoint-linux/fx-core" "github"
@@ -150,19 +223,128 @@ view model =
                 , extra = []
                 }
             , Styled.main_ [ css [ Style.wrap, mainS ] ]
-                [ header
-                , case model.error of
+                [ case model.error of
                     Just err ->
                         Styled.p [ css [ errorS ] ] [ Styled.text ("could not read commands.json: " ++ err) ]
 
                     Nothing ->
-                        Styled.div []
-                            [ tableOfContents model.commands
-                            , Styled.div [] (List.map commandSection model.commands)
-                            ]
+                        case model.route of
+                            Index ->
+                                indexPage model
+
+                            Detail cmd ->
+                                detailPage model cmd
+
+                            NotFound slug ->
+                                notFoundPage model slug
                 ]
             , footer
             ]
+
+
+indexPage : Model -> Html msg
+indexPage model =
+    Styled.div []
+        [ header
+        , tableOfContents model
+        , Styled.div [] (List.map (commandSection model.basePath) model.commands)
+        ]
+
+
+{-| A single-command page: the full argument table plus prev/next navigation
+through the (sorted) command list.
+-}
+detailPage : Model -> Command -> Html msg
+detailPage model cmd =
+    let
+        neighbours =
+            neighboursOf cmd.name model.commands
+    in
+    Styled.div []
+        [ Styled.p [ css [ backS ] ]
+            [ Styled.a [ href model.basePath ] [ Styled.text "← all commands" ] ]
+        , Styled.h1 [ css [ detailTitleS ] ]
+            [ Styled.code [ css [ cmdNameS ] ] [ Styled.text ("fx-" ++ cmd.name) ] ]
+        , Styled.p [ css [ detailDocS ] ] [ Styled.text cmd.doc ]
+        , Styled.p [ css [ usageS ] ] [ Styled.code [] [ Styled.text cmd.usage ] ]
+        , if List.isEmpty cmd.args then
+            Styled.p [ css [ mutedS ] ] [ Styled.text "No arguments." ]
+
+          else
+            argsTable cmd.args
+        , mutexNote cmd.mutex
+        , prevNext model.basePath neighbours
+        ]
+
+
+type alias Neighbours =
+    { prev : Maybe Command, next : Maybe Command }
+
+
+neighboursOf : String -> List Command -> Neighbours
+neighboursOf name commands =
+    case indexOfName name commands 0 of
+        Nothing ->
+            { prev = Nothing, next = Nothing }
+
+        Just i ->
+            { prev = nth (i - 1) commands
+            , next = nth (i + 1) commands
+            }
+
+
+indexOfName : String -> List Command -> Int -> Maybe Int
+indexOfName name commands i =
+    case commands of
+        [] ->
+            Nothing
+
+        c :: rest ->
+            if c.name == name then
+                Just i
+
+            else
+                indexOfName name rest (i + 1)
+
+
+nth : Int -> List Command -> Maybe Command
+nth i commands =
+    if i < 0 then
+        Nothing
+
+    else
+        List.head (List.drop i commands)
+
+
+prevNext : String -> Neighbours -> Html msg
+prevNext basePath n =
+    Styled.nav [ css [ pagerS ] ]
+        [ case n.prev of
+            Just c ->
+                Styled.a [ href (basePath ++ "/" ++ c.name), css [ pagerLinkS ] ]
+                    [ Styled.text ("← fx-" ++ c.name) ]
+
+            Nothing ->
+                Styled.span [] []
+        , case n.next of
+            Just c ->
+                Styled.a [ href (basePath ++ "/" ++ c.name), css [ pagerLinkS, pagerNextS ] ]
+                    [ Styled.text ("fx-" ++ c.name ++ " →") ]
+
+            Nothing ->
+                Styled.span [] []
+        ]
+
+
+notFoundPage : Model -> String -> Html msg
+notFoundPage model slug =
+    Styled.div []
+        [ Styled.h1 [] [ Styled.text "Not found" ]
+        , Styled.p []
+            [ Styled.text ("No command named "), Styled.code [] [ Styled.text slug ], Styled.text "." ]
+        , Styled.p []
+            [ Styled.a [ href model.basePath ] [ Styled.text "← all commands" ] ]
+        ]
 
 
 header : Html msg
@@ -187,23 +369,24 @@ header =
 {-| A compact index of every command, so a reader can jump (anchors are the
 command names, set on each section).
 -}
-tableOfContents : List Command -> Html msg
-tableOfContents commands =
+tableOfContents : Model -> Html msg
+tableOfContents model =
     Styled.nav [ css [ tocS ] ]
         (Styled.span [ css [ tocHeadS ] ] [ Styled.text "Commands" ]
             :: List.map
-                (\c -> Styled.a [ href ("#" ++ c.name), css [ tocLinkS ] ]
+                (\c -> Styled.a [ href (model.basePath ++ "/" ++ c.name), css [ tocLinkS ] ]
                     [ Styled.text c.name ]
                 )
-                commands
+                model.commands
         )
 
 
-commandSection : Command -> Html msg
-commandSection cmd =
+commandSection : String -> Command -> Html msg
+commandSection basePath cmd =
     Styled.section [ css [ cmdS ], Attr.id cmd.name ]
         [ Styled.h2 [ css [ cmdHeadS ] ]
-            [ Styled.code [ css [ cmdNameS ] ] [ Styled.text ("fx-" ++ cmd.name) ]
+            [ Styled.a [ href (basePath ++ "/" ++ cmd.name), css [ cmdLinkS ] ]
+                [ Styled.code [ css [ cmdNameS ] ] [ Styled.text ("fx-" ++ cmd.name) ] ]
             , Styled.span [ css [ docS ] ] [ Styled.text cmd.doc ]
             ]
         , Styled.p [ css [ usageS ] ] [ Styled.code [] [ Styled.text cmd.usage ] ]
@@ -509,6 +692,54 @@ operandS =
 noneS : Css.Style
 noneS =
     Css.batch [ Css.color Style.dim, Css.fontSize (Css.px 11) ]
+
+
+brandLinkS : Css.Style
+brandLinkS =
+    Css.batch [ Css.color Style.fg, Css.hover [ Css.textDecoration Css.none, Css.color Style.accent ] ]
+
+
+cmdLinkS : Css.Style
+cmdLinkS =
+    Css.batch [ Css.hover [ Css.textDecoration Css.none ] ]
+
+
+backS : Css.Style
+backS =
+    Css.batch [ Css.fontSize (Css.px 13), Css.marginBottom (Css.px 18) ]
+
+
+detailTitleS : Css.Style
+detailTitleS =
+    Css.batch [ Css.marginBottom (Css.px 6) ]
+
+
+detailDocS : Css.Style
+detailDocS =
+    Css.batch [ Css.color Style.fg, Css.fontSize (Css.px 15), Css.marginBottom (Css.px 10) ]
+
+
+pagerS : Css.Style
+pagerS =
+    Css.batch
+        [ Css.displayFlex
+        , Css.justifyContent Css.spaceBetween
+        , Css.marginTop (Css.px 24)
+        , Css.paddingTop (Css.px 14)
+        , Css.borderTop3 (Css.px 1) Css.solid Style.line
+        , Css.fontFamilies Style.fontMono
+        , Css.fontSize (Css.px 13)
+        ]
+
+
+pagerLinkS : Css.Style
+pagerLinkS =
+    Css.batch [ Css.color Style.accent2 ]
+
+
+pagerNextS : Css.Style
+pagerNextS =
+    Css.batch [ Css.marginLeft Css.auto ]
 
 
 mutexS : Css.Style

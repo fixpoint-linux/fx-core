@@ -3,7 +3,7 @@
     "version": "1.0.0",
     "description": "The fx-core command reference — generated from the Dhall schemas.",
     "private": true,
-    "type": "commonjs",
+    "type": "module",
     "scripts": {
         "build": "./vendor/dhake/dhake.com"
     },
