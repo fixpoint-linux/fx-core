@@ -208,16 +208,22 @@ fn buildAndCheck(
     tokens: []const []const u8,
 ) !struct { stages: []eval.Stage, commands: []pipeline.Command } {
     var stages = std.ArrayList(eval.Stage).empty;
-    errdefer stages.deinit(gpa);
+    errdefer {
+        for (stages.items) |s| gpa.free(s.argv);
+        stages.deinit(gpa);
+    }
     var commands = std.ArrayList(pipeline.Command).empty;
     errdefer commands.deinit(gpa);
 
     var prev_out: ?pipeline.Shape = null;
     for (tokens) |tok| {
-        // split "name:arg"
+        // split "name:arg" — the arg part is the SAME token stream the real
+        // argv frontends produce: whitespace-split until fx-shell's full
+        // tokenizer lands (U4 will route the DSL through it; a quoted token
+        // with spaces is then preserved verbatim, today it splits)
         const colon = std.mem.indexOfScalar(u8, tok, ':');
         const name = if (colon) |c| tok[0..c] else tok;
-        const arg = if (colon) |c| tok[c + 1 ..] else "";
+        const rest = if (colon) |c| tok[c + 1 ..] else "";
 
         const cmd = try pipeline.builtin(name, gpa);
         try commands.append(gpa, cmd);
@@ -229,11 +235,21 @@ fn buildAndCheck(
                 return e;
             };
         }
+
+        var argv = std.ArrayList([]const u8).empty;
+        errdefer argv.deinit(gpa);
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        while (it.next()) |a| {
+            argv.append(gpa, a) catch return error.NoMem;
+        }
+        const argv_slice = try argv.toOwnedSlice(gpa);
+        errdefer gpa.free(argv_slice); // until stages.append takes ownership
+
         // strip the arena-owned Term pointers: eval.run reads only .tag, and
         // resetArena below would otherwise leave dangling .ty pointers (N5).
         try stages.append(gpa, .{
             .name = name,
-            .args = arg,
+            .argv = argv_slice,
             .shape_in = .{ .tag = cmd.input.tag },
             .shape_out = .{ .tag = cmd.output.tag },
         });
@@ -264,6 +280,7 @@ fn runPipeline(
 ) !void {
     const built = try buildAndCheck(gpa, tokens);
     defer {
+        for (built.stages) |s| gpa.free(s.argv);
         gpa.free(built.stages);
         gpa.free(built.commands);
     }
@@ -331,7 +348,8 @@ fn runReplay(
     defer {
         for (report.stages) |s| {
             gpa.free(s.name);
-            gpa.free(s.args);
+            for (s.argv) |tok| gpa.free(tok);
+            gpa.free(s.argv);
             gpa.free(s.shape_out);
             gpa.free(s.in_hash);
             gpa.free(s.out_hash);
@@ -375,7 +393,7 @@ fn runConverge(
     // strip the arena-owned Term pointers before resetArena (N5).
     const stage = eval.Stage{
         .name = name,
-        .args = "",
+        .argv = &.{},
         .shape_in = .{ .tag = cmd.input.tag },
         .shape_out = .{ .tag = cmd.output.tag },
     };
@@ -404,7 +422,10 @@ fn runConverge(
 /// FIRST line is a header carrying the run's INTERNED INITIAL-INPUT CAS hash
 /// (fx-eval.run's casPut of the raw input) — replay reads the initial input
 /// back from the CAS BY THAT HASH (#3).  A stage line's `in` field is the S1
-/// derivation hash (name+args+input), which is NOT a CAS key.
+/// derivation hash (name+argv+input), which is NOT a CAS key.  The stage argv
+/// ride as a JSON ARRAY (manifest v2: `"argv":["-r","-n","3"]`); the loader
+/// still accepts the legacy rendered `"args":"-r"` string (whitespace-split)
+/// so pre-v2 manifests replay.
 fn manifestJson(gpa: Allocator, report: *const eval.RunReport) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
@@ -417,7 +438,12 @@ fn manifestJson(gpa: Allocator, report: *const eval.RunReport) ![]u8 {
         out.append(gpa, ',') catch return error.NoMem;
         try appendJsonStringField(gpa, &out, "name", s.name);
         out.append(gpa, ',') catch return error.NoMem;
-        try appendJsonStringField(gpa, &out, "args", s.args);
+        out.appendSlice(gpa, "\"argv\":[") catch return error.NoMem;
+        for (s.argv, 0..) |tok, i| {
+            if (i > 0) out.append(gpa, ',') catch return error.NoMem;
+            caslog.jsonEscape(gpa, &out, tok) catch return error.NoMem;
+        }
+        out.append(gpa, ']') catch return error.NoMem;
         out.append(gpa, ',') catch return error.NoMem;
         try appendJsonStringField(gpa, &out, "shape", s.shape_out);
         out.append(gpa, ',') catch return error.NoMem;
@@ -588,12 +614,13 @@ fn unescapeJsonString(gpa: Allocator, line: []const u8, start: usize) !struct { 
 }
 
 fn parseManifestLine(gpa: Allocator, line: []const u8) !eval.StageRecord {
-    // All five fields are OWNED (dup'd empty by default) so runReplay can
-    // free them uniformly without ever freeing a static "" literal.
+    // The string fields are OWNED (dup'd empty by default) so runReplay can
+    // free them uniformly without ever freeing a static "" literal; argv is
+    // an owned [][]u8 (empty = fresh zero-len alloc, again never static).
     var name: []u8 = try gpa.dupe(u8, "");
     errdefer gpa.free(name);
-    var args: []u8 = try gpa.dupe(u8, "");
-    errdefer gpa.free(args);
+    var argv: [][]u8 = try gpa.alloc([]u8, 0);
+    errdefer gpa.free(argv);
     var shape: []u8 = try gpa.dupe(u8, "");
     errdefer gpa.free(shape);
     var in_h: []u8 = try gpa.dupe(u8, "");
@@ -618,8 +645,18 @@ fn parseManifestLine(gpa: Allocator, line: []const u8) !eval.StageRecord {
                 gpa.free(name);
                 name = val;
             } else if (std.mem.eql(u8, key, "args")) {
-                gpa.free(args);
-                args = val;
+                // LEGACY (manifest v1): the rendered args string —
+                // whitespace-split into argv tokens so old manifests replay
+                // under the v2 engine
+                var toks = std.ArrayList([]u8).empty;
+                errdefer toks.deinit(gpa);
+                var it = std.mem.tokenizeAny(u8, val, " \t");
+                while (it.next()) |tok| {
+                    try toks.append(gpa, try gpa.dupe(u8, tok));
+                }
+                gpa.free(argv);
+                argv = try toks.toOwnedSlice(gpa);
+                gpa.free(val);
             } else if (std.mem.eql(u8, key, "shape")) {
                 gpa.free(shape);
                 shape = val;
@@ -633,6 +670,27 @@ fn parseManifestLine(gpa: Allocator, line: []const u8) !eval.StageRecord {
                 gpa.free(val);
             }
             i = parsed.end_quote + 1;
+        } else if (v_start < line.len and line[v_start] == '[') {
+            // manifest v2: "argv":[ "...", "..." ] — the token ARRAY form
+            if (std.mem.eql(u8, key, "argv")) {
+                var toks = std.ArrayList([]u8).empty;
+                errdefer toks.deinit(gpa);
+                var j = v_start + 1;
+                while (j < line.len) : (j += 1) {
+                    if (line[j] == '"') {
+                        const parsed = try unescapeJsonString(gpa, line, j + 1);
+                        try toks.append(gpa, parsed.value);
+                        j = parsed.end_quote;
+                    } else if (line[j] == ']') {
+                        break;
+                    }
+                }
+                gpa.free(argv);
+                argv = try toks.toOwnedSlice(gpa);
+                i = j + 1;
+            } else {
+                i = v_start + 1;
+            }
         } else {
             i = v_start;
         }
@@ -640,7 +698,7 @@ fn parseManifestLine(gpa: Allocator, line: []const u8) !eval.StageRecord {
     return .{
         .index = 0,
         .name = name,
-        .args = args,
+        .argv = argv,
         .shape_out = shape,
         .in_hash = in_h,
         .out_hash = out_h,
@@ -653,6 +711,191 @@ fn parseManifestLine(gpa: Allocator, line: []const u8) !eval.StageRecord {
 
 const testing = std.testing;
 
+// hermetic replay-test fixtures (mkdtemp + fake fx-sort); open/close/write/
+// mkdir are already declared at the top of this file
+extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+extern fn rmdir(path: [*:0]const u8) c_int;
+
+/// A tiny hermetic fixture for the replay tests: state dir + bin dir with one
+/// fake fx-sort that reverse-sorts its operand file (deterministic output).
+fn replayFixtures(gpa: Allocator) !struct { tmp: [:0]u8, state: []u8, bin_dir: [:0]u8 } {
+    var tpl: [128]u8 = undefined;
+    const base = "/tmp/fxu2replayXXXXXX";
+    @memcpy(tpl[0..base.len], base);
+    tpl[base.len] = 0;
+    const d = mkdtemp(@ptrCast(&tpl)) orelse return error.BadStateDir;
+    const tmp = gpa.dupeZ(u8, std.mem.span(d)) catch return error.NoMem;
+    errdefer {
+        _ = rmdir(tmp.ptr);
+        gpa.free(tmp);
+    }
+    const state = std.fmt.allocPrint(gpa, "{s}/fx", .{tmp}) catch return error.NoMem;
+    errdefer gpa.free(state);
+    try caslog.ensureDirs(state);
+    var bbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&bbuf, "{s}/bin", .{tmp}) catch return error.BadStateDir;
+    if (mkdir(bin_dir.ptr, 0o755) != 0) return error.BadStateDir;
+    var fbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const fake = std.fmt.bufPrintZ(&fbuf, "{s}/fx-sort", .{bin_dir}) catch return error.BadStateDir;
+    const fd = open(fake.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    if (fd < 0) return error.BadStateDir;
+    const script = "#!/bin/sh\ntac \"$1\"\n";
+    _ = write(fd, script.ptr, script.len);
+    _ = close(fd);
+    return .{ .tmp = tmp, .state = state, .bin_dir = gpa.dupeZ(u8, bin_dir) catch return error.NoMem };
+}
+
+fn rmTreeZ(path: [:0]const u8) void {
+    // best-effort recursive delete via libc dirent (the fx-eval test idiom)
+    const it = caslog.dl.opendir(path.ptr) orelse {
+        _ = std.c.unlink(path.ptr);
+        _ = rmdir(path.ptr);
+        return;
+    };
+    defer _ = caslog.dl.closedir(it);
+    while (caslog.dl.readdir(it)) |entry| {
+        const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        var child: [std.posix.PATH_MAX]u8 = undefined;
+        const c = std.fmt.bufPrintZ(&child, "{s}/{s}", .{ path, name }) catch continue;
+        if (rmdir(c.ptr) == 0) continue;
+        if (std.c.unlink(c.ptr) == 0) continue;
+        rmTreeZ(c);
+    }
+    _ = rmdir(path.ptr);
+}
+
+test "replay: legacy v1 manifest (args string, OLD in-hash format) still verifies" {
+    // RISK 1 pin: stageInHashHex changed framing in U2, so every recorded
+    // in-hash differs from v1 — but replay compares OUT-hashes only, and the
+    // v1 "args" string loads via the legacy whitespace-split.  A v1 manifest
+    // written by the OLD code (hand-built below, byte-for-byte the old
+    // writer's shape) must replay to null divergence under the new engine.
+    const gpa = testing.allocator;
+    const fix = try replayFixtures(gpa);
+    defer {
+        rmTreeZ(fix.tmp);
+        gpa.free(fix.bin_dir);
+        gpa.free(fix.state);
+        gpa.free(fix.tmp);
+    }
+
+    // 1. run 'sort:-r' under the NEW engine to intern the input + record the
+    //    real out-hash (the fake reverses, so -r vs bare differ)
+    const input = "1\n2\n3\n";
+    const in_hex = try caslog.casPut(fix.state, input);
+    const new_argv = [_][]const u8{"-r"};
+    const new_stage = [_]eval.Stage{.{
+        .name = "sort",
+        .argv = &new_argv,
+        .shape_in = .{ .tag = .lines },
+        .shape_out = .{ .tag = .lines },
+    }};
+    const rep = try eval.run(&new_stage, input, fix.state, fix.bin_dir, gpa, testing.io);
+    defer {
+        for (rep.stages) |s| {
+            gpa.free(s.in_hash);
+            gpa.free(s.out_hash);
+        }
+        gpa.free(rep.stages);
+        gpa.free(rep.final_hash);
+        gpa.free(rep.input_hash);
+    }
+
+    // 2. hand-write the SAME run as a v1 manifest: "args":"-r" string, an
+    //    in-hash in the OLD "{name}:{args}\n{input}" framing (any hex — it is
+    //    a derivation hash, never compared), the header + real out-hash
+    var mbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const mpath = std.fmt.bufPrintZ(&mbuf, "{s}/legacy.jsonl", .{fix.tmp}) catch unreachable;
+    const v1_line = try std.fmt.allocPrint(gpa,
+        "{{\"i\":0,\"name\":\"sort\",\"args\":\"-r\",\"shape\":\"lines\",\"in\":\"deadbeef\",\"out\":\"{s}\"}}\n",
+        .{rep.stages[0].out_hash},
+    );
+    defer gpa.free(v1_line);
+    const header = try std.fmt.allocPrint(gpa, "{{\"fx-pipe\":1,\"input\":\"{s}\"}}\n", .{in_hex[0..64]});
+    defer gpa.free(header);
+    const manifest = try std.fmt.allocPrint(gpa, "{s}{s}", .{ header, v1_line });
+    defer gpa.free(manifest);
+    {
+        const fd = open(mpath.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if (fd < 0) return error.BadStateDir;
+        defer _ = close(fd);
+        _ = write(fd, manifest.ptr, manifest.len);
+    }
+
+    // 3. --replay it: the loader splits "-r" into ["-r"], the engine
+    //    re-derives the SAME out-hash, and divergence is null
+    const loaded = try loadManifest(gpa, mpath);
+    defer {
+        for (loaded.stages) |s| {
+            gpa.free(s.name);
+            for (s.argv) |tok| gpa.free(tok);
+            gpa.free(s.argv);
+            gpa.free(s.shape_out);
+            gpa.free(s.in_hash);
+            gpa.free(s.out_hash);
+        }
+        gpa.free(loaded.stages);
+        gpa.free(loaded.final_hash);
+        gpa.free(loaded.input_hash);
+    }
+    try testing.expectEqual(@as(usize, 1), loaded.stages.len);
+    try testing.expectEqual(@as(usize, 1), loaded.stages[0].argv.len);
+    try testing.expectEqualStrings("-r", loaded.stages[0].argv[0]);
+    const div = try eval.replay(&loaded, fix.state, fix.bin_dir, gpa, testing.io);
+    try testing.expect(div == null);
+}
+
+test "replay: v2 argv-array manifest round-trips (write then replay)" {
+    const gpa = testing.allocator;
+    const fix = try replayFixtures(gpa);
+    defer {
+        rmTreeZ(fix.tmp);
+        gpa.free(fix.bin_dir);
+        gpa.free(fix.state);
+        gpa.free(fix.tmp);
+    }
+
+    const input = "a\nb\nc\n";
+    const argv_in = [_][]const u8{"-r"};
+    const stages = [_]eval.Stage{.{
+        .name = "sort",
+        .argv = &argv_in,
+        .shape_in = .{ .tag = .lines },
+        .shape_out = .{ .tag = .lines },
+    }};
+    const rep = try eval.run(&stages, input, fix.state, fix.bin_dir, gpa, testing.io);
+    defer {
+        for (rep.stages) |s| {
+            gpa.free(s.in_hash);
+            gpa.free(s.out_hash);
+        }
+        gpa.free(rep.stages);
+        gpa.free(rep.final_hash);
+        gpa.free(rep.input_hash);
+    }
+    // the emitted manifest carries the argv ARRAY; parsing it back re-runs
+    const manifest = try manifestJson(gpa, &rep);
+    defer gpa.free(manifest);
+    try testing.expect(std.mem.indexOf(u8, manifest, "\"argv\":[\"-r\"]") != null);
+    const loaded = try parseManifest(gpa, manifest);
+    defer {
+        for (loaded.stages) |s| {
+            gpa.free(s.name);
+            for (s.argv) |tok| gpa.free(tok);
+            gpa.free(s.argv);
+            gpa.free(s.shape_out);
+            gpa.free(s.in_hash);
+            gpa.free(s.out_hash);
+        }
+        gpa.free(loaded.stages);
+        gpa.free(loaded.final_hash);
+        gpa.free(loaded.input_hash);
+    }
+    const div = try eval.replay(&loaded, fix.state, fix.bin_dir, gpa, testing.io);
+    try testing.expect(div == null);
+}
+
 test "state-dir resolution returns an owned copy (B1 surface)" {
     const gpa = testing.allocator;
     const d = try resolveStateDirOwned(gpa, "/tmp/fxcompose-test-state");
@@ -660,11 +903,13 @@ test "state-dir resolution returns an owned copy (B1 surface)" {
     try testing.expectEqualStrings("/tmp/fxcompose-test-state", d);
 }
 
-test "manifest parse round-trip: escaped args survive (S6)" {
+test "manifest parse round-trip: escaped argv tokens survive (S6)" {
     const gpa = testing.allocator;
-    const tricky_args = "grep:\"quoted \\\\ backslash\nnewline\t\r";
+    // ONE token carrying quotes/backslash/newline/tab/CR — the v2 array form
+    // keeps it whole instead of whitespace-splitting it away
+    const tricky_argv = [_][]const u8{"grep:\"quoted \\\\ backslash\nnewline\t\r"};
     var stages_buf = [_]eval.StageRecord{
-        .{ .index = 0, .name = "grep", .args = tricky_args, .shape_out = "lines", .in_hash = "aa", .out_hash = "bb" },
+        .{ .index = 0, .name = "grep", .argv = &tricky_argv, .shape_out = "lines", .in_hash = "aa", .out_hash = "bb" },
     };
     const report = eval.RunReport{
         .stages = &stages_buf,
@@ -679,13 +924,15 @@ test "manifest parse round-trip: escaped args survive (S6)" {
     const rec = try parseManifestLine(gpa, manifest[nl0 + 1 .. nl1]);
     defer {
         gpa.free(rec.name);
-        gpa.free(rec.args);
+        for (rec.argv) |tok| gpa.free(tok);
+        gpa.free(rec.argv);
         gpa.free(rec.shape_out);
         gpa.free(rec.in_hash);
         gpa.free(rec.out_hash);
     }
     try testing.expectEqualStrings("grep", rec.name);
-    try testing.expectEqualStrings(tricky_args, rec.args);
+    try testing.expectEqual(@as(usize, 1), rec.argv.len);
+    try testing.expectEqualStrings(tricky_argv[0], rec.argv[0]);
     try testing.expectEqualStrings("lines", rec.shape_out);
     try testing.expectEqualStrings("aa", rec.in_hash);
     try testing.expectEqualStrings("bb", rec.out_hash);
@@ -694,7 +941,8 @@ test "manifest parse round-trip: escaped args survive (S6)" {
 fn freeLoadedReport(gpa: Allocator, rep: *const eval.RunReport) void {
     for (rep.stages) |s| {
         gpa.free(s.name);
-        gpa.free(s.args);
+        for (s.argv) |tok| gpa.free(tok);
+        gpa.free(s.argv);
         gpa.free(s.shape_out);
         gpa.free(s.in_hash);
         gpa.free(s.out_hash);
@@ -710,8 +958,8 @@ test "manifest header carries the interned input CAS hash (replay's casGet key)"
     // not CAS keys — the pre-2026-09 loader read stage 0's `in` as input_hash,
     // so EVERY --replay died in casGet(Missing).  The header must win.
     var stages_buf = [_]eval.StageRecord{
-        .{ .index = 0, .name = "sort", .args = "", .shape_out = "lines", .in_hash = "derive0", .out_hash = "mid" },
-        .{ .index = 1, .name = "head", .args = "1", .shape_out = "lines", .in_hash = "mid", .out_hash = "fin" },
+        .{ .index = 0, .name = "sort", .argv = &.{}, .shape_out = "lines", .in_hash = "derive0", .out_hash = "mid" },
+        .{ .index = 1, .name = "head", .argv = &.{"1"}, .shape_out = "lines", .in_hash = "mid", .out_hash = "fin" },
     };
     const report = eval.RunReport{ .stages = &stages_buf, .final_hash = "fin", .input_hash = "cas0" };
     const manifest = try manifestJson(gpa, &report);
@@ -736,6 +984,41 @@ test "manifest without a header falls back to the legacy input-hash read" {
     defer freeLoadedReport(gpa, &loaded);
     try testing.expectEqualStrings("derive0", loaded.input_hash);
     try testing.expectEqual(@as(usize, 1), loaded.stages.len);
+}
+
+test "legacy manifest (v1 args string) replays: whitespace-split into argv" {
+    const gpa = testing.allocator;
+    // a pre-v2 stage line carries the RENDERED "args" string; the loader
+    // must split it into the same tokens the DSL would have produced so the
+    // stage re-runs identically (the engine appends the plan tokens itself)
+    const legacy = "{\"i\":0,\"name\":\"sort\",\"args\":\"-r -n 3\",\"shape\":\"lines\",\"in\":\"x\",\"out\":\"y\"}\n";
+    const loaded = try parseManifest(gpa, legacy);
+    defer freeLoadedReport(gpa, &loaded);
+    try testing.expectEqual(@as(usize, 1), loaded.stages.len);
+    try testing.expectEqual(@as(usize, 3), loaded.stages[0].argv.len);
+    try testing.expectEqualStrings("-r", loaded.stages[0].argv[0]);
+    try testing.expectEqualStrings("-n", loaded.stages[0].argv[1]);
+    try testing.expectEqualStrings("3", loaded.stages[0].argv[2]);
+}
+
+test "manifest v2 argv array round-trips tokens verbatim" {
+    const gpa = testing.allocator;
+    // the v2 writer emits "argv":[...]; the loader reads the array back
+    // token-for-token WITHOUT splitting (a token containing spaces survives)
+    const argv_in = [_][]const u8{ "-r", "hello world", "3" };
+    var stages_buf = [_]eval.StageRecord{
+        .{ .index = 0, .name = "sort", .argv = &argv_in, .shape_out = "lines", .in_hash = "aa", .out_hash = "bb" },
+    };
+    const report = eval.RunReport{ .stages = &stages_buf, .final_hash = "bb", .input_hash = "aa" };
+    const manifest = try manifestJson(gpa, &report);
+    defer gpa.free(manifest);
+    try testing.expect(std.mem.indexOf(u8, manifest, "\"argv\":[\"-r\",\"hello world\",\"3\"]") != null);
+
+    const loaded = try parseManifest(gpa, manifest);
+    defer freeLoadedReport(gpa, &loaded);
+    try testing.expectEqual(@as(usize, 1), loaded.stages.len);
+    try testing.expectEqual(@as(usize, 3), loaded.stages[0].argv.len);
+    try testing.expectEqualStrings("hello world", loaded.stages[0].argv[1]);
 }
 
 test "cli parse: --text captures the value, --input unchanged" {
@@ -771,11 +1054,13 @@ test "buildAndCheck: seq:5 source stage lands at position 0 with shape .none" {
     const gpa = testing.allocator;
     const built = try buildAndCheck(gpa, &.{ "seq:5", "sort" });
     defer {
+        for (built.stages) |s| gpa.free(s.argv);
         gpa.free(built.stages);
         gpa.free(built.commands);
     }
     try testing.expectEqualStrings("seq", built.stages[0].name);
-    try testing.expectEqualStrings("5", built.stages[0].args);
+    try testing.expectEqual(@as(usize, 1), built.stages[0].argv.len);
+    try testing.expectEqualStrings("5", built.stages[0].argv[0]);
     try testing.expectEqual(pipeline.ShapeTag.none, built.stages[0].shape_in.tag);
     try testing.expectEqual(pipeline.ShapeTag.lines, built.stages[0].shape_out.tag);
     try testing.expectEqual(pipeline.ShapeTag.lines, built.stages[1].shape_in.tag);

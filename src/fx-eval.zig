@@ -66,11 +66,12 @@ extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 // Types
 // ---------------------------------------------------------------------------
 
-/// A native in-process handler: (args, input bytes, state_dir, gpa) -> output.
-/// `args` is the post-':' stage argument (e.g. "3" for head:3, or "." for
-/// find:.).  `input` is the materialized input bytes for that stage.
-/// `state_dir` lets find skip its own CAS tree (S3).
-pub const NativeFn = *const fn (args: []const u8, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8;
+/// A native in-process handler: (stage, input bytes, state_dir, gpa) -> output.
+/// The stage carries the user's argv TOKENS (find: argv[0] is the root,
+/// defaulting to "."; grep: argv[0] is the pattern).  `input` is the
+/// materialized input bytes for that stage.  `state_dir` lets find skip its
+/// own CAS tree (S3).
+pub const NativeFn = *const fn (stage: *const Stage, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8;
 
 pub const ExecSpec = struct {
     /// argv[0] basename to run (resolved against the bin dir), e.g. "sort".
@@ -84,7 +85,12 @@ pub const Dispatch = union(enum) {
 
 pub const Stage = struct {
     name: []const u8, // dispatch-table key, e.g. "sort"
-    args: []const u8, // post-':' argument, "" if none
+    /// the USER'S argv tokens after the stage name, in order (the tokens the
+    /// user wrote — NOT the engine-synthesized ones like -n 10 / --rows / the
+    /// CAS operand path; those are appended per argv_plan at dispatch time).
+    /// Empty = bare stage.  Built by fx-compose's DSL splitter / the replay
+    /// loader; never mutated by the engine.
+    argv: []const []const u8 = &.{},
     shape_in: Shape,
     shape_out: Shape,
 };
@@ -93,7 +99,7 @@ pub const Stage = struct {
 pub const StageRecord = struct {
     index: usize,
     name: []const u8,
-    args: []const u8,
+    argv: []const []const u8,
     shape_out: []const u8, // "lines" / "bytes" / "rows" / "single"
     in_hash: []const u8, // 64-hex, may be "sha256:"-prefixed by caller
     out_hash: []const u8,
@@ -208,13 +214,15 @@ const FindEntry = struct {
     mtime: u64,
 };
 
-/// native find: walk `args` (a path, default ".") recursively, emit JSONL rows
+/// native find: walk the stage's root operand (argv[0], default ".")
+/// recursively, emit JSONL rows
 /// {path,kind,size,mtime} SORTED by path (directory iteration order is not
 /// guaranteed — L5), via openat + dirent recursion (the fx-find walkDir idiom).
 /// kind = 'File'/'Dir' JSON string; mtime = stat.mtime integer SECONDS; size =
 /// stat.size.  Pure Zig + libc, no libdatalog.
-pub fn nativeFind(args: []const u8, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8 {
+pub fn nativeFind(stage: *const Stage, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8 {
     _ = input;
+    const args = if (stage.argv.len > 0) stage.argv[0] else "";
     const root = if (args.len > 0) args else ".";
     const kk = try wire.declaredFieldKinds(gpa, find_rows_src);
     defer {
@@ -375,15 +383,17 @@ fn dfaMatchFull(dfa: *const rx.regex_dfa, s: []const u8) bool {
 
 /// native grep: read JSONL rows (the previous stage's output), extract each
 /// record's `path` (width subtyping — only the path field is read), REGEX-match
-/// it against `args`, and emit matching paths one per line in INPUT ROW ORDER.
+/// it against the stage's pattern operand (argv[0]), and emit matching paths
+/// one per line in INPUT ROW ORDER.
 /// The regex is the real fx-grep engine: libdatalog's regex_compile (subset:
 /// literals incl \ and \xHH, ., [abc]/[a-z]/[^abc], *, +, ?, |, () — ^ $ { }
 /// are plain literals here, backrefs/lookaround do not exist) with the same
 /// `.*({s}).*` substring wrap the binary uses, grouped so a top-level `|`
 /// stays inside one substring match.  Compile failures are stage errors
 /// (BadPattern), an empty pattern is EmptyPattern — both mirror fx-grep.
-pub fn nativeGrep(args: []const u8, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8 {
+pub fn nativeGrep(stage: *const Stage, input: []const u8, state_dir: []const u8, gpa: Allocator) anyerror![]u8 {
     _ = state_dir;
+    const args = if (stage.argv.len > 0) stage.argv[0] else "";
     if (args.len == 0) return error.EmptyPattern;
 
     const wrapped = std.fmt.allocPrint(gpa, ".*({s}).*", .{args}) catch return error.NoMem;
@@ -462,15 +472,24 @@ fn dispatchStage(
 ) ![]u8 {
     const entry = lookupEntry(stage.name) orelse return error.UnknownCommand;
     switch (entry.dispatch) {
-        .native => |fn_| return fn_(stage.args, input, ctx.state_dir, ctx.gpa),
+        .native => |fn_| return fn_(stage, input, ctx.state_dir, ctx.gpa),
         .exec => return execDispatch(ctx, stage, entry.dispatch.exec.binary, input),
+    }
+}
+
+/// Append the stage's USER argv tokens to `argv` in order, verbatim (the
+/// frontend already tokenized; the engine never re-splits or re-joins).
+fn appendUserArgv(ctx: *RunContext, stage: *const Stage, argv: *std.ArrayList([]const u8)) !void {
+    for (stage.argv) |tok| {
+        argv.append(ctx.gpa, tok) catch return error.NoMem;
     }
 }
 
 /// exec dispatch: run the real fx-<binary> and capture stdout
 /// (std.process.run, stdin=.ignore).  Every per-binary decision — which ROLE
 /// the stage plays (CAS blob operand / single-Text value operand / no
-/// pipeline input at all), how stage.args are laid out into argv, and how the
+/// pipeline input at all), how the user's argv tokens are laid out into the
+/// child's argv, and how the
 /// child's stdout is postprocessed — comes from the fx-stages.zig table;
 /// this fn is the single switch over it (U1).  The ~27 per-binary
 /// std.mem.eql chains that used to live here claimed stage args in the
@@ -512,11 +531,15 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     var path_text: ?[]const u8 = null;
     defer if (path_text) |pt| ctx.gpa.free(pt);
 
-    // head/tail's -n N buffer — function scope: argv holds a pointer into it
-    // until the spawn below, so it must outlive the argv-building switch
+    // head/tail's DEFAULT "-n 10" buffer — function scope: argv holds a
+    // pointer into it until the spawn below, so it must outlive the
+    // argv-building switch
     var cnt: [64]u8 = undefined;
 
-    // build argv from the table: [bin, <argv_plan shape>, operand?]
+    // build argv from the table: [bin, <user argv in order>, <role/argv_plan
+    // tokens>].  The user's tokens ALWAYS ride first and verbatim (nothing
+    // re-parses, re-joins or re-splits them — the tokenizer already ran in
+    // the frontend); the engine only APPENDS the plan tokens after them.
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(ctx.gpa);
     argv.append(ctx.gpa, bin_path) catch return error.NoMem;
@@ -524,11 +547,11 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         .operand_rows => {
             // --rows: canonical wire rows (the declared registry output
             // shape); ls/du text output is display-only and does not
-            // round-trip the type.  The stage args are the TREE ROOT / PATH
-            // operand (mirror find); empty args -> the child's default
-            // (tree/df: "."/all-mounts).
+            // round-trip the type.  The stage argv are the TREE ROOT / PATH
+            // operand tokens (mirror find); empty argv -> the child's
+            // default (tree/df: "."/all-mounts).
+            try appendUserArgv(ctx, stage, &argv);
             argv.append(ctx.gpa, "--rows") catch return error.NoMem;
-            if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
         },
         .text_operand => {
             // the PATH operand is the prior stage's single-Text VALUE,
@@ -543,17 +566,21 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
                 return error.StageFailed;
             }
             switch (spec.argv_plan) {
-                // basename's stage args are the SUFFIX operand (fx-basename
-                // NAME [SUFFIX])
+                // basename's stage argv are the SUFFIX operand (fx-basename
+                // NAME [SUFFIX]) — exactly one token
                 .text_value => {
+                    if (stage.argv.len > 1) {
+                        std.debug.print("fx-eval: {s}: expected at most 1 argv token (the SUFFIX operand), got {d}\n", .{ binary, stage.argv.len });
+                        return error.StageFailed;
+                    }
                     argv.append(ctx.gpa, pt) catch return error.NoMem;
-                    if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+                    try appendUserArgv(ctx, stage, &argv);
                 },
-                // dirname/realpath reject args: extra operands would emit
+                // dirname/realpath reject argv: extra operands would emit
                 // multiple lines, breaking the single-Text output shape
                 else => {
-                    if (stage.args.len > 0) {
-                        std.debug.print("fx-eval: {s}: stage args '{s}' rejected (extra operands would emit multiple lines)\n", .{ binary, stage.args });
+                    if (stage.argv.len > 0) {
+                        std.debug.print("fx-eval: {s}: stage argv rejected (extra operands would emit multiple lines)\n", .{binary});
                         return error.StageFailed;
                     }
                     argv.append(ctx.gpa, pt) catch return error.NoMem;
@@ -562,117 +589,182 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         },
         // GENERATOR stages are SOURCES: no file operand and no pipeline input
         // at all (valid only at position 0, which shapeCompatible enforces).
-        // echo (text_value) passes ONE verbatim operand; seq (rows_flag) is
-        // the INTEGER-validated split — distinct from ps/top's rows_flag
+        // echo (text_value) passes the user argv as verbatim operands
+        // (fx-echo joins them with single spaces); seq (rows_flag) is the
+        // INTEGER-validated form — distinct from ps/top's rows_flag
         // passthrough by role.
         .generator => switch (spec.argv_plan) {
-            // echo: the whole post-':' arg is ONE verbatim text operand
-            // (spaces included); empty args -> argv [bin] -> a bare newline
-            // (GNU echo behavior; a leading-dash arg reaches fx-echo's
-            // option parser and fails loudly)
-            .text_value => if (stage.args.len > 0) {
-                argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-            },
-            // seq: fast-fail on empty args before the spawn (mirrors the
+            // echo: the user tokens ride verbatim (the old single-verbatim
+            // operand is the 1-token case: fx-echo re-joins with single
+            // spaces, so `echo:a b` keeps producing "a b\n").  Empty argv ->
+            // argv [bin] -> a bare newline (GNU echo behavior; a
+            // leading-dash token reaches fx-echo's option parser and fails
+            // loudly)
+            .text_value => try appendUserArgv(ctx, stage, &argv),
+            // seq: fast-fail on empty argv before the spawn (mirrors the
             // dirname extra-args rejection) — fx-seq with no operand is
             // MissingOperand, but the engine rejects it itself so the
             // contract holds even under fake-binary tests
             .rows_flag => {
-                if (stage.args.len == 0) {
+                if (stage.argv.len == 0) {
                     std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
                     return error.StageFailed;
                 }
-                if (stage.args[0] == '{') {
-                    // the fx-seq Dhall-record form rides verbatim as ONE operand
-                    argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+                if (stage.argv[0].len > 0 and stage.argv[0][0] == '{') {
+                    // the fx-seq Dhall-record form rides verbatim as ONE
+                    // operand (the DSL keeps a record with spaces in one
+                    // token; a user-supplied multi-token record is rejected
+                    // by fx-seq itself)
+                    if (stage.argv.len > 1) {
+                        std.debug.print("fx-eval: seq: the Dhall-record form is ONE token (quote the record in the shell)\n", .{});
+                        return error.StageFailed;
+                    }
+                    try appendUserArgv(ctx, stage, &argv);
                 } else {
-                    // whitespace-split into 1-3 INTEGER operands, mirroring
-                    // fx-seq parsePosixArgs (a non-integer or a 4th operand
-                    // is a loud engine-side failure, not a surprise child exit)
-                    var n: usize = 0;
-                    var it = std.mem.tokenizeAny(u8, stage.args, " \t");
-                    while (it.next()) |tok| {
-                        n += 1;
-                        if (n > 3) {
-                            std.debug.print("fx-eval: seq: more than 3 integer operands\n", .{});
-                            return error.StageFailed;
-                        }
+                    // 1-3 INTEGER operands, mirroring fx-seq parsePosixArgs
+                    // (a non-integer or a 4th operand is a loud engine-side
+                    // failure, not a surprise child exit).  The tokens are
+                    // already split — this validates, it does not split.
+                    if (stage.argv.len > 3) {
+                        std.debug.print("fx-eval: seq: more than 3 integer operands\n", .{});
+                        return error.StageFailed;
+                    }
+                    for (stage.argv) |tok| {
                         _ = std.fmt.parseInt(i128, tok, 10) catch {
                             std.debug.print("fx-eval: seq: operand '{s}' is not an integer\n", .{tok});
                             return error.StageFailed;
                         };
                         argv.append(ctx.gpa, tok) catch return error.NoMem;
                     }
-                    if (n == 0) {
-                        std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
-                        return error.StageFailed;
-                    }
                 }
             },
             else => unreachable, // generators are text_value (echo) / rows_flag (seq)
         },
-        // ps/top: [bin, "--rows", flags?] — the stage args are
-        // whitespace-split into flag tokens (a single "-m"/"-c" rides
-        // through as one; "top:-n 10" must reach the child as TWO argv
-        // tokens or fx-top's parser rejects "-n 10").  Unknown flags
-        // fail loudly in the child; empty args -> [--rows] -> the
-        // child's default sort/count.  Unlike seq there is no
-        // engine-side token validation: the flags are the child's
-        // vocabulary, not the engine's.  The Dhall-record form is NOT
-        // reachable through the pipeline (argv[1] is "--rows", so the
-        // child's record-form branch never fires).
+        // ps/top: [bin, flags..., "--rows"] — the user tokens ride verbatim
+        // (a single "-m"/"-c" as one; a "-n 10" arrives as TWO tokens only
+        // if the user wrote them as two — the frontend's split already
+        // decided).  Unknown flags fail loudly in the child; empty argv ->
+        // just [--rows] -> the child's default sort/count.  Unlike seq
+        // there is no engine-side token validation: the flags are the
+        // child's vocabulary, not the engine's.  The Dhall-record form is
+        // NOT reachable through the pipeline (the engine appends --rows, so
+        // the child's record-form branch never fires).
         .generator_rows => {
+            try appendUserArgv(ctx, stage, &argv);
             argv.append(ctx.gpa, "--rows") catch return error.NoMem;
-            var it = std.mem.tokenizeAny(u8, stage.args, " \t");
-            while (it.next()) |tok| {
-                argv.append(ctx.gpa, tok) catch return error.NoMem;
-            }
         },
         // TWO-FILE stages: the prior stage's CAS blob is FILE1, the stage
-        // args are the SECOND FILE PATH verbatim (live-read at run AND
-        // replay — the accepted find/ls/du live-operand caveat: a changed
-        // PATH2 diverges replay loudly, an absent one fails)
+        // argv are the SECOND FILE PATH (live-read at run AND replay — the
+        // accepted find/ls/du live-operand caveat: a changed PATH2 diverges
+        // replay loudly, an absent one fails)
         .two_file => {
-            // fast-fail on empty args before the spawn: PATH2 is not
+            // fast-fail on an empty argv before the spawn: PATH2 is not
             // optional (mirrors the seq/dirname pre-spawn rejections) —
             // without it the child would misparse its operands or read stdin
-            if (stage.args.len == 0) {
+            if (stage.argv.len == 0) {
                 std.debug.print("fx-eval: {s}: stage args required (second file operand)\n", .{binary});
                 return error.StageFailed;
             }
             argv.append(ctx.gpa, cas_path.?) catch return error.NoMem; // FILE1
-            argv.append(ctx.gpa, stage.args) catch return error.NoMem; // PATH2
+            try appendUserArgv(ctx, stage, &argv); // PATH2 (1 token, checked below)
+            if (stage.argv.len > 1) {
+                std.debug.print("fx-eval: {s}: the second file operand is ONE token, got {d}\n", .{ binary, stage.argv.len });
+                return error.StageFailed;
+            }
         },
         // file-operand stages: [bin, flags..., cas_path].  head/tail/nl/
         // expand have a synthesized flag vocabulary (specs.synthFlag);
-        // every other .cas_file binary rides its args as raw flag tokens.
+        // every other .cas_file binary rides its tokens as raw flag
+        // operands.
         .file_operand => {
             if (specs.synthFlag(binary)) |sf| {
-                // head/tail: [-n, N] with the default 10 when args are
-                // empty (dflt != null); nl/expand: [-b|-t, args] only when
-                // args are non-empty (dflt == null)
-                if (sf.dflt != null or stage.args.len > 0) {
-                    const v = if (stage.args.len > 0) stage.args else sf.dflt.?;
-                    const nz = std.fmt.bufPrintZ(&cnt, "{s}", .{v}) catch return error.BadStateDir;
-                    argv.append(ctx.gpa, sf.flag) catch return error.NoMem;
-                    argv.append(ctx.gpa, nz) catch return error.NoMem;
+                // head/tail: [-n, N].  DSL SUGAR: a single bare-integer token
+                // (head:3) IS the N — the old flat-args semantics, preserved
+                // so `head:3` keeps meaning `-n 3` rather than a stray FILE
+                // operand.  Anything else rides verbatim, and the "-n 10"
+                // default is injected only when the user's argv has no -n of
+                // their own.
+                // nl/expand: [-b|-t, value] built from the single user token
+                // only when one exists (no default; extra tokens rejected).
+                if (sf.dflt != null) {
+                    if (stage.argv.len == 1 and stage.argv[0].len > 0 and stage.argv[0][0] != '-') {
+                        _ = std.fmt.parseInt(i128, stage.argv[0], 10) catch {
+                            std.debug.print("fx-eval: {s}: '{s}' is not a line count\n", .{ binary, stage.argv[0] });
+                            return error.StageFailed;
+                        };
+                        argv.append(ctx.gpa, sf.flag) catch return error.NoMem;
+                        argv.append(ctx.gpa, stage.argv[0]) catch return error.NoMem;
+                    } else {
+                        var has_n = false;
+                        for (stage.argv) |tok| {
+                            if (std.mem.eql(u8, tok, sf.flag)) has_n = true;
+                        }
+                        try appendUserArgv(ctx, stage, &argv);
+                        if (!has_n) {
+                            const nz = std.fmt.bufPrintZ(&cnt, "{s}", .{sf.dflt.?}) catch return error.BadStateDir;
+                            argv.append(ctx.gpa, sf.flag) catch return error.NoMem;
+                            argv.append(ctx.gpa, nz) catch return error.NoMem;
+                        }
+                    }
+                } else {
+                    // nl/expand: [-b|-t, value].  THREE accepted spellings,
+                    // all loud-checked (a ':' cannot occur in a legit value:
+                    // nl's body is a|t, expand's tabstop a Natural):
+                    //   ["-b", "a"]    real argv tokens (verbatim)
+                    //   ["-b:a"]       the DSL colon sugar (split on ':')
+                    //   ["a"]          the bare-value sugar (the U1 form)
+                    if (stage.argv.len > 2) {
+                        std.debug.print("fx-eval: {s}: expected at most 2 argv tokens ({s} VALUE), got {d}\n", .{ binary, sf.flag, stage.argv.len });
+                        return error.StageFailed;
+                    }
+                    if (stage.argv.len == 2) {
+                        if (!std.mem.eql(u8, stage.argv[0], sf.flag)) {
+                            std.debug.print("fx-eval: {s}: two tokens must be [{s}, VALUE], got '{s}'\n", .{ binary, sf.flag, stage.argv[0] });
+                            return error.StageFailed;
+                        }
+                        try appendUserArgv(ctx, stage, &argv);
+                    } else if (stage.argv.len == 1) {
+                        const tok = stage.argv[0];
+                        if (std.mem.indexOfScalar(u8, tok, ':')) |c| {
+                            // DSL sugar "flag:value" — split it
+                            if (!std.mem.eql(u8, tok[0..c], sf.flag)) {
+                                std.debug.print("fx-eval: {s}: '{s}' is not a {s} value (expected {s}:VALUE)\n", .{ binary, tok, sf.flag, sf.flag });
+                                return error.StageFailed;
+                            }
+                            argv.append(ctx.gpa, sf.flag) catch return error.NoMem;
+                            argv.append(ctx.gpa, tok[c + 1 ..]) catch return error.NoMem;
+                        } else {
+                            argv.append(ctx.gpa, sf.flag) catch return error.NoMem;
+                            argv.append(ctx.gpa, tok) catch return error.NoMem;
+                        }
+                    }
                 }
             } else {
                 // U1: sort/uniq/cat/wc/cksum/sum/the 6 digests used to fall
                 // through the old chain with NO arm at all, so their stage
                 // args were claimed in the manifest and silently DROPPED
-                // ('sort:-r' hashed like 'sort').  The args now ride as flag
-                // tokens BEFORE the operand: a flag reaches the child's
-                // option parser, a non-flag becomes an extra operand and the
-                // child rejects it loudly (a second FILE operand is
+                // ('sort:-r' hashed like 'sort').  The tokens now ride as
+                // flag operands BEFORE the CAS operand: a flag reaches the
+                // child's option parser, a non-flag becomes an extra operand
+                // and the child rejects it loudly (a second FILE operand is
                 // UnexpectedOperand — never a silent drop).
-                var it = std.mem.tokenizeAny(u8, stage.args, " \t");
-                while (it.next()) |tok| {
-                    argv.append(ctx.gpa, tok) catch return error.NoMem;
-                }
+                try appendUserArgv(ctx, stage, &argv);
             }
         },
         .native => unreachable, // the dispatch table never execs find/grep
+    }
+    // the rows/second-file/digest plan tokens ride AFTER the user's argv for
+    // every other role (the engine appends --rows / FILE1 / the CAS path —
+    // a user-supplied duplicate would double it, so it is a LOUD error)
+    switch (spec.role) {
+        .operand_rows, .generator_rows => for (stage.argv) |tok| {
+            if (std.mem.eql(u8, tok, "--rows")) {
+                std.debug.print("fx-eval: {s}: '--rows' in stage argv rejected (the engine appends it; doubling it would be silent nonsense)\n", .{binary});
+                return error.StageFailed;
+            }
+        },
+        .two_file, .file_operand => {},
+        else => {},
     }
     if (spec.role == .file_operand) {
         argv.append(ctx.gpa, cas_path.?) catch return error.NoMem;
@@ -890,14 +982,28 @@ fn hexToStr(gpa: Allocator, hex: [65]u8) ![]const u8 {
 }
 
 /// Stage 0's recorded input hash covers the stage's ACTUAL derivation inputs
-/// (name + args + input) so a `find:.` pipeline records distinct hashes for
+/// (name + argv + input) so a `find:.` pipeline records distinct hashes for
 /// different roots instead of hash("") for every root (S1).  Later stages use
 /// the prior stage's output hash instead.
-fn stageInHashHex(gpa: Allocator, name: []const u8, args: []const u8, input: []const u8) ![]const u8 {
-    const combined = std.fmt.allocPrint(gpa, "{s}:{s}\n{s}", .{ name, args, input }) catch return error.NoMem;
-    defer gpa.free(combined);
+fn stageInHashHex(gpa: Allocator, name: []const u8, argv: []const []const u8, input: []const u8) ![]const u8 {
+    // UNAMBIGUOUS framing (U2, replacing the old "{name}:{args}\n{input}"):
+    // name, NUL, argv tokens joined by the unit-separator \x1f, NUL, input.
+    // The old format let ("a:b", "") and ("a", "b") collide — impossible now:
+    // NUL terminates the name, \x1f cannot appear inside a token written by
+    // the DSL splitter or the manifest loader (both treat it as ordinary
+    // whitespace/bytes, but the join itself cannot reproduce a NUL).
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(gpa);
+    buf.appendSlice(gpa, name) catch return error.NoMem;
+    buf.append(gpa, 0) catch return error.NoMem;
+    for (argv, 0..) |tok, i| {
+        if (i > 0) buf.append(gpa, 0x1f) catch return error.NoMem;
+        buf.appendSlice(gpa, tok) catch return error.NoMem;
+    }
+    buf.append(gpa, 0) catch return error.NoMem;
+    buf.appendSlice(gpa, input) catch return error.NoMem;
     var hex: [65]u8 = undefined;
-    dh.sha256.sha256_hex(combined, &hex);
+    dh.sha256.sha256_hex(buf.items, &hex);
     return gpa.dupe(u8, hex[0..64]) catch error.NoMem;
 }
 
@@ -939,14 +1045,14 @@ pub fn run(
         const in_str = if (prev_hex) |ph|
             try hexToStr(gpa, ph)
         else if (st.shape_in.tag == .none)
-            try stageInHashHex(gpa, st.name, st.args, "")
+            try stageInHashHex(gpa, st.name, st.argv, "")
         else
-            try stageInHashHex(gpa, st.name, st.args, input_bytes);
+            try stageInHashHex(gpa, st.name, st.argv, input_bytes);
 
         records.append(gpa, .{
             .index = i,
             .name = st.name,
-            .args = st.args,
+            .argv = st.argv,
             .shape_out = shapeTagName(st.shape_out),
             .in_hash = in_str,
             .out_hash = out_str,
@@ -1000,7 +1106,7 @@ pub fn replay(
         // resetArena below would otherwise leave dangling pointers (N5).
         stages.append(gpa, .{
             .name = rec.name,
-            .args = rec.args,
+            .argv = rec.argv,
             .shape_in = .{ .tag = cmd.input.tag },
             .shape_out = .{ .tag = cmd.output.tag },
         }) catch return error.NoMem;
@@ -1189,8 +1295,8 @@ test "run materializes, dispatches, hashes and records a native pipeline" {
     // find:.  grep:a.txt  — native rows->lines pipeline, both resolve from the
     // production dispatch table.  bin_dir is null (all native).
     const stages = [_]Stage{
-        .{ .name = "find", .args = data_dir, .shape_in = .{ .tag = .single, .ty = null }, .shape_out = .{ .tag = .rows } },
-        .{ .name = "grep", .args = "a.txt", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+        .{ .name = "find", .argv = &.{data_dir}, .shape_in = .{ .tag = .single, .ty = null }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "grep", .argv = &.{"a.txt"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
     };
 
     const report = try run(&stages, "", fix.state, null, gpa, testing.io);
@@ -1229,8 +1335,8 @@ test "replay re-derives identical hashes; converge proves sort idempotence" {
     try writeTestFile(a_path, "x\ny\n");
 
     const stages = [_]Stage{
-        .{ .name = "find", .args = data_dir, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
-        .{ .name = "grep", .args = "x", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+        .{ .name = "find", .argv = &.{data_dir}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "grep", .argv = &.{"x"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
     };
     const report = try run(&stages, "", fix.state, null, gpa, testing.io);
     defer {
@@ -1263,8 +1369,8 @@ test "replay rejects a tampered manifest shape_out (ShapeMismatch)" {
     try writeTestFile(a_path, "x\ny\n");
 
     const stages = [_]Stage{
-        .{ .name = "find", .args = data_dir, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
-        .{ .name = "grep", .args = "x", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+        .{ .name = "find", .argv = &.{data_dir}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "grep", .argv = &.{"x"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
     };
     const report = try run(&stages, "", fix.state, null, gpa, testing.io);
     defer {
@@ -1283,7 +1389,7 @@ test "replay rejects a tampered manifest shape_out (ShapeMismatch)" {
         .{
             .index = report.stages[0].index,
             .name = report.stages[0].name,
-            .args = report.stages[0].args,
+            .argv = report.stages[0].argv,
             .shape_out = "bytes",
             .in_hash = report.stages[0].in_hash,
             .out_hash = report.stages[0].out_hash,
@@ -1291,7 +1397,7 @@ test "replay rejects a tampered manifest shape_out (ShapeMismatch)" {
         .{
             .index = report.stages[1].index,
             .name = report.stages[1].name,
-            .args = report.stages[1].args,
+            .argv = report.stages[1].argv,
             .shape_out = report.stages[1].shape_out,
             .in_hash = report.stages[1].in_hash,
             .out_hash = report.stages[1].out_hash,
@@ -1313,16 +1419,16 @@ test "native find on an unopenable root errors cleanly (no double-free)" {
     // find:/nonexistent` aborted with SIGABRT). The testing allocator detects
     // the double free, so simply reaching this error path is the assertion.
     const gpa = testing.allocator;
-    try testing.expectError(error.OpenRoot, nativeFind("/nonexistent-path-xyz", "", "", gpa));
+    try testing.expectError(error.OpenRoot, nativeFind(&(Stage{ .name = "find", .argv = &.{"/nonexistent-path-xyz"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }), "", "", gpa));
 }
 
 test "native find emits deterministic sorted JSONL rows" {
     const gpa = testing.allocator;
     // walk the current dir (deterministic within this run); just assert shape
     // and sortedness via a second identical call.
-    const out1 = try nativeFind("src", "", "", gpa);
+    const out1 = try nativeFind(&(Stage{ .name = "find", .argv = &.{"src"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }), "", "", gpa);
     defer gpa.free(out1);
-    const out2 = try nativeFind("src", "", "", gpa);
+    const out2 = try nativeFind(&(Stage{ .name = "find", .argv = &.{"src"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }), "", "", gpa);
     defer gpa.free(out2);
     try testing.expectEqualStrings(out1, out2);
     try testing.expect(out1.len > 0);
@@ -1351,27 +1457,27 @@ test "native grep extracts and regex-matches paths (DAFSA)" {
     // literal 'a/' — the v1 substring behavior and the regex agree here
     // (compat proof: existing pipelines' plain-literal patterns keep matching).
     {
-        const out = try nativeGrep("a/", enc, "", gpa);
+        const out = try nativeGrep(&(Stage{ .name = "grep", .argv = &.{"a/"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } }), enc, "", gpa);
         defer gpa.free(out);
         try testing.expectEqualStrings("/a/b\n", out);
     }
     // '.' is a metachar now, not a literal dot: 'a.b' matches /a/b (the '/'
     // fills the dot) and /axb — under v1 substring rules it matched NOTHING.
     {
-        const out = try nativeGrep("a.b", enc, "", gpa);
+        const out = try nativeGrep(&(Stage{ .name = "grep", .argv = &.{"a.b"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } }), enc, "", gpa);
         defer gpa.free(out);
         try testing.expectEqualStrings("/a/b\n/axb\n", out);
     }
     // alternation + grouping, output in input row order.
     {
-        const out = try nativeGrep("a(x|zz)b", enc, "", gpa);
+        const out = try nativeGrep(&(Stage{ .name = "grep", .argv = &.{"a(x|zz)b"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } }), enc, "", gpa);
         defer gpa.free(out);
         try testing.expectEqualStrings("/axb\n/azzb\n", out);
     }
     // a pattern that fails to compile / an empty pattern are stage errors,
     // not silent matches (mirrors fx-grep).
-    try testing.expectError(error.BadPattern, nativeGrep("[unclosed", enc, "", gpa));
-    try testing.expectError(error.EmptyPattern, nativeGrep("", enc, "", gpa));
+    try testing.expectError(error.BadPattern, nativeGrep(&(Stage{ .name = "grep", .argv = &.{"[unclosed"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } }), enc, "", gpa));
+    try testing.expectError(error.EmptyPattern, nativeGrep(&(Stage{ .name = "grep", .argv = &.{}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } }), enc, "", gpa));
 }
 
 test "wc filename-strip: first three tokens only, canonical single JSON" {
@@ -1400,7 +1506,7 @@ test "native find skips its own state dir subtree (S3)" {
     try writeTestFile(a_path, "hi\n");
 
     // walk the PARENT of the state dir, passing the state dir so it is skipped.
-    const out = try nativeFind(fix.tmp, "", fix.state, gpa);
+    const out = try nativeFind(&(Stage{ .name = "find", .argv = &.{fix.tmp}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }), "", fix.state, gpa);
     defer gpa.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "data") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"path\":\"fx\"") == null);
@@ -1430,7 +1536,7 @@ test "exec dispatch: output round-trips; non-zero exit is StageFailed (S5)" {
     _ = std.c.chmod(sort_path.ptr, 0o755);
 
     // happy path: the cat stage's output is captured from the child
-    const cat_stage = [_]Stage{.{ .name = "cat", .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .bytes } }};
+    const cat_stage = [_]Stage{.{ .name = "cat", .argv = &.{}, .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .bytes } }};
     const rep = try run(&cat_stage, "ignored-input", fix.state, bin_dir, gpa, testing.io);
     defer {
         for (rep.stages) |s| {
@@ -1447,7 +1553,7 @@ test "exec dispatch: output round-trips; non-zero exit is StageFailed (S5)" {
 
     // error path: a child that ran and exited non-zero is StageFailed, NOT
     // UnknownCommand (S5).
-    const sort_stage = [_]Stage{.{ .name = "sort", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+    const sort_stage = [_]Stage{.{ .name = "sort", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
     try testing.expectError(error.StageFailed, run(&sort_stage, "x\ny\n", fix.state, bin_dir, gpa, testing.io));
 }
 
@@ -1480,7 +1586,7 @@ test "exec dispatch: nl/expand flag argv + file-operand round-trip (hermetic fak
 
     const input = "one\ntwo\n";
     {
-        const stages = [_]Stage{.{ .name = "nl", .args = "a", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "nl", .argv = &.{"a"}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1488,7 +1594,7 @@ test "exec dispatch: nl/expand flag argv + file-operand round-trip (hermetic fak
         try testing.expectEqualStrings("nl:-b:a\none\ntwo\n", out);
     }
     {
-        const stages = [_]Stage{.{ .name = "nl", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "nl", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1496,7 +1602,7 @@ test "exec dispatch: nl/expand flag argv + file-operand round-trip (hermetic fak
         try testing.expectEqualStrings("nl:1\none\ntwo\n", out);
     }
     {
-        const stages = [_]Stage{.{ .name = "expand", .args = "4", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "expand", .argv = &.{"4"}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1504,7 +1610,7 @@ test "exec dispatch: nl/expand flag argv + file-operand round-trip (hermetic fak
         try testing.expectEqualStrings("expand:-t:4\none\ntwo\n", out);
     }
     {
-        const stages = [_]Stage{.{ .name = "expand", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "expand", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1566,7 +1672,7 @@ test "exec dispatch: md5sum/sha1sum/sum strip the CAS filename token (hermetic f
         .{ .name = "sum", .want = "{\"checksum\":123,\"blocks\":4}\n" },
     };
     for (cases) |c| {
-        const stages = [_]Stage{.{ .name = c.name, .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = c.name, .argv = &.{}, .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
         const rep = try run(&stages, "payload", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1595,7 +1701,7 @@ test "exec dispatch: cksum/sha256sum strip the CAS filename token (hermetic fake
     try writeFakeBin(bin_dir, "sha256sum", "#!/bin/sh\necho \"abc  $1\"\n");
 
     {
-        const stages = [_]Stage{.{ .name = "cksum", .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "cksum", .argv = &.{}, .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
         const rep = try run(&stages, "payload", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1603,7 +1709,7 @@ test "exec dispatch: cksum/sha256sum strip the CAS filename token (hermetic fake
         try testing.expectEqualStrings("{\"sum\":123,\"bytes\":45}\n", out);
     }
     {
-        const stages = [_]Stage{.{ .name = "sha256sum", .args = "", .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "sha256sum", .argv = &.{}, .shape_in = .{ .tag = .bytes }, .shape_out = .{ .tag = .single } }};
         const rep = try run(&stages, "payload", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1623,8 +1729,9 @@ test "exec dispatch: ls/du are --rows operand stages; du|>grep composes (hermeti
     }
 
     // fakes fold $#/$1/$2 into the emitted wire row so the test pins the argv
-    // EXACTLY: [--rows, <root>] when args is set, [--rows] when not — and
-    // never a CAS file operand (a 3rd arg changes the folded count).
+    // EXACTLY: [<root>, --rows] when args is set, [--rows] when not — and
+    // never a CAS file operand (a 3rd arg changes the folded count).  U2: the
+    // user tokens ride FIRST, the engine-appended --rows LAST.
     var binbuf: [std.posix.PATH_MAX]u8 = undefined;
     const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
     _ = mkdir(bin_dir.ptr, 0o755);
@@ -1643,22 +1750,22 @@ test "exec dispatch: ls/du are --rows operand stages; du|>grep composes (hermeti
     // NATIVE DAFSA grep (character class), end to end.  The pipeline input is
     // ignored by the operand stage: it appears in no output.
     const stages = [_]Stage{
-        .{ .name = "du", .args = "/root", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
-        .{ .name = "grep", .args = "du:[0-9]", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+        .{ .name = "du", .argv = &.{"/root"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "grep", .argv = &.{"du:[0-9]"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
     };
     const rep = try run(&stages, "GARBAGE-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
     defer freeRunReport(gpa, &rep);
     const du_out = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
     defer gpa.free(du_out);
-    try testing.expectEqualStrings("{\"path\":\"du:2:--rows:/root\",\"bytes\":7}\n", du_out);
+    try testing.expectEqualStrings("{\"path\":\"du:2:/root:--rows\",\"bytes\":7}\n", du_out);
     const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
     defer gpa.free(final);
-    try testing.expectEqualStrings("du:2:--rows:/root\n", final);
+    try testing.expectEqualStrings("du:2:/root:--rows\n", final);
 
     // ls with NO args: argv is just [--rows] (the root defaults inside the
     // child, exactly like find with empty args).
     {
-        const ls_stages = [_]Stage{.{ .name = "ls", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
+        const ls_stages = [_]Stage{.{ .name = "ls", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
         const lrep = try run(&ls_stages, "ignored", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &lrep);
         const out = try caslog.casGet(gpa, fix.state, lrep.final_hash);
@@ -1711,31 +1818,31 @@ test "exec dispatch: tree/df/ps/top --rows argv pin (hermetic fakes)" {
     // ignored by the operand stage: it appears in no output.
     {
         const stages = [_]Stage{
-            .{ .name = "tree", .args = "/root", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
-            .{ .name = "grep", .args = "tree:[0-9]+", .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "tree", .argv = &.{"/root"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+            .{ .name = "grep", .argv = &.{"tree:[0-9]+"}, .shape_in = .{ .tag = .rows }, .shape_out = .{ .tag = .lines } },
         };
         const rep = try run(&stages, "GARBAGE-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const tree_out = try caslog.casGet(gpa, fix.state, rep.stages[0].out_hash);
         defer gpa.free(tree_out);
-        try testing.expectEqualStrings("{\"path\":\"tree:2:--rows:/root\",\"kind\":\"Dir\",\"size\":1,\"mtime\":2}\n", tree_out);
+        try testing.expectEqualStrings("{\"path\":\"tree:2:/root:--rows\",\"kind\":\"Dir\",\"size\":1,\"mtime\":2}\n", tree_out);
         const final = try caslog.casGet(gpa, fix.state, rep.final_hash);
         defer gpa.free(final);
-        try testing.expectEqualStrings("tree:2:--rows:/root\n", final);
+        try testing.expectEqualStrings("tree:2:/root:--rows\n", final);
     }
 
     // df: alone (operand stage): [--rows, /] — and empty args -> [--rows]
     // (the all-mounts default lives in the child).
     {
-        const stages = [_]Stage{.{ .name = "df", .args = "/", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
+        const stages = [_]Stage{.{ .name = "df", .argv = &.{"/"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
         const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
         defer gpa.free(out);
-        try testing.expectEqualStrings("{\"fs\":\"df:2:--rows:/\",\"mount\":\"/\",\"total_kb\":8,\"used_kb\":4,\"avail_kb\":4}\n", out);
+        try testing.expectEqualStrings("{\"fs\":\"df:2:/:--rows\",\"mount\":\"/\",\"total_kb\":8,\"used_kb\":4,\"avail_kb\":4}\n", out);
     }
     {
-        const stages = [_]Stage{.{ .name = "df", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
+        const stages = [_]Stage{.{ .name = "df", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } }};
         const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1743,9 +1850,10 @@ test "exec dispatch: tree/df/ps/top --rows argv pin (hermetic fakes)" {
         try testing.expectEqualStrings("{\"fs\":\"df:1:--rows:\",\"mount\":\"/\",\"total_kb\":8,\"used_kb\":4,\"avail_kb\":4}\n", out);
     }
 
-    // ps (generator): bare -> [--rows]; with flags -> [--rows, -m]
+    // ps (generator): bare -> [--rows]; with flags -> [-m, --rows] (U2:
+    // user tokens first, engine-appended --rows last)
     {
-        const stages = [_]Stage{.{ .name = "ps", .args = "", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
+        const stages = [_]Stage{.{ .name = "ps", .argv = &.{}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
         const rep = try run(&stages, "GARBAGE-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1753,23 +1861,24 @@ test "exec dispatch: tree/df/ps/top --rows argv pin (hermetic fakes)" {
         try testing.expectEqualStrings("{\"pid\":1,\"state\":\"ps:--rows:\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
     }
     {
-        const stages = [_]Stage{.{ .name = "ps", .args = "-m", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
+        const stages = [_]Stage{.{ .name = "ps", .argv = &.{"-m"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
         const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
         defer gpa.free(out);
-        try testing.expectEqualStrings("{\"pid\":2,\"state\":\"ps:--rows:-m\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
+        try testing.expectEqualStrings("{\"pid\":2,\"state\":\"ps:-m:--rows\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
     }
 
-    // top:-n 10 (generator): the args MUST split into two tokens — the fake
-    // folds $3 so a verbatim single "-n 10" arg ($2 == "-n 10", no $3) fails.
+    // top:-n 10 (generator): TWO tokens (the frontend split them) — the
+    // fake folds $3 so a verbatim single "-n 10" token would fail; --rows
+    // rides last ($3).
     {
-        const stages = [_]Stage{.{ .name = "top", .args = "-n 10", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
+        const stages = [_]Stage{.{ .name = "top", .argv = &.{"-n", "10"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } }};
         const rep = try run(&stages, "ignored", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
         defer gpa.free(out);
-        try testing.expectEqualStrings("{\"pid\":3,\"state\":\"top:--rows:-n:10\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
+        try testing.expectEqualStrings("{\"pid\":3,\"state\":\"top:-n:10:--rows\",\"ppid\":1,\"cpu\":2,\"rss_kb\":3,\"comm\":\"init\"}\n", out);
     }
 }
 
@@ -1794,7 +1903,7 @@ test "exec dispatch: basename text-operand argv pin (hermetic fakes)" {
     const input = try wire.encodeSingleText(gpa, "IN");
     defer gpa.free(input);
     {
-        const stages = [_]Stage{.{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "basename", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1803,7 +1912,7 @@ test "exec dispatch: basename text-operand argv pin (hermetic fakes)" {
     }
     {
         // stage args ride as the SUFFIX operand (fx-basename NAME [SUFFIX])
-        const stages = [_]Stage{.{ .name = "basename", .args = ".txt", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "basename", .argv = &.{".txt"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         const rep = try run(&stages, input, fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1831,8 +1940,8 @@ test "exec dispatch: basename |> dirname single-Text chain + replay (hermetic fa
     // the bare-Text wire VALUE must flow stage-to-stage: basename receives the
     // decoded initial value, dirname receives basename's re-encoded output.
     const stages = [_]Stage{
-        .{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } },
-        .{ .name = "dirname", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } },
+        .{ .name = "basename", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } },
+        .{ .name = "dirname", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } },
     };
     const input = try wire.encodeSingleText(gpa, "/a/b/c.txt");
     defer gpa.free(input);
@@ -1861,30 +1970,34 @@ test "exec dispatch: echo/seq generator argv pin (hermetic fakes)" {
     }
 
     // the fakes fold $#/$1/$2/$3 into ONE emitted line so the test pins argv
-    // EXACTLY: echo passes its whole stage args as ONE verbatim operand
-    // (empty -> argv [bin]); seq whitespace-splits into integer operands
-    // unless the args start with '{' (the fx-seq Dhall-record form rides
-    // verbatim).  The ambient initial input must never appear.
+    // EXACTLY: echo passes its user tokens as verbatim operands (fx-echo
+    // joins them with single spaces, so two tokens still PRINT as "hello
+    // world"); seq takes integer operands unless the first token starts '{'
+    // (the fx-seq Dhall-record form, ONE token — quoted in the shell/DSL).
+    // The ambient initial input must never appear.
     var binbuf: [std.posix.PATH_MAX]u8 = undefined;
     const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
     _ = mkdir(bin_dir.ptr, 0o755);
     try writeFakeBin(bin_dir, "echo", "#!/bin/sh\necho \"e:$#:$1:$2\"\n");
     try writeFakeBin(bin_dir, "seq", "#!/bin/sh\necho \"s:$#:$1:$2:$3\"\n");
 
-    const cases = [_]struct { name: []const u8, args: []const u8, want: []const u8 }{
+    const cases = [_]struct { name: []const u8, argv: []const []const u8, want: []const u8 }{
         // [fx-echo] — no operand (the real fx-echo emits the bare newline)
-        .{ .name = "echo", .args = "", .want = "e:0::\n" },
-        // [fx-echo, "hello world"] — ONE verbatim operand, spaces included
-        .{ .name = "echo", .args = "hello world", .want = "e:1:hello world:\n" },
+        .{ .name = "echo", .argv = &.{}, .want = "e:0::\n" },
+        // [fx-echo, "hello", "world"] — two verbatim operands
+        .{ .name = "echo", .argv = &.{ "hello", "world" }, .want = "e:2:hello:world\n" },
+        // [fx-echo, "hello world"] — ONE quoted operand, space preserved
+        // (the single-verbatim-operand semantics the tokenizer must keep)
+        .{ .name = "echo", .argv = &.{"hello world"}, .want = "e:1:hello world:\n" },
         // [fx-seq, 5]
-        .{ .name = "seq", .args = "5", .want = "s:1:5::\n" },
-        // [fx-seq, 1, 2, 9] — whitespace-split into three integer operands
-        .{ .name = "seq", .args = "1 2 9", .want = "s:3:1:2:9\n" },
+        .{ .name = "seq", .argv = &.{"5"}, .want = "s:1:5::\n" },
+        // [fx-seq, 1, 2, 9] — three integer operands
+        .{ .name = "seq", .argv = &.{ "1", "2", "9" }, .want = "s:3:1:2:9\n" },
         // [fx-seq, "{last = 5, first = 1, increment = 2}"] — verbatim record
-        .{ .name = "seq", .args = "{last = 5, first = 1, increment = 2}", .want = "s:1:{last = 5, first = 1, increment = 2}::\n" },
+        .{ .name = "seq", .argv = &.{"{last = 5, first = 1, increment = 2}"}, .want = "s:1:{last = 5, first = 1, increment = 2}::\n" },
     };
     for (cases) |c| {
-        const stages = [_]Stage{.{ .name = c.name, .args = c.args, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = c.name, .argv = c.argv, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
         const rep = try run(&stages, "AMBIENT-INPUT-IGNORED", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -1895,15 +2008,15 @@ test "exec dispatch: echo/seq generator argv pin (hermetic fakes)" {
     // a source with nothing to generate fails loudly (no invented default),
     // and so do 4 operands / a non-integer operand — engine-side, pre-spawn
     {
-        const stages = [_]Stage{.{ .name = "seq", .args = "", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "seq", .argv = &.{}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
         try testing.expectError(error.StageFailed, run(&stages, "", fix.state, bin_dir, gpa, testing.io));
     }
     {
-        const stages = [_]Stage{.{ .name = "seq", .args = "1 2 3 4", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "seq", .argv = &.{"1", "2", "3", "4"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
         try testing.expectError(error.StageFailed, run(&stages, "", fix.state, bin_dir, gpa, testing.io));
     }
     {
-        const stages = [_]Stage{.{ .name = "seq", .args = "x", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "seq", .argv = &.{"x"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } }};
         try testing.expectError(error.StageFailed, run(&stages, "", fix.state, bin_dir, gpa, testing.io));
     }
 }
@@ -1940,11 +2053,12 @@ test "exec dispatch: echo |> wc end-to-end + seq |> head replay (hermetic fakes)
 
     // echo |> wc — the generator's lines ride the CAS file operand into wc
     // END TO END, and wc's filename token is stripped into the canonical
-    // declared single { lines, words, bytes }.
+    // declared single { lines, words, bytes }.  (ONE quoted token: the DSL
+    // "echo:hello world" form keeps a single operand with its space.)
     {
         const stages = [_]Stage{
-            .{ .name = "echo", .args = "hello world", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
-            .{ .name = "wc", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .single } },
+            .{ .name = "echo", .argv = &.{"hello world"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "wc", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .single } },
         };
         const rep = try run(&stages, "", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
@@ -1962,8 +2076,8 @@ test "exec dispatch: echo |> wc end-to-end + seq |> head replay (hermetic fakes)
     // stage hashes, because the source reads name+args only).
     {
         const stages = [_]Stage{
-            .{ .name = "seq", .args = "5", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
-            .{ .name = "head", .args = "3", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "seq", .argv = &.{"5"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "head", .argv = &.{"3"}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
         };
         const rep = try run(&stages, "AMBIENT", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
@@ -2027,7 +2141,7 @@ test "exec dispatch: paste/comm two-file argv pin (hermetic fakes)" {
             try std.fmt.allocPrint(gpa, "c:2\nq2:{s}/b.txt\na\nb\n", .{fix.tmp});
         defer gpa.free(want);
 
-        const stages = [_]Stage{.{ .name = name, .args = path2, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = name, .argv = &.{path2}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         const rep = try run(&stages, "a\nb\n", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
         const out = try caslog.casGet(gpa, fix.state, rep.final_hash);
@@ -2037,11 +2151,11 @@ test "exec dispatch: paste/comm two-file argv pin (hermetic fakes)" {
 
     // the second operand is not optional: empty args fail loudly pre-spawn
     {
-        const stages = [_]Stage{.{ .name = "paste", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "paste", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         try testing.expectError(error.StageFailed, run(&stages, "a\nb\n", fix.state, bin_dir, gpa, testing.io));
     }
     {
-        const stages = [_]Stage{.{ .name = "comm", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+        const stages = [_]Stage{.{ .name = "comm", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
         try testing.expectError(error.StageFailed, run(&stages, "a\nb\n", fix.state, bin_dir, gpa, testing.io));
     }
 }
@@ -2081,9 +2195,9 @@ test "exec dispatch: seq |> paste |> head end-to-end + replay (hermetic fakes)" 
 
     {
         const stages = [_]Stage{
-            .{ .name = "seq", .args = "3", .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
-            .{ .name = "paste", .args = path2, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
-            .{ .name = "head", .args = "1", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "seq", .argv = &.{"3"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "paste", .argv = &.{path2}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
+            .{ .name = "head", .argv = &.{"1"}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } },
         };
         const rep = try run(&stages, "", fix.state, bin_dir, gpa, testing.io);
         defer freeRunReport(gpa, &rep);
@@ -2131,37 +2245,37 @@ test "exec dispatch: text-operand stage errors are StageFailed (hermetic)" {
 
     // record-single input (the old wire form, not the bare-Text value)
     {
-        const stages = [_]Stage{.{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "basename", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         try testing.expectError(error.StageFailed, run(&stages, "{\"path\":\"/a\"}\n", fix.state, bin_dir, gpa, testing.io));
     }
     // NUL byte in the text value — execve argv cannot carry it
     {
         const input = try wire.encodeSingleText(gpa, "a\x00b");
         defer gpa.free(input);
-        const stages = [_]Stage{.{ .name = "basename", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "basename", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
     }
     // dirname with stage args — the extra operand would emit multiple lines
     {
         const input = try wire.encodeSingleText(gpa, "/a/b");
         defer gpa.free(input);
-        const stages = [_]Stage{.{ .name = "dirname", .args = "x", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "dirname", .argv = &.{"x"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
     }
     // a child emitting TWO lines
     {
         const input = try wire.encodeSingleText(gpa, "/a/b");
         defer gpa.free(input);
-        const stages = [_]Stage{.{ .name = "realpath", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
+        const stages = [_]Stage{.{ .name = "realpath", .argv = &.{}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
     }
 }
 
 test "exec dispatch: sort:-r and sort hash DIFFERENTLY (args reach the child)" {
     // U1 regression: the old per-binary mem.eql chain had NO arm for sort, so
-    // execDispatch appended ONLY the CAS blob path and silently DROPPED
-    // stage.args — `fx-compose 'sort:-r' --input F` recorded "args":"-r" in
-    // the manifest but produced the SAME final hash as 'sort'.  A
+    // execDispatch appended ONLY the CAS blob path and silently DROPPED the
+    // stage's user argv — `fx-compose 'sort:-r' --input F` recorded
+    // "args":"-r" in the manifest but produced the SAME final hash as 'sort'.  A
     // reverse-sorting fake makes the two pipelines' final hashes differ iff
     // "-r" actually rides in argv.
     const gpa = testing.allocator;
@@ -2185,8 +2299,8 @@ test "exec dispatch: sort:-r and sort hash DIFFERENTLY (args reach the child)" {
     );
 
     const input = "1\n2\n3\n";
-    const plain = [_]Stage{.{ .name = "sort", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
-    const rev = [_]Stage{.{ .name = "sort", .args = "-r", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+    const plain = [_]Stage{.{ .name = "sort", .argv = &.{}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+    const rev = [_]Stage{.{ .name = "sort", .argv = &.{"-r"}, .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
 
     const rep = try run(&plain, input, fix.state, bin_dir, gpa, testing.io);
     defer freeRunReport(gpa, &rep);
@@ -2197,6 +2311,35 @@ test "exec dispatch: sort:-r and sort hash DIFFERENTLY (args reach the child)" {
     const out = try caslog.casGet(gpa, fix.state, rep_rev.final_hash);
     defer gpa.free(out);
     try testing.expectEqualStrings("3\n2\n1\n", out);
+}
+
+test "exec dispatch: a user-supplied --rows is a LOUD error (no doubling)" {
+    // the engine appends --rows itself for ls/du/tree/df/ps/top; a user
+    // --rows in the stage argv would double it into silent nonsense, so the
+    // engine rejects it BEFORE the spawn.
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    try writeFakeBin(bin_dir, "ls", "#!/bin/sh\necho unreachable\n");
+    try writeFakeBin(bin_dir, "top", "#!/bin/sh\necho unreachable\n");
+
+    const cases = [_]Stage{
+        .{ .name = "ls", .argv = &.{"--rows"}, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "ls", .argv = &.{ ".", "--rows" }, .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .rows } },
+        .{ .name = "top", .argv = &.{"--rows"}, .shape_in = .{ .tag = .none }, .shape_out = .{ .tag = .rows } },
+    };
+    for (cases) |st| {
+        const one = [_]Stage{st};
+        try testing.expectError(error.StageFailed, run(&one, "ignored", fix.state, bin_dir, gpa, testing.io));
+    }
 }
 
 test "fx-stages name set == dispatch-table name set (drift pin)" {
