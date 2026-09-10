@@ -156,7 +156,10 @@ view model =
                         Styled.p [ css [ errorS ] ] [ Styled.text ("could not read commands.json: " ++ err) ]
 
                     Nothing ->
-                        Styled.div [] (List.map commandSection model.commands)
+                        Styled.div []
+                            [ tableOfContents model.commands
+                            , Styled.div [] (List.map commandSection model.commands)
+                            ]
                 ]
             , footer
             ]
@@ -179,6 +182,21 @@ header =
             , Styled.text " for the design."
             ]
         ]
+
+
+{-| A compact index of every command, so a reader can jump (anchors are the
+command names, set on each section).
+-}
+tableOfContents : List Command -> Html msg
+tableOfContents commands =
+    Styled.nav [ css [ tocS ] ]
+        (Styled.span [ css [ tocHeadS ] ] [ Styled.text "Commands" ]
+            :: List.map
+                (\c -> Styled.a [ href ("#" ++ c.name), css [ tocLinkS ] ]
+                    [ Styled.text c.name ]
+                )
+                commands
+        )
 
 
 commandSection : Command -> Html msg
@@ -220,7 +238,7 @@ argRow arg =
     Styled.tr []
         [ Styled.td [ css [ tdS, fieldS ] ] [ Styled.code [] [ Styled.text arg.field ] ]
         , Styled.td [ css [ tdS, typeS ] ] [ Styled.code [] [ Styled.text arg.type_ ] ]
-        , Styled.td [ css [ tdS, defaultS ] ] [ Styled.code [] [ Styled.text arg.default ] ]
+        , Styled.td [ css [ tdS, defaultS ] ] [ Styled.code [] [ Styled.text (displayDefault arg.default) ] ]
         , Styled.td [ css [ tdS ] ]
             [ case ( arg.flags, arg.positional ) of
                 ( [], Just p ) ->
@@ -235,7 +253,7 @@ argRow arg =
                         ]
 
                 ( [], Nothing ) ->
-                    Styled.span [ css [ noneS ] ] [ Styled.text "config only" ]
+                    Styled.span [ css [ noneS ] ] [ Styled.text "—" ]
 
                 ( flags, _ ) ->
                     Styled.span [] (List.indexedMap (flagSpan arg) flags)
@@ -273,6 +291,22 @@ valuePlaceholder type_ =
 
     else
         "TEXT"
+
+
+{-| The default, as a reader wants to see it. The Dhall source spells an empty
+list `[] : List Text` and an absent optional `None Text`; the type column
+already carries the type, so strip the annotation here.
+-}
+displayDefault : String -> String
+displayDefault d =
+    if String.startsWith "[] :" d then
+        "[]"
+
+    else if String.startsWith "None " d then
+        "None"
+
+    else
+        d
 
 
 flagTokens : Flag -> String
@@ -328,6 +362,37 @@ introS =
 errorS : Css.Style
 errorS =
     Css.batch [ Css.color (Css.hex "ff7b72"), Css.fontFamilies Style.fontMono ]
+
+
+tocS : Css.Style
+tocS =
+    Css.batch
+        [ Css.displayFlex
+        , Css.flexWrap Css.wrap
+        , Css.property "gap" "6px 14px"
+        , Css.padding3 (Css.px 16) (Css.px 18) (Css.px 16)
+        , Css.border3 (Css.px 1) Css.solid Style.line
+        , Css.borderRadius (Css.px 8)
+        , Css.backgroundColor Style.bg2
+        , Css.marginBottom (Css.px 24)
+        , Css.fontSize (Css.px 12)
+        ]
+
+
+tocHeadS : Css.Style
+tocHeadS =
+    Css.batch
+        [ Css.fontFamilies Style.fontMono
+        , Css.color Style.dim
+        , Css.width (Css.pct 100)
+        , Css.marginBottom (Css.px 4)
+        , Css.fontSize (Css.px 11)
+        ]
+
+
+tocLinkS : Css.Style
+tocLinkS =
+    Css.batch [ Css.fontFamilies Style.fontMono, Css.color Style.accent2 ]
 
 
 cmdS : Css.Style
