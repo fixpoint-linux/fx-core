@@ -1,0 +1,105 @@
+# Deploy the fx-core command reference to fixpointlinux.org/fx-core (node-infra)
+# on push.
+#
+# The site is an Elm app (site/Main.elm) rendered against the shared Fixpoint.*
+# design package (`design` submodule) and, like the other component sites, is a
+# multi-route @mfe app: shell routes + one pre-rendered page per command. Its
+# content is generated from the Dhall schemas (`zig build docs` -> commands.json),
+# so the pages cannot drift from the CLI.
+#
+# The workflow builds it, assembles a deploy tarball from dist/, and ships it over
+# restricted SSH to node-infra's fx-core-receive forced command (stages + promotes
+# to /srv/www/fx-core, served by Caddy on fixpointlinux.org/fx-core).
+name: Deploy fx-core docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-fx-core
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # site/Main.elm imports the Fixpoint.* design package from the `design`
+          # submodule, and the build is driven by the `dhake` submodule; the MFE
+          # shell needs `mfe-framework`. (mfe-framework in turn carries `dhake`
+          # and `dhall-c`, so recurse.)
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Zig
+        # `zig build docs` regenerates docs/commands.json from the Dhall
+        # schemas; it is part of the site build (see Dhakefile.dhall), so the
+        # pinned Zig toolchain must be present. Installed from the official
+        # tarball rather than a third-party action.
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          curl -fsSL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p /opt/zig
+          tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          /opt/zig/zig version
+
+      - name: Fetch the dhall-c sibling
+        # fx-core's build imports the dhall typechecker from ../dhall-c (a
+        # sibling checkout, not a submodule — the Zig modules are referenced
+        # by relative path). Only the source is needed: the docs generator
+        # imports zig/src/dhall_mod.zig and does not link libdatalog.
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/fixpoint-linux/dhall-c.git \
+            "${{ github.workspace }}/../dhall-c"
+
+      - name: "Build the docs site (dhake: elm + MFE vendor + SSG)"
+        # dhake drives the whole chain (see Dhakefile.dhall): zig build docs ->
+        # gen-shell -> copy-mfe -> elm make -> ssg. `npm ci` provides the tooling
+        # dhake shells out to (elm, happy-dom, tsc in the mfe-framework submodule).
+        run: |
+          npm ci
+          ./vendor/dhake/dhake.com
+
+      - name: Assemble deploy bundle
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/fxcorepkg
+          mkdir -p /tmp/fxcorepkg/site
+          cp -r dist/. /tmp/fxcorepkg/site/
+          tar -czf /tmp/fxcorepkg/fx-core.tar.gz -C /tmp/fxcorepkg site
+          ls -la /tmp/fxcorepkg/fx-core.tar.gz
+
+      - name: Deploy via restricted SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          echo "$DEPLOY_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+          cat /tmp/fxcorepkg/fx-core.tar.gz | ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" 'cat > /dev/null'
