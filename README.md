@@ -10,6 +10,9 @@ by construction, and content-addressed so a command can show its own derivation.
 See [`concept.md`](./concept.md) for the full design (the three lenses: state as
 relations, the two timelines, and commands as typed Dhall expressions).
 
+📖 **Command reference: <https://fixpointlinux.org/fx-core/>** — one page per
+command, generated from the Dhall schemas (see [Docs site](#docs-site) below).
+
 ---
 
 ## The idea in one example
@@ -96,6 +99,45 @@ src/fx-wire.zig               canonical wire encoding (rows)
 
 Engine modules (`fx-cli`, `fx-pipeline`, `fx-eval`, `fx-wire`, `fx-caslog`,
 `fx-log`, `fx-undo`, `fx-compose`) are libraries; the rest are commands.
+
+## Docs site
+
+The command reference at **<https://fixpointlinux.org/fx-core/>** is also
+generated — there is no hand-written page content, so it cannot drift from the
+CLI. It is deployed alongside the other fixpoint-linux component sites and linked
+from the main site's components menu.
+
+```
+schemas/<name>.dhall              the single source of truth per command
+      │  zig build docs
+      ▼
+docs/commands.json                name, doc, usage, args {field,type,default,flags}…
+      │  node scripts/gen-shell.mjs
+      ├──────────────────────────► shell/pages.js + shell/templates/<slot>.html
+      │                             (the route table — one route per command)
+      │  node scripts/copy-mfe.mjs
+      ├──────────────────────────► vendor/@mfe/  (the built @mfe framework)
+      ▼
+site/Main.elm ── elm make ──► dist/elm.js
+      │  node scripts/ssg.mjs
+      ▼
+dist/index.html + dist/<name>/index.html   (pre-rendered static pages)
+```
+
+The pages are an MFE (@mfe/framework) app: each route renders into its own
+`data-mfe` slot, all served by a single module (`shell/mfe/fx-core-page.js`) and
+a single Elm bundle. Client-side navigation swaps the slot without a reload (the
+router falls back to a full page load when a route is not registered). Every page
+is pre-rendered to static HTML, so it works with JavaScript disabled.
+
+```sh
+./vendor/dhake/dhake.com          # build the whole site into dist/
+```
+
+`docs/commands.json`, `shell/pages.js` and `shell/templates/` are generated and
+committed (deterministic); `dist/`, `node_modules/` and `vendor/@mfe/` are not.
+Requires the `vendor/design`, `vendor/dhake` and `vendor/mfe-framework`
+submodules, and node + npm for the Elm toolchain (`npm ci`).
 
 ## Build & test
 
