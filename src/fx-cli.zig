@@ -120,12 +120,18 @@ pub const Schema = struct {
     ty: *TypeExpr,
     dflt: Value,
     posix: Posix,
+    /// OPTIONAL one-line command description (schemas' `doc = Some "..."`
+    /// section; null when the schema predates it — never required).  The
+    /// docs-data generator (src/tools/fx-clidocs.zig) reads it; the parser
+    /// generator ignores it.
+    doc: ?[]const u8 = null,
 
     pub fn deinit(self: *Schema, gpa: Allocator) void {
         self.ty.deinit(gpa);
         gpa.destroy(self.ty);
         valueDeinit(&self.dflt, gpa);
         posixDeinit(&self.posix, gpa);
+        if (self.doc) |d| gpa.free(d);
     }
 };
 
@@ -640,6 +646,44 @@ fn copyPosix(gpa: Allocator, t: *dhall.Term) Error!Posix {
 // schema evaluation: source -> gpa-owned { ty, dflt, posix } view
 // ---------------------------------------------------------------------------
 
+/// The command's display name in usage(): fx-<name> (a name that already
+/// starts with "fx-" stays verbatim).  ALWAYS gpa-owned so callers can free
+/// unconditionally.  Shared by the parser generator (fx-clijson) and the
+/// docs-data generator (fx-clidocs) so both render the same name.
+pub fn displayName(gpa: Allocator, name: []const u8) Error![]const u8 {
+    if (std.mem.startsWith(u8, name, "fx-"))
+        return gpa.dupe(u8, name) catch return error.OutOfMemory;
+    return std.fmt.allocPrint(gpa, "fx-{s}", .{name}) catch return error.OutOfMemory;
+}
+
+/// The usage line the generated parser's usage() returns, WITHOUT the
+/// trailing newline: "usage: fx-ls [OPTIONS] [PATH]".  This is the single
+/// source for that string — fx-clijson embeds it in the emitted usage()
+/// (byte-for-byte by construction) and fx-clidocs puts it in the JSON
+/// dataset — so the docs can never drift from the binaries.
+pub fn usageLine(gpa: Allocator, name: []const u8, s: *const Schema) Error![]const u8 {
+    const disp = try displayName(gpa, name);
+    defer gpa.free(disp);
+
+    var line = std.ArrayList(u8).empty;
+    errdefer line.deinit(gpa);
+    line.appendSlice(gpa, "usage: ") catch return error.OutOfMemory;
+    line.appendSlice(gpa, disp) catch return error.OutOfMemory;
+    if (s.posix.flags.len > 0) line.appendSlice(gpa, " [OPTIONS]") catch return error.OutOfMemory;
+    for (s.posix.positionals) |p| {
+        if (p.many) {
+            line.appendSlice(gpa, " [") catch return error.OutOfMemory;
+            line.appendSlice(gpa, p.display) catch return error.OutOfMemory;
+            line.appendSlice(gpa, "...]") catch return error.OutOfMemory;
+        } else {
+            line.appendSlice(gpa, " [") catch return error.OutOfMemory;
+            line.appendSlice(gpa, p.display) catch return error.OutOfMemory;
+            line.appendSlice(gpa, "]") catch return error.OutOfMemory;
+        }
+    }
+    return line.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
 /// Evaluate a schema source into the gpa-owned view.  One whole-arena
 /// transaction (see the header): reset, parse+typecheck+normalize, deep-copy
 /// the three sections out, reset again.
@@ -667,9 +711,16 @@ pub fn evalSchemaSrc(gpa: Allocator, src: [:0]const u8) Error!Schema {
     errdefer valueDeinit(&dflt, gpa);
     var posix = try copyPosix(gpa, posix_t);
     errdefer posixDeinit(&posix, gpa);
+    // doc : Optional Text — ABSENT (or None) means null.  Never required:
+    // the meta_* fixtures and any older schema must keep loading.
+    var doc: ?[]const u8 = null;
+    errdefer if (doc) |d| gpa.free(d);
+    if (recField(nf, "doc")) |doc_t| {
+        doc = try copyOptText(gpa, doc_t);
+    }
 
     arena.arena_reset(arena.dhall_arena.?);
-    return .{ .ty = ty, .dflt = dflt, .posix = posix };
+    return .{ .ty = ty, .dflt = dflt, .posix = posix, .doc = doc };
 }
 
 // ---------------------------------------------------------------------------

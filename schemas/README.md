@@ -9,6 +9,12 @@ user-override semantics) and `posix` (which flag binds which field and how).
 gen-cli-check` (part of `zig build test`) fails when a committed file is
 stale.
 
+`doc = Some "..."` (OPTIONAL, first field) carries a one-line user-facing
+description; `src/tools/fx-clidocs.zig` reads it for `docs/commands.json`
+(`zig build docs`), falling back to `fx-<name>` when absent.  The parser
+generator ignores it — a schema with or without `doc` emits the same
+parser.
+
 ## Validation rule
 
 NEVER validate schemas with the committed `dhall.com` APE binary — it is

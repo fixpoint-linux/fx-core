@@ -38,7 +38,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "change file mode bits, journaled through the derivation log"
+, ty =
     { mode : Text
     , paths : List Text
     }

@@ -36,7 +36,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print or check SHA-512 checksums"
+, ty =
     { binary : Bool
     , files : List Text
     }

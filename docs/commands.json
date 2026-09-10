@@ -1,0 +1,596 @@
+{
+"commands": [
+{
+  "name": "basename",
+  "doc": "strip directories and any suffix from file names",
+  "usage": "usage: fx-basename [OPTIONS] [NAME] [SUFFIX]",
+  "args": [
+    {"field": "all", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-a", "long": "--multiple", "kind": "Flag", "value": null } ]},
+    {"field": "input", "type": "Text", "default": "\"\"", "positional": { "display":"NAME", "many":false }, "flags": []},
+    {"field": "names", "type": "List Text", "default": "[] : List Text", "positional": null, "flags": []},
+    {"field": "suffix", "type": "Text", "default": "\"\"", "positional": { "display":"SUFFIX", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "cat",
+  "doc": "concatenate FILEs (or stdin) to stdout, bytes to bytes",
+  "usage": "usage: fx-cat [FILE...]",
+  "args": [
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "chgrp",
+  "doc": "change the group ownership of files (datalog-backed stat rows)",
+  "usage": "usage: fx-chgrp [GROUP] [FILE...]",
+  "args": [
+    {"field": "group", "type": "Text", "default": "\"\"", "positional": { "display":"GROUP", "many":false }, "flags": []},
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "chmod",
+  "doc": "change file mode bits, journaled through the derivation log",
+  "usage": "usage: fx-chmod [MODE] [FILE...]",
+  "args": [
+    {"field": "mode", "type": "Text", "default": "\"\"", "positional": { "display":"MODE", "many":false }, "flags": []},
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "chown",
+  "doc": "change the owner and/or group of files (datalog-backed stat rows)",
+  "usage": "usage: fx-chown [OWNER] [FILE...]",
+  "args": [
+    {"field": "owner", "type": "Text", "default": "\"\"", "positional": { "display":"OWNER", "many":false }, "flags": []},
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "cksum",
+  "doc": "print CRC checksum (POSIX) and byte count for each FILE",
+  "usage": "usage: fx-cksum [FILE...]",
+  "args": [
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "comm",
+  "doc": "compare two sorted files line by line (three-column output)",
+  "usage": "usage: fx-comm [OPTIONS] [FILE1] [FILE2]",
+  "args": [
+    {"field": "a", "type": "Text", "default": "\"\"", "positional": { "display":"FILE1", "many":false }, "flags": []},
+    {"field": "b", "type": "Text", "default": "\"\"", "positional": { "display":"FILE2", "many":false }, "flags": []},
+    {"field": "one", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-1", "long": "--suppress-1", "kind": "Flag", "value": null } ]},
+    {"field": "three", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-3", "long": "--suppress-3", "kind": "Flag", "value": null } ]},
+    {"field": "two", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-2", "long": "--suppress-2", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "cp",
+  "doc": "copy files, capturing originals to CAS before mutating",
+  "usage": "usage: fx-cp [SRC] [DST]",
+  "args": [
+    {"field": "dst", "type": "Text", "default": "\"\"", "positional": { "display":"DST", "many":false }, "flags": []},
+    {"field": "src", "type": "Text", "default": "\"\"", "positional": { "display":"SRC", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "date",
+  "doc": "print or set the system date and time (UTC)",
+  "usage": "usage: fx-date [OPTIONS]",
+  "args": [
+    {"field": "format", "type": "Text", "default": "\"%a %b %e %H:%M:%S %Z %Y\"", "positional": null, "flags": []},
+    {"field": "utc", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-u", "long": "--utc", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "df",
+  "doc": "report filesystem usage in 1K blocks via statvfs",
+  "usage": "usage: fx-df [OPTIONS] [PATH]",
+  "args": [
+    {"field": "path", "type": "Text", "default": "\"\"", "positional": { "display":"PATH", "many":false }, "flags": []},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "diff",
+  "doc": "compare two files (or trees, -r) line by line",
+  "usage": "usage: fx-diff [OPTIONS] [A] [B]",
+  "args": [
+    {"field": "a", "type": "Text", "default": "\"\"", "positional": { "display":"A", "many":false }, "flags": []},
+    {"field": "b", "type": "Text", "default": "\"\"", "positional": { "display":"B", "many":false }, "flags": []},
+    {"field": "recursive", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-r", "long": "--recursive", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "dirname",
+  "doc": "strip the last component from a file name",
+  "usage": "usage: fx-dirname [NAME...]",
+  "args": [
+    {"field": "names", "type": "List Text", "default": "[] : List Text", "positional": { "display":"NAME", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "du",
+  "doc": "estimate file space usage as Datalog-backed stat rows",
+  "usage": "usage: fx-du [OPTIONS] [PATH]",
+  "args": [
+    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": [ { "short": "-d", "long": "--max-depth", "kind": "Value", "value": null } ]},
+    {"field": "path", "type": "Text", "default": "\".\"", "positional": { "display":"PATH", "many":false }, "flags": []},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]},
+    {"field": "summary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-s", "long": "--summarize", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "echo",
+  "doc": "print the given STRINGs to stdout, newline-terminated",
+  "usage": "usage: fx-echo [OPTIONS] [STRING...]",
+  "args": [
+    {"field": "escapes", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-e", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "no_newline", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-n", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "strings", "type": "List Text", "default": "[] : List Text", "positional": { "display":"STRING", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "env",
+  "doc": "print, filter or modify the environment, then run nothing (print form)",
+  "usage": "usage: fx-env [OPTIONS] [NAME=VALUE...]",
+  "args": [
+    {"field": "ignore", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-i", "long": "--ignore-environment", "kind": "Flag", "value": null } ]},
+    {"field": "sets", "type": "List Text", "default": "[] : List Text", "positional": { "display":"NAME=VALUE", "many":true }, "flags": []},
+    {"field": "unset", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": "-u", "long": "--unset", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "expand",
+  "doc": "convert tabs in FILEs (or stdin) to spaces",
+  "usage": "usage: fx-expand [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []},
+    {"field": "tabstop", "type": "Natural", "default": "8", "positional": null, "flags": [ { "short": "-t", "long": "--tabs", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "find",
+  "doc": "walk a directory closure via Datalog reachability from ROOT",
+  "usage": "usage: fx-find [ROOT]",
+  "args": [
+    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": []},
+    {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": []},
+    {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []},
+    {"field": "type_filter", "type": "Optional < Dir | File >", "default": "None < Dir | File >", "positional": null, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "grep",
+  "doc": "print lines of files under ROOT matching a regex PATTERN",
+  "usage": "usage: fx-grep [PATTERN] [ROOT]",
+  "args": [
+    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": []},
+    {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": []},
+    {"field": "pattern", "type": "Text", "default": "\"\"", "positional": { "display":"PATTERN", "many":false }, "flags": []},
+    {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "head",
+  "doc": "print the first N lines (-n, default 10) of FILEs (or stdin)",
+  "usage": "usage: fx-head [OPTIONS] [FILE]",
+  "args": [
+    {"field": "input", "type": "Text", "default": "\"\"", "positional": { "display":"FILE", "many":false }, "flags": []},
+    {"field": "n", "type": "Natural", "default": "10", "positional": null, "flags": [ { "short": "-n", "long": "--lines", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "hostname",
+  "doc": "print the system's host name",
+  "usage": "usage: fx-hostname",
+  "args": [
+    {"field": "nothing", "type": "Bool", "default": "True", "positional": null, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "id",
+  "doc": "print user and group identity for USER (or the caller)",
+  "usage": "usage: fx-id [OPTIONS] [USER]",
+  "args": [
+    {"field": "all", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-G", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "gid", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-g", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "names", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-n", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "real", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-r", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "uid", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-u", "long": null, "kind": "Flag", "value": null } ]},
+    {"field": "user", "type": "Text", "default": "\"\"", "positional": { "display":"USER", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": [["-u","-g","-G"]]
+},
+{
+  "name": "link",
+  "doc": "create a hard link OLD -> NEW via linkat, journaled",
+  "usage": "usage: fx-link [OLD] [NEW]",
+  "args": [
+    {"field": "new", "type": "Text", "default": "\"\"", "positional": { "display":"NEW", "many":false }, "flags": []},
+    {"field": "old", "type": "Text", "default": "\"\"", "positional": { "display":"OLD", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "ln",
+  "doc": "create links between files (-s for symbolic)",
+  "usage": "usage: fx-ln [OPTIONS] [TARGET] [LINK_NAME]",
+  "args": [
+    {"field": "dst", "type": "Text", "default": "\"\"", "positional": { "display":"LINK_NAME", "many":false }, "flags": []},
+    {"field": "src", "type": "Text", "default": "\"\"", "positional": { "display":"TARGET", "many":false }, "flags": []},
+    {"field": "symbolic", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-s", "long": "--symbolic", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "ls",
+  "doc": "list a directory's entries as Datalog-backed stat rows",
+  "usage": "usage: fx-ls [OPTIONS] [PATH]",
+  "args": [
+    {"field": "all", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-a", "long": "--all", "kind": "Flag", "value": null } ]},
+    {"field": "long", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-l", "long": "--long", "kind": "Flag", "value": null } ]},
+    {"field": "path", "type": "Text", "default": "\".\"", "positional": { "display":"PATH", "many":false }, "flags": []},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]},
+    {"field": "sort", "type": "< MTime | Name | Size >", "default": "< MTime | Name | Size >.Name", "positional": null, "flags": [ { "short": "-S", "long": null, "kind": "Enum", "value": "Size" }, { "short": "-t", "long": null, "kind": "Enum", "value": "MTime" } ]}
+  ],
+  "mutually_exclusive": [["-S","-t"]]
+},
+{
+  "name": "md5sum",
+  "doc": "print or check MD5 (128-bit) checksums",
+  "usage": "usage: fx-md5sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "binary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-b", "long": "--binary", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "mkdir",
+  "doc": "create directories (-p for parents), journaled",
+  "usage": "usage: fx-mkdir [OPTIONS] [DIR...]",
+  "args": [
+    {"field": "parents", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-p", "long": "--parents", "kind": "Flag", "value": null } ]},
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"DIR", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "mkfifo",
+  "doc": "create FIFOs with mkfifo(3), -m sets the mode",
+  "usage": "usage: fx-mkfifo [OPTIONS] [NAME...]",
+  "args": [
+    {"field": "mode", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": "-m", "long": "--mode", "kind": "Value", "value": null } ]},
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"NAME", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "mv",
+  "doc": "rename SOURCE to DEST, or move SOURCE into DIRECTORY",
+  "usage": "usage: fx-mv [SRC] [DST]",
+  "args": [
+    {"field": "dst", "type": "Text", "default": "\"\"", "positional": { "display":"DST", "many":false }, "flags": []},
+    {"field": "src", "type": "Text", "default": "\"\"", "positional": { "display":"SRC", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "nl",
+  "doc": "number lines of a file or stdin (GNU nl)",
+  "usage": "usage: fx-nl [OPTIONS] [FILE]",
+  "args": [
+    {"field": "body", "type": "Text", "default": "\"t\"", "positional": null, "flags": [ { "short": "-b", "long": "--body-numbering", "kind": "Value", "value": null } ]},
+    {"field": "file", "type": "Text", "default": "\"\"", "positional": { "display":"FILE", "many":false }, "flags": []},
+    {"field": "fmt", "type": "Text", "default": "\"rn\"", "positional": null, "flags": [ { "short": "-n", "long": "--number-format", "kind": "Value", "value": null } ]},
+    {"field": "sep", "type": "Text", "default": "\"\t\"", "positional": null, "flags": [ { "short": "-s", "long": "--number-separator", "kind": "Value", "value": null } ]},
+    {"field": "width", "type": "Natural", "default": "6", "positional": null, "flags": [ { "short": "-w", "long": "--number-width", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "paste",
+  "doc": "merge corresponding or subsequent lines of files (GNU paste)",
+  "usage": "usage: fx-paste [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "delim", "type": "Text", "default": "\"\t\"", "positional": null, "flags": [ { "short": "-d", "long": "--delimiters", "kind": "Value", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []},
+    {"field": "serial", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-s", "long": "--serial", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "ps",
+  "doc": "snapshot running processes as a datalog-backed view",
+  "usage": "usage: fx-ps [OPTIONS]",
+  "args": [
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]},
+    {"field": "sort", "type": "< Cpu | Mem | Pid >", "default": "< Cpu | Mem | Pid >.Pid", "positional": null, "flags": [ { "short": "-c", "long": null, "kind": "Enum", "value": "Cpu" }, { "short": "-m", "long": null, "kind": "Enum", "value": "Mem" } ]}
+  ],
+  "mutually_exclusive": [["-c","-m"]]
+},
+{
+  "name": "realpath",
+  "doc": "print the resolved absolute file name",
+  "usage": "usage: fx-realpath [FILE...]",
+  "args": [
+    {"field": "names", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "rm",
+  "doc": "remove files or directories (-r), journaled with CAS capture",
+  "usage": "usage: fx-rm [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []},
+    {"field": "recursive", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-r", "long": "--recursive", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "rmdir",
+  "doc": "remove empty directories, journaled",
+  "usage": "usage: fx-rmdir [DIR...]",
+  "args": [
+    {"field": "paths", "type": "List Text", "default": "[] : List Text", "positional": { "display":"DIR", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "seq",
+  "doc": "print a sequence of numbers FIRST..LAST (step INC)",
+  "usage": "usage: fx-seq",
+  "args": [
+    {"field": "first", "type": "Integer", "default": "1", "positional": null, "flags": []},
+    {"field": "inc", "type": "Integer", "default": "1", "positional": null, "flags": []},
+    {"field": "last", "type": "Integer", "default": "0", "positional": null, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sha1sum",
+  "doc": "print or check SHA-1 (160-bit) checksums",
+  "usage": "usage: fx-sha1sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "binary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-b", "long": "--binary", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sha224sum",
+  "doc": "print or check SHA-224 checksums",
+  "usage": "usage: fx-sha224sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "binary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-b", "long": "--binary", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sha256sum",
+  "doc": "print or check SHA-256 checksums",
+  "usage": "usage: fx-sha256sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "binary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-b", "long": "--binary", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sha384sum",
+  "doc": "print or check SHA-384 checksums",
+  "usage": "usage: fx-sha384sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "binary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-b", "long": "--binary", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sha512sum",
+  "doc": "print or check SHA-512 checksums",
+  "usage": "usage: fx-sha512sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "binary", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-b", "long": "--binary", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sort",
+  "doc": "sort lines (numeric, reverse, unique) as Datalog-backed rows",
+  "usage": "usage: fx-sort [OPTIONS] [FILE]",
+  "args": [
+    {"field": "input", "type": "Text", "default": "\"\"", "positional": { "display":"FILE", "many":false }, "flags": []},
+    {"field": "numeric", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-n", "long": "--numeric-sort", "kind": "Flag", "value": null } ]},
+    {"field": "reverse", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-r", "long": "--reverse", "kind": "Flag", "value": null } ]},
+    {"field": "unique", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-u", "long": "--unique", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "sum",
+  "doc": "print checksum and block count for each FILE (-s SysV)",
+  "usage": "usage: fx-sum [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []},
+    {"field": "sysv", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-s", "long": "--sysv", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "tail",
+  "doc": "print the last N lines (-n, default 10) of FILEs (or stdin)",
+  "usage": "usage: fx-tail [OPTIONS] [FILE]",
+  "args": [
+    {"field": "input", "type": "Text", "default": "\"\"", "positional": { "display":"FILE", "many":false }, "flags": []},
+    {"field": "n", "type": "Natural", "default": "10", "positional": null, "flags": [ { "short": "-n", "long": "--lines", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "tee",
+  "doc": "copy stdin to each FILE and to stdout (-a appends)",
+  "usage": "usage: fx-tee [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "append", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-a", "long": "--append", "kind": "Flag", "value": null } ]},
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "top",
+  "doc": "single-shot process ranking by total cpu ticks or memory",
+  "usage": "usage: fx-top [OPTIONS]",
+  "args": [
+    {"field": "count", "type": "Natural", "default": "15", "positional": null, "flags": [ { "short": "-n", "long": null, "kind": "Value", "value": null } ]},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]},
+    {"field": "sort", "type": "< Cpu | Mem >", "default": "< Cpu | Mem >.Cpu", "positional": null, "flags": [ { "short": "-m", "long": null, "kind": "Enum", "value": "Mem" } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "touch",
+  "doc": "create files or update timestamps, journaled",
+  "usage": "usage: fx-touch [FILE...]",
+  "args": [
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "tree",
+  "doc": "render a directory closure as a tree (Datalog descent)",
+  "usage": "usage: fx-tree [OPTIONS] [ROOT]",
+  "args": [
+    {"field": "all", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-a", "long": "--all", "kind": "Flag", "value": null } ]},
+    {"field": "dirs_only", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-d", "long": "--dirs-only", "kind": "Flag", "value": null } ]},
+    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": [ { "short": "-L", "long": null, "kind": "Value", "value": null } ]},
+    {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "truncate",
+  "doc": "shrink or extend a file to SIZE (-r REF), CAS-captured",
+  "usage": "usage: fx-truncate [OPTIONS] [FILE...]",
+  "args": [
+    {"field": "files", "type": "List Text", "default": "[] : List Text", "positional": { "display":"FILE", "many":true }, "flags": []},
+    {"field": "no_create", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-c", "long": "--no-create", "kind": "Flag", "value": null } ]},
+    {"field": "ref", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": "-r", "long": "--reference", "kind": "Value", "value": null } ]},
+    {"field": "size", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": "-s", "long": "--size", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": [["-s","-r"]]
+},
+{
+  "name": "uname",
+  "doc": "print system information (-a: all)",
+  "usage": "usage: fx-uname [OPTIONS]",
+  "args": [
+    {"field": "all", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-a", "long": "--all", "kind": "Flag", "value": null } ]},
+    {"field": "kernel", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-s", "long": "--kernel-name", "kind": "Flag", "value": null } ]},
+    {"field": "machine", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-m", "long": "--machine", "kind": "Flag", "value": null } ]},
+    {"field": "nodename", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-n", "long": "--nodename", "kind": "Flag", "value": null } ]},
+    {"field": "os", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-o", "long": "--operating-system", "kind": "Flag", "value": null } ]},
+    {"field": "release", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-r", "long": "--release", "kind": "Flag", "value": null } ]},
+    {"field": "version", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-v", "long": null, "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "uniq",
+  "doc": "filter repeated adjacent lines in sorted input (-c counts)",
+  "usage": "usage: fx-uniq [OPTIONS] [FILE]",
+  "args": [
+    {"field": "count", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-c", "long": "--count", "kind": "Flag", "value": null } ]},
+    {"field": "global", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-g", "long": "--global", "kind": "Flag", "value": null } ]},
+    {"field": "input", "type": "Text", "default": "\"\"", "positional": { "display":"FILE", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "unlink",
+  "doc": "delete a name and possibly the file it refers to",
+  "usage": "usage: fx-unlink [PATH]",
+  "args": [
+    {"field": "path", "type": "Text", "default": "\"\"", "positional": { "display":"PATH", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "wc",
+  "doc": "print newline, word and byte counts for each FILE",
+  "usage": "usage: fx-wc [FILE]",
+  "args": [
+    {"field": "input", "type": "Text", "default": "\"\"", "positional": { "display":"FILE", "many":false }, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "what",
+  "doc": "query which package owns a rootfs PATH (provenance)",
+  "usage": "usage: fx-what [OPTIONS] [PATH]",
+  "args": [
+    {"field": "as_of", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": [ { "short": null, "long": "--as-of", "kind": "Value", "value": null } ]},
+    {"field": "operand", "type": "Text", "default": "\"\"", "positional": { "display":"PATH", "many":false }, "flags": []},
+    {"field": "store", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": null, "long": "--store", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "whoami",
+  "doc": "print the effective user name",
+  "usage": "usage: fx-whoami",
+  "args": [
+    {"field": "nothing", "type": "Bool", "default": "True", "positional": null, "flags": []}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "why",
+  "doc": "explain why a package is in the store (provenance)",
+  "usage": "usage: fx-why [OPTIONS] [PKG]",
+  "args": [
+    {"field": "as_of", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": [ { "short": null, "long": "--as-of", "kind": "Value", "value": null } ]},
+    {"field": "operand", "type": "Text", "default": "\".\"", "positional": { "display":"PKG", "many":false }, "flags": []},
+    {"field": "store", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": null, "long": "--store", "kind": "Value", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "yes",
+  "doc": "repeatedly output STRING (or 'y'), one per line, until killed",
+  "usage": "usage: fx-yes [STRING...]",
+  "args": [
+    {"field": "strings", "type": "List Text", "default": "[] : List Text", "positional": { "display":"STRING", "many":true }, "flags": []}
+  ],
+  "mutually_exclusive": []
+}
+]
+}

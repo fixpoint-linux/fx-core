@@ -30,7 +30,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "snapshot running processes as a datalog-backed view"
+, ty =
     { rows : Bool
     , sort : < Pid | Cpu | Mem >
     }

@@ -40,7 +40,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "create FIFOs with mkfifo(3), -m sets the mode"
+, ty =
     { mode : Optional Text
     , paths : List Text
     }

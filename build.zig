@@ -298,6 +298,44 @@ pub fn build(b: *std.Build) void {
     const run_clijson_tests = b.addRunArtifact(clijson_tests);
     test_step.dependOn(&run_clijson_tests.step);
 
+    // -----------------------------------------------------------------------
+    // fx-clidocs: the docs-data generator (schemas/*.dhall -> docs/
+    // commands.json; the Elm docs site's frozen dataset).  Same module
+    // surface as fx-clijson (the fx-cli schema evaluator), plus cli-ls so
+    // the tool's tests can pin docs-usage == the committed generated
+    // parser's usage() byte-for-byte (the drift-kill proof).  The TOOL RUN
+    // (writing docs/commands.json) is NOT part of `zig build test` — it is
+    // the explicit `zig build docs` step (a docs regen, not a gate); the
+    // tool's own test blocks below are wired in like clijson's.
+    // -----------------------------------------------------------------------
+    const clidocs_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/fx-clidocs.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "fx-cli", .module = cli_mod },
+            .{ .name = "cli-ls", .module = b.createModule(.{
+                .root_source_file = b.path("src/generated/cli_ls.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }) },
+        },
+    });
+    const clidocs_exe = b.addExecutable(.{ .name = "fx-clidocs", .root_module = clidocs_mod });
+    b.installArtifact(clidocs_exe);
+    const docs_step = b.step("docs", "Regenerate docs/commands.json from schemas/ (the docs-site dataset; commit the result)");
+    const docs_run = b.addRunArtifact(clidocs_exe);
+    docs_run.setCwd(b.path("."));
+    docs_run.addArg("schemas");
+    docs_run.addArg("docs/commands.json");
+    docs_step.dependOn(&docs_run.step);
+
+    const clidocs_tests = b.addTest(.{ .root_module = clidocs_mod });
+    const run_clidocs_tests = b.addRunArtifact(clidocs_tests);
+    test_step.dependOn(&run_clidocs_tests.step);
+
     // The generated parsers' own test blocks (pure std; no module imports).
     inline for (gen_schemas) |schema_name| {
         const out_path = std.fmt.comptimePrint("src/generated/cli_{s}.zig", .{schema_name});

@@ -36,7 +36,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "estimate file space usage as Datalog-backed stat rows"
+, ty =
     { path : Text
     , maxdepth : Optional Natural
     , summary : Bool

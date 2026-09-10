@@ -29,7 +29,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "rename SOURCE to DEST, or move SOURCE into DIRECTORY"
+, ty =
     { src : Text
     , dst : Text
     }

@@ -39,7 +39,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "sort lines (numeric, reverse, unique) as Datalog-backed rows"
+, ty =
     { input : Text
     , numeric : Bool
     , reverse : Bool

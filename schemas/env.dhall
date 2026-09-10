@@ -38,7 +38,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print, filter or modify the environment, then run nothing (print form)"
+, ty =
     { ignore : Bool
     , unset : Optional Text
     , sets : List Text

@@ -51,7 +51,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print lines of files under ROOT matching a regex PATTERN"
+, ty =
     { root : Text
     , pattern : Text
     , name_glob : Optional Text

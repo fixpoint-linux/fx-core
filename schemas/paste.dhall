@@ -47,7 +47,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "merge corresponding or subsequent lines of files (GNU paste)"
+, ty =
     { delim : Text
     , files : List Text
     , serial : Bool

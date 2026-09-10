@@ -33,7 +33,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print the last N lines (-n, default 10) of FILEs (or stdin)"
+, ty =
     { input : Text
     , n : Natural
     }

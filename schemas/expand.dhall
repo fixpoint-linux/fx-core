@@ -42,7 +42,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "convert tabs in FILEs (or stdin) to spaces"
+, ty =
     { files : List Text
     , tabstop : Natural
     }

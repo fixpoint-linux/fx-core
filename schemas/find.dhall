@@ -59,7 +59,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "walk a directory closure via Datalog reachability from ROOT"
+, ty =
     { root : Text
     , name_glob : Optional Text
     , type_filter : Optional < File | Dir >

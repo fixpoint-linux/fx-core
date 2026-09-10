@@ -32,7 +32,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "create links between files (-s for symbolic)"
+, ty =
     { src : Text
     , dst : Text
     , symbolic : Bool

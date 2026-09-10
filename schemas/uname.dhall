@@ -41,7 +41,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print system information (-a: all)"
+, ty =
     { all : Bool
     , kernel : Bool
     , nodename : Bool

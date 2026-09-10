@@ -24,7 +24,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { paths : List Text }
+{ doc = Some "remove empty directories, journaled"
+, ty = { paths : List Text }
 , dflt = { paths = [] : List Text }
 , posix =
     { flags = [] : List Flag

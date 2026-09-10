@@ -30,7 +30,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { files : List Text }
+{ doc = Some "concatenate FILEs (or stdin) to stdout, bytes to bytes"
+, ty = { files : List Text }
 , dflt = { files = [] : List Text }
 , posix =
     { flags = [] : List Flag

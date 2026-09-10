@@ -46,7 +46,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "strip directories and any suffix from file names"
+, ty =
     { all : Bool
     , input : Text
     , names : List Text

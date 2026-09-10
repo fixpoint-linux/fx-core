@@ -34,7 +34,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "query which package owns a rootfs PATH (provenance)"
+, ty =
     { as_of : Optional Natural
     , operand : Text
     , store : Optional Text

@@ -26,7 +26,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "copy stdin to each FILE and to stdout (-a appends)"
+, ty =
     { files : List Text
     , append : Bool
     }

@@ -23,7 +23,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { input : Text }
+{ doc = Some "print newline, word and byte counts for each FILE"
+, ty = { input : Text }
 , dflt = { input = "" }
 , posix =
     { flags = [] : List Flag

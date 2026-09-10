@@ -34,7 +34,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "list a directory's entries as Datalog-backed stat rows"
+, ty =
     { all : Bool
     , long : Bool
     , path : Text

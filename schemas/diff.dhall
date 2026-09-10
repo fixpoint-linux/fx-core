@@ -32,7 +32,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "compare two files (or trees, -r) line by line"
+, ty =
     { a : Text
     , b : Text
     , recursive : Bool

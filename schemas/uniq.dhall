@@ -39,7 +39,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "filter repeated adjacent lines in sorted input (-c counts)"
+, ty =
     { count : Bool
     , global : Bool
     , input : Text

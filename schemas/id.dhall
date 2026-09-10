@@ -45,7 +45,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print user and group identity for USER (or the caller)"
+, ty =
     { all : Bool
     , gid : Bool
     , names : Bool

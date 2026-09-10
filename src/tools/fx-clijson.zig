@@ -577,9 +577,7 @@ const BindingValue = union(enum) {
 /// callers free unconditionally (even when `name` is already an fx- name, the
 /// name itself is argv memory the caller may free first).
 fn displayName(gpa: Allocator, name: []const u8) GenError![]const u8 {
-    if (std.mem.startsWith(u8, name, "fx-"))
-        return gpa.dupe(u8, name) catch return error.OutOfMemory;
-    return std.fmt.allocPrint(gpa, "fx-{s}", .{name}) catch return error.OutOfMemory;
+    return cli.displayName(gpa, name) catch return error.OutOfMemory;
 }
 
 /// One line of bad-value diagnostic for an integer/Double flag: prints the
@@ -1345,28 +1343,18 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
 }
 
 fn emitUsage(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) GenError!void {
-    const disp = try displayName(gpa, name);
-    defer gpa.free(disp);
+    // cli.usageLine is the SINGLE SOURCE of this string — the docs-data
+    // generator (fx-clidocs) emits the same bytes into the JSON dataset, so
+    // bytestream parity here keeps the docs from drifting from the binaries.
+    const line = cli.usageLine(gpa, name, s) catch return error.OutOfMemory;
+    defer gpa.free(line);
 
-    var line = std.ArrayList(u8).empty;
-    defer line.deinit(gpa);
-    try line.appendSlice(gpa, "usage: ");
-    try line.appendSlice(gpa, disp);
-    if (s.posix.flags.len > 0) try line.appendSlice(gpa, " [OPTIONS]");
-    for (s.posix.positionals) |p| {
-        if (p.many) {
-            try line.appendSlice(gpa, " [");
-            try line.appendSlice(gpa, p.display);
-            try line.appendSlice(gpa, "...]");
-        } else {
-            try line.appendSlice(gpa, " [");
-            try line.appendSlice(gpa, p.display);
-            try line.appendSlice(gpa, "]");
-        }
-    }
-    try line.appendSlice(gpa, "\n");
+    var full = std.ArrayList(u8).empty;
+    defer full.deinit(gpa);
+    full.appendSlice(gpa, line) catch return error.OutOfMemory;
+    full.append(gpa, '\n') catch return error.OutOfMemory;
 
-    const e = try zigEscape(gpa, line.items);
+    const e = try zigEscape(gpa, full.items);
     defer gpa.free(e);
     try out.put("\npub fn usage() []const u8 {\n    return \"");
     try out.put(e);

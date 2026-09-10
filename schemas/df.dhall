@@ -30,7 +30,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "report filesystem usage in 1K blocks via statvfs"
+, ty =
     { path : Text
     , rows : Bool
     }

@@ -54,7 +54,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "shrink or extend a file to SIZE (-r REF), CAS-captured"
+, ty =
     { size : Optional Text
     , ref : Optional Text
     , no_create : Bool

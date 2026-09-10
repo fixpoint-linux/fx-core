@@ -34,7 +34,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "change the owner and/or group of files (datalog-backed stat rows)"
+, ty =
     { owner : Text
     , paths : List Text
     }

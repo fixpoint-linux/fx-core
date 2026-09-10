@@ -29,7 +29,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { path : Text }
+{ doc = Some "delete a name and possibly the file it refers to"
+, ty = { path : Text }
 , dflt = { path = "" }
 , posix =
     { flags = [] : List Flag

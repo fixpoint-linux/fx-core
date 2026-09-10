@@ -29,7 +29,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "single-shot process ranking by total cpu ticks or memory"
+, ty =
     { count : Natural
     , sort : < Cpu | Mem >
     , rows : Bool

@@ -45,7 +45,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "print a sequence of numbers FIRST..LAST (step INC)"
+, ty =
     { first : Integer
     , inc : Integer
     , last : Integer

@@ -19,7 +19,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { names : List Text }
+{ doc = Some "strip the last component from a file name"
+, ty = { names : List Text }
 , dflt = { names = [] : List Text }
 , posix =
     { flags = [] : List Flag

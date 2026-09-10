@@ -23,7 +23,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { nothing : Bool }
+{ doc = Some "print the effective user name"
+, ty = { nothing : Bool }
 , dflt = { nothing = True }
 , posix =
     { flags = [] : List Flag

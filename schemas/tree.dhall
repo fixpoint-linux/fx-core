@@ -32,7 +32,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty =
+{ doc = Some "render a directory closure as a tree (Datalog descent)"
+, ty =
     { all : Bool
     , dirs_only : Bool
     , maxdepth : Optional Natural

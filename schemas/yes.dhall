@@ -19,7 +19,8 @@ let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : <
 let Positional = { field : Text, display : Text, many : Bool }
 
 in
-{ ty = { strings : List Text }
+{ doc = Some "repeatedly output STRING (or 'y'), one per line, until killed"
+, ty = { strings : List Text }
 , dflt = { strings = [] : List Text }
 , posix =
     { flags = [] : List Flag
