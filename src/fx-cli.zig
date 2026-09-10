@@ -863,8 +863,10 @@ extern fn close(fd: c_int) c_int;
 /// Read a schema file into a NUL-terminated gpa buffer (plain libc open/
 /// read/close — the fx-diff readFdAlloc idiom; std.posix slimmed these out
 /// in 0.16 and toPosixPath asserts on non-absolute relative resolution).
-/// `candidates` are tried in order (tests run from varying CWDs; STEP 4
-/// replaces this with a comptime @embedFile from a repo-root module).
+/// `candidates` are tried in order (tests run from varying CWDs; the STEP-4
+/// plan floated a comptime @embedFile from a repo-root module — declined:
+/// the pipeline registry does not consume schemas, see fx-pipeline.zig's
+/// registry-header note, so runtime file reads stay test-side only).
 pub fn readSchemaFile(gpa: Allocator, candidates: []const []const u8) Error![:0]u8 {
     for (candidates) |path| {
         const path_z = gpa.dupeZ(u8, path) catch return error.OutOfMemory;

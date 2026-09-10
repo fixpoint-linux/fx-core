@@ -379,6 +379,52 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > remaining commands migrate in flag-shape batches, each landing with its own
 > differential matrix (the same template).
 
+> **Single-schema file map (2026-09, cmdif STEP 4):** all 56 commands have
+> migrated (the per-command hand `parsePosixArgs`/`usage`/`Options` are
+> gone; every command carries its differential matrix), so the full data
+> flow is visible in one picture —
+>
+>     schemas/<name>.dhall          SINGLE SOURCE OF TRUTH per command:
+>                                   one { ty, dflt, posix } Dhall record
+>                                   literal (ty = the argument record TYPE
+>                                   the runtime evalDhallArgs accepts, dflt
+>                                   = the defaults literal, posix = flags/
+>                                   positionals/mutual-exclusion surface)
+>                                      |
+>                                      v  (src/tools/fx-clijson.zig, build
+>                                          time: validates (dflt // {}) : ty
+>                                          and emits)
+>                                      |
+>                      +---------------+---------------+
+>                      v                               v
+>     src/generated/cli_<name>.zig        (the same schema, the OTHER
+>     the generated typed POSIX parser    arg form, needs no generated
+>     (pure std — no dhall at runtime,    code: completed at runtime as
+>     imported by the command binary      (dflt // user) : ty by
+>     as its own module)                  fx-cli.completeSrc)
+>                      |                               |
+>                      +---------------+---------------+
+>                                      v
+>     src/fx-cli.zig                 the SHARED layer: the schema evaluator
+>     (evalSchemaSrc / completeSrc / (both arg forms), renderDhallRecord,
+>     encodeOptionsWire live here)    the comptime-reflection wire encoder
+>                                     and the generic differential runner
+>                                     (expectPosixEqualsRecord) the per-
+>                                     command differential matrices call
+>
+> `zig build gen-cli` regenerates the committed `src/generated/cli_*.zig`
+> in place; `zig build gen-cli-check` (wired into `test`) fails on a stale
+> or hand-edited one.  NOT in this graph: the fx-pipeline `builtin()`
+> registry — it declares pipeline SHAPES (single {path : Text} -> rows
+> {...}), not argument surfaces, and only fractionally overlaps the schemas
+> (ls/du/df's `path` positional; nothing for grep's upstream-rows input or
+> any output type), so consolidating it onto the schemas was considered and
+> DECLINED (the naming gaps would need a hand-written field map — a new
+> drift surface — and fx-cli's whole-arena transactions would dangle the
+> registry's live Terms); see fx-pipeline.zig's registry-header note for
+> the full argument and the test-enforced guarantees that keep the layers
+> honest anyway.
+
 **Determinism as proof, not hope.** Replaying a pipeline re-runs each stage and
 compares the produced intermediate against the recorded sha256. A divergence is a
 *caught non-deterministic command* (or a CAS hash collision — astronomically

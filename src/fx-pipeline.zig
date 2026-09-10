@@ -168,6 +168,34 @@ pub fn resetArena() void {
 // Builtin command signature registry
 // ---------------------------------------------------------------------------
 
+// RELATION TO schemas/<name>.dhall (single-schema command interface — STEP 4
+// decision: the registry does NOT consolidate with it).  The schemas describe
+// each command's ARGUMENT surface ({ty, dflt, posix}: flags and operands);
+// this registry describes each stage's PIPELINE SHAPE (what it consumes and
+// emits as a Lens-3 producer/consumer).  The overlap is real but narrow and
+// one-directional:
+//   * ls/du/df carry a schema positional `path : Text` that coincides with
+//     the registry input `single { path : Text }` — but tree/find spell the
+//     same operand `root` in their schemas;
+//   * grep's registry input `rows { path : Text }` describes the UPSTREAM
+//     rows it consumes — no field of grep's own schema;
+//   * every registry OUTPUT type (ls {name,size,mode}, wc {lines,words,
+//     bytes}, ps {...}, the Text singles, the tag-only bytes/lines/none
+//     shapes) has no schema counterpart at all.
+// Deriving registry shapes from schemas would therefore need a hand-written
+// field-mapping table (a NEW drift surface to paper over the naming gaps),
+// and would break the arena contract: fx-cli's entry points are whole-arena
+// transactions — they reset the shared dhall_arena on entry AND exit
+// (fx-cli.zig header rule) — while this registry's Terms must stay alive
+// across builtin() calls until the CALLER's resetArena() (fx-eval/
+// fx-compose strip the .ty pointers before resetting for exactly this
+// reason, N5).  The two layers stay deliberately independent; the
+// single-source guarantees that do hold are enforced elsewhere: schema ->
+// generated POSIX parser by `zig build gen-cli-check` (the regen no-op
+// gate), schema -> runtime record form by the per-command differential
+// matrix tests, and this registry's types -> the binaries' --rows wire
+// output by the fx-eval engine tests (e.g. the ls [--rows,root] pin).
+
 /// Return a builtin command by name, parsing its signature into the arena.
 /// The returned Command's Terms are valid until the next resetArena().
 /// `find |> grep` type-checks (rows width-subtyping); `ls |> find` (rows vs
