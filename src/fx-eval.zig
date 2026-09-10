@@ -29,6 +29,9 @@ const dh = @import("dhall");
 const pipeline = @import("fx-pipeline.zig");
 const caslog = @import("fx-caslog.zig");
 const wire = @import("fx-wire.zig");
+// the per-binary exec-dispatch decision table (argv shape + stdout
+// postprocess) — same dir, imported by path so build.zig wiring is untouched
+const specs = @import("fx-stages.zig");
 
 // libdatalog's regex-DFA compiler — the same engine the real fx-grep binary
 // uses, so fx-eval's grep and fx-grep share one regex subset by construction.
@@ -133,16 +136,10 @@ pub const Diverged = struct {
 // ---------------------------------------------------------------------------
 
 /// The name -> dispatch+metadata registry.  find/grep are NATIVE (production);
-/// the rest are EXEC (shell to real fx-* binaries): nl/expand take an optional
-/// -b/-t flag from args plus the file operand; the checksum stages (wc/cksum/
-/// sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum) get their
-/// filename token postprocessed (T2); ls/du are OPERAND stages run with --rows
-/// so they emit canonical wire rows; tree/df join them as OPERAND stages (the
-/// stage args are the ROOT/PATH operand; empty args -> the child's default);
-/// basename/dirname/realpath are TEXT-OPERAND stages fed the prior stage's
-/// single-Text VALUE as the PATH operand; echo/seq
-/// are GENERATOR (source) stages — argv [bin, args?], no file operand, no
-/// pipeline input; ps/top join the generators with argv [bin, --rows, flags?].
+/// the rest are EXEC (shell to real fx-* binaries).  The per-binary EXEC
+/// decisions (argv shape, stdout postprocess, idempotence) live in the
+/// fx-stages.zig table — execDispatch is a pure switch over them, and the
+/// drift test at the bottom of this file pins the two name sets equal.
 /// `idempotent` marks stages where
 /// f(f(x)) == f(x) (used by --converge); only sort, uniq and expand are so
 /// marked (trivially true, a demonstration not a prover).
@@ -471,74 +468,34 @@ fn dispatchStage(
 }
 
 /// exec dispatch: run the real fx-<binary> and capture stdout
-/// (std.process.run, stdin=.ignore).  Five argv shapes:
-///   OPERAND stages (ls/du/tree/df): [bin, "--rows", args?] — the stage args
-///     are the TREE ROOT / PATH operand (mirror find: the pipeline input is
-///     ignored entirely, no file operand; in_hash still covers name+args via
-///     stageInHash).  tree/df default to "."/all-mounts when args is empty.
-///   TEXT-OPERAND stages (basename/dirname/realpath): [bin, path, suffix?] —
-///     the prior stage's single-Text VALUE is decoded from the bare-Text wire
-///     form and passed as the PATH operand (basename's stage args are the
-///     SUFFIX; dirname/realpath reject args); no CAS blob is materialized.
-///   GENERATOR stages (echo/seq/ps/top): SOURCE stages, no file operand and
-///     no pipeline input at all (valid only at position 0, which
-///     shapeCompatible enforces).  echo passes its stage args as ONE verbatim
-///     text operand (empty args -> argv [bin] -> a bare newline, GNU echo
-///     behavior; a leading-dash arg reaches fx-echo's option parser and fails
-///     loudly).  seq whitespace-splits its stage args into 1-3 INTEGER
-///     operands mirroring fx-seq parsePosixArgs, EXCEPT an arg starting with
-///     '{' passes verbatim as one operand (fx-seq's Dhall-record form); empty
-///     seq args fail loudly before the spawn (a source with nothing to
-///     generate has no invented default).  ps/top run as [bin, "--rows",
-///     flags?]: the stage args are whitespace-split into flag tokens (e.g.
-///     "top:-n 10" -> ["-n","10"]; "-m" rides through as one) — unknown flags
-///     fail loudly in the child, and the Dhall-record form is NOT reachable
-///     through the pipeline (argv[1] is "--rows", so the child's record-form
-///     branch never fires; use the binary directly for that form).
-///   TWO-FILE stages (paste/comm): [bin, cas_path, PATH2] — the prior stage's
-///     CAS blob path is FILE1 and the stage args are the SECOND FILE PATH
-///     verbatim (live-read at run AND replay — the find/ls/du live-operand
-///     caveat: a changed PATH2 diverges replay loudly, an absent one fails).
-///     Empty args fail loudly before the spawn: the second operand is not
-///     optional.  Output is raw lines (no filename-token postprocess).
-///   file-operand stages: [bin, flags..., cas_path] with the prior stage's CAS
-///     blob path as the FILE operand.  Per-binary flags: head/tail -n N
-///     (default 10); nl -b <args> and expand -t <args> when args is non-empty.
-/// wc/cksum/sha256sum/md5sum/sha1sum/sha224sum/sha384sum/sha512sum/sum output
-/// ends in a filename token that IS the state-dir CAS path (T2/wc-trap) — postprocessed into the stage's DECLARED single as
-/// canonical JSON (S8).
+/// (std.process.run, stdin=.ignore).  Every per-binary decision — which ROLE
+/// the stage plays (CAS blob operand / single-Text value operand / no
+/// pipeline input at all), how stage.args are laid out into argv, and how the
+/// child's stdout is postprocessed — comes from the fx-stages.zig table;
+/// this fn is the single switch over it (U1).  The ~27 per-binary
+/// std.mem.eql chains that used to live here claimed stage args in the
+/// manifest and silently DROPPED them for every binary without a special
+/// case (`fx-compose 'sort:-r'` hashed the same as 'sort'), so the rule
+/// since is: NO per-binary binary-name comparison outside the wire_mode
+/// postprocess switch at the bottom.
 fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input: []const u8) ![]u8 {
     const bin_dir = ctx.bin_dir orelse return error.UnknownCommand;
 
-    // operand stages never see the pipeline input, so no CAS blob is materialized
-    const operand_stage = std.mem.eql(u8, binary, "ls") or std.mem.eql(u8, binary, "du") or
-        std.mem.eql(u8, binary, "tree") or std.mem.eql(u8, binary, "df");
+    const spec = specs.lookup(binary) orelse return error.UnknownCommand;
 
-    // text-operand stages (basename/dirname/realpath) decode the prior
-    // stage's single-Text VALUE and pass it as the PATH operand — the VALUE
-    // rides in argv, so no CAS blob is materialized for them either
-    const text_operand_stage = std.mem.eql(u8, binary, "basename") or
-        std.mem.eql(u8, binary, "dirname") or
-        std.mem.eql(u8, binary, "realpath");
-
-    // generator stages (echo/seq/ps/top) are SOURCES: no pipeline input, no
-    // CAS blob.  ps/top emit wire rows (argv [--rows, flags?]) instead of
-    // echo/seq's raw lines.
-    const generator_stage = std.mem.eql(u8, binary, "echo") or
-        std.mem.eql(u8, binary, "seq") or
-        std.mem.eql(u8, binary, "ps") or
-        std.mem.eql(u8, binary, "top");
-
-    // two-file stages (paste/comm): the prior stage's CAS blob is FILE1, the
-    // stage args are the SECOND FILE PATH verbatim (live-read at run AND
-    // replay — the accepted find/ls/du live-operand caveat).  Unlike the
-    // stage categories above they DO materialize the CAS blob.
-    const two_file_stage = std.mem.eql(u8, binary, "paste") or
-        std.mem.eql(u8, binary, "comm");
+    // file-operand stages pass the blob as the FILE operand, two-file stages
+    // as FILE1; operand stages never see the pipeline input, text-operand
+    // stages pass the VALUE in argv, generators have no input at all — no
+    // blob is materialized for any of those
+    const needs_blob = switch (spec.role) {
+        .file_operand, .two_file => true,
+        .operand_rows, .text_operand, .generator, .generator_rows => false,
+        .native => unreachable, // the dispatch table never execs find/grep
+    };
 
     var pb: [std.posix.PATH_MAX]u8 = undefined;
     var cas_path: ?[:0]const u8 = null;
-    if (!operand_stage and !text_operand_stage and !generator_stage) {
+    if (needs_blob) {
         // materialize input as a CAS blob path to pass as the FILE operand
         const in_hex = try caslog.casPut(ctx.state_dir, input);
         cas_path = std.fmt.bufPrintZ(&pb, "{s}/cas/{s}", .{ ctx.state_dir, in_hex[0..64] }) catch
@@ -555,117 +512,169 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
     var path_text: ?[]const u8 = null;
     defer if (path_text) |pt| ctx.gpa.free(pt);
 
-    // build argv per-binary: [bin, flags..., operand]
+    // head/tail's -n N buffer — function scope: argv holds a pointer into it
+    // until the spawn below, so it must outlive the argv-building switch
+    var cnt: [64]u8 = undefined;
+
+    // build argv from the table: [bin, <argv_plan shape>, operand?]
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(ctx.gpa);
     argv.append(ctx.gpa, bin_path) catch return error.NoMem;
-    if (operand_stage) {
-        // --rows: canonical wire rows (the declared registry output shape);
-        // ls/du text output is display-only and does not round-trip the type
-        argv.append(ctx.gpa, "--rows") catch return error.NoMem;
-        if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-    } else if (text_operand_stage) {
-        // the PATH operand is the prior stage's single-Text VALUE, decoded
-        // from the bare-Text wire form — not a CAS blob path
-        const pt = wire.decodeSingleText(ctx.gpa, input) catch |e| {
-            std.debug.print("fx-eval: {s}: input is not a bare-Text single value (e={s})\n", .{ binary, @errorName(e) });
-            return error.StageFailed;
-        };
-        path_text = pt;
-        if (std.mem.indexOfScalar(u8, pt, 0) != null) {
-            std.debug.print("fx-eval: {s}: path value contains a NUL byte (execve argv cannot carry it)\n", .{binary});
-            return error.StageFailed;
-        }
-        // only basename takes stage args (the SUFFIX operand: fx-basename NAME
-        // [SUFFIX]); dirname/realpath with args would pass extra operands and
-        // emit multiple lines, breaking the single-Text output shape
-        if (stage.args.len > 0 and !std.mem.eql(u8, binary, "basename")) {
-            std.debug.print("fx-eval: {s}: stage args '{s}' rejected (extra operands would emit multiple lines)\n", .{ binary, stage.args });
-            return error.StageFailed;
-        }
-        argv.append(ctx.gpa, pt) catch return error.NoMem;
-        if (std.mem.eql(u8, binary, "basename") and stage.args.len > 0) {
-            argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-        }
-    } else if (generator_stage) {
-        if (std.mem.eql(u8, binary, "echo")) {
-            // the whole post-':' arg is ONE verbatim text operand (spaces
-            // included); empty args -> argv [bin] -> a bare newline
+    switch (spec.role) {
+        .operand_rows => {
+            // --rows: canonical wire rows (the declared registry output
+            // shape); ls/du text output is display-only and does not
+            // round-trip the type.  The stage args are the TREE ROOT / PATH
+            // operand (mirror find); empty args -> the child's default
+            // (tree/df: "."/all-mounts).
+            argv.append(ctx.gpa, "--rows") catch return error.NoMem;
             if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-        } else if (std.mem.eql(u8, binary, "seq")) {
-            // seq: fast-fail on empty args before the spawn (mirrors the
-            // dirname extra-args rejection above) — fx-seq with no operand is
-            // MissingOperand, but the engine rejects it itself so the contract
-            // holds even under fake-binary tests
-            if (stage.args.len == 0) {
-                std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
+        },
+        .text_operand => {
+            // the PATH operand is the prior stage's single-Text VALUE,
+            // decoded from the bare-Text wire form — not a CAS blob path
+            const pt = wire.decodeSingleText(ctx.gpa, input) catch |e| {
+                std.debug.print("fx-eval: {s}: input is not a bare-Text single value (e={s})\n", .{ binary, @errorName(e) });
+                return error.StageFailed;
+            };
+            path_text = pt;
+            if (std.mem.indexOfScalar(u8, pt, 0) != null) {
+                std.debug.print("fx-eval: {s}: path value contains a NUL byte (execve argv cannot carry it)\n", .{binary});
                 return error.StageFailed;
             }
-            if (stage.args[0] == '{') {
-                // the fx-seq Dhall-record form rides verbatim as ONE operand
-                argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-            } else {
-                // whitespace-split into 1-3 INTEGER operands, mirroring
-                // fx-seq parsePosixArgs (a non-integer or a 4th operand is a
-                // loud engine-side failure, not a surprise child exit)
-                var n: usize = 0;
-                var it = std.mem.tokenizeAny(u8, stage.args, " \t");
-                while (it.next()) |tok| {
-                    n += 1;
-                    if (n > 3) {
-                        std.debug.print("fx-eval: seq: more than 3 integer operands\n", .{});
+            switch (spec.argv_plan) {
+                // basename's stage args are the SUFFIX operand (fx-basename
+                // NAME [SUFFIX])
+                .text_value => {
+                    argv.append(ctx.gpa, pt) catch return error.NoMem;
+                    if (stage.args.len > 0) argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+                },
+                // dirname/realpath reject args: extra operands would emit
+                // multiple lines, breaking the single-Text output shape
+                else => {
+                    if (stage.args.len > 0) {
+                        std.debug.print("fx-eval: {s}: stage args '{s}' rejected (extra operands would emit multiple lines)\n", .{ binary, stage.args });
                         return error.StageFailed;
                     }
-                    _ = std.fmt.parseInt(i128, tok, 10) catch {
-                        std.debug.print("fx-eval: seq: operand '{s}' is not an integer\n", .{tok});
-                        return error.StageFailed;
-                    };
-                    argv.append(ctx.gpa, tok) catch return error.NoMem;
-                }
-                if (n == 0) {
+                    argv.append(ctx.gpa, pt) catch return error.NoMem;
+                },
+            }
+        },
+        // GENERATOR stages are SOURCES: no file operand and no pipeline input
+        // at all (valid only at position 0, which shapeCompatible enforces).
+        // echo (text_value) passes ONE verbatim operand; seq (rows_flag) is
+        // the INTEGER-validated split — distinct from ps/top's rows_flag
+        // passthrough by role.
+        .generator => switch (spec.argv_plan) {
+            // echo: the whole post-':' arg is ONE verbatim text operand
+            // (spaces included); empty args -> argv [bin] -> a bare newline
+            // (GNU echo behavior; a leading-dash arg reaches fx-echo's
+            // option parser and fails loudly)
+            .text_value => if (stage.args.len > 0) {
+                argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+            },
+            // seq: fast-fail on empty args before the spawn (mirrors the
+            // dirname extra-args rejection) — fx-seq with no operand is
+            // MissingOperand, but the engine rejects it itself so the
+            // contract holds even under fake-binary tests
+            .rows_flag => {
+                if (stage.args.len == 0) {
                     std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
                     return error.StageFailed;
                 }
-            }
-        } else {
-            // ps/top: [bin, "--rows", flags?] — the stage args are
-            // whitespace-split into flag tokens (a single "-m"/"-c" rides
-            // through as one; "top:-n 10" must reach the child as TWO argv
-            // tokens or fx-top's parser rejects "-n 10").  Unknown flags fail
-            // loudly in the child; empty args -> [--rows] -> the child's
-            // default sort/count.  Unlike seq there is no engine-side token
-            // validation: the flags are the child's vocabulary, not the
-            // engine's.
+                if (stage.args[0] == '{') {
+                    // the fx-seq Dhall-record form rides verbatim as ONE operand
+                    argv.append(ctx.gpa, stage.args) catch return error.NoMem;
+                } else {
+                    // whitespace-split into 1-3 INTEGER operands, mirroring
+                    // fx-seq parsePosixArgs (a non-integer or a 4th operand
+                    // is a loud engine-side failure, not a surprise child exit)
+                    var n: usize = 0;
+                    var it = std.mem.tokenizeAny(u8, stage.args, " \t");
+                    while (it.next()) |tok| {
+                        n += 1;
+                        if (n > 3) {
+                            std.debug.print("fx-eval: seq: more than 3 integer operands\n", .{});
+                            return error.StageFailed;
+                        }
+                        _ = std.fmt.parseInt(i128, tok, 10) catch {
+                            std.debug.print("fx-eval: seq: operand '{s}' is not an integer\n", .{tok});
+                            return error.StageFailed;
+                        };
+                        argv.append(ctx.gpa, tok) catch return error.NoMem;
+                    }
+                    if (n == 0) {
+                        std.debug.print("fx-eval: seq: stage args required (1-3 integers or a {{...}} Dhall record)\n", .{});
+                        return error.StageFailed;
+                    }
+                }
+            },
+            else => unreachable, // generators are text_value (echo) / rows_flag (seq)
+        },
+        // ps/top: [bin, "--rows", flags?] — the stage args are
+        // whitespace-split into flag tokens (a single "-m"/"-c" rides
+        // through as one; "top:-n 10" must reach the child as TWO argv
+        // tokens or fx-top's parser rejects "-n 10").  Unknown flags
+        // fail loudly in the child; empty args -> [--rows] -> the
+        // child's default sort/count.  Unlike seq there is no
+        // engine-side token validation: the flags are the child's
+        // vocabulary, not the engine's.  The Dhall-record form is NOT
+        // reachable through the pipeline (argv[1] is "--rows", so the
+        // child's record-form branch never fires).
+        .generator_rows => {
             argv.append(ctx.gpa, "--rows") catch return error.NoMem;
             var it = std.mem.tokenizeAny(u8, stage.args, " \t");
             while (it.next()) |tok| {
                 argv.append(ctx.gpa, tok) catch return error.NoMem;
             }
-        }
-    } else if (two_file_stage) {
-        // fast-fail on empty args before the spawn: PATH2 is not optional
-        // (mirrors the seq/dirname pre-spawn rejections above) — without it
-        // the child would misparse its operands or read stdin
-        if (stage.args.len == 0) {
-            std.debug.print("fx-eval: {s}: stage args required (second file operand)\n", .{binary});
-            return error.StageFailed;
-        }
-        argv.append(ctx.gpa, cas_path.?) catch return error.NoMem; // FILE1
-        argv.append(ctx.gpa, stage.args) catch return error.NoMem; // PATH2
-    } else {
-        var cnt: [64]u8 = undefined;
-        if (std.mem.eql(u8, binary, "head") or std.mem.eql(u8, binary, "tail")) {
-            const n = if (stage.args.len > 0) stage.args else "10";
-            const nz = std.fmt.bufPrintZ(&cnt, "{s}", .{n}) catch return error.BadStateDir;
-            argv.append(ctx.gpa, "-n") catch return error.NoMem;
-            argv.append(ctx.gpa, nz) catch return error.NoMem;
-        } else if (stage.args.len > 0 and std.mem.eql(u8, binary, "nl")) {
-            argv.append(ctx.gpa, "-b") catch return error.NoMem;
-            argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-        } else if (stage.args.len > 0 and std.mem.eql(u8, binary, "expand")) {
-            argv.append(ctx.gpa, "-t") catch return error.NoMem;
-            argv.append(ctx.gpa, stage.args) catch return error.NoMem;
-        }
+        },
+        // TWO-FILE stages: the prior stage's CAS blob is FILE1, the stage
+        // args are the SECOND FILE PATH verbatim (live-read at run AND
+        // replay — the accepted find/ls/du live-operand caveat: a changed
+        // PATH2 diverges replay loudly, an absent one fails)
+        .two_file => {
+            // fast-fail on empty args before the spawn: PATH2 is not
+            // optional (mirrors the seq/dirname pre-spawn rejections) —
+            // without it the child would misparse its operands or read stdin
+            if (stage.args.len == 0) {
+                std.debug.print("fx-eval: {s}: stage args required (second file operand)\n", .{binary});
+                return error.StageFailed;
+            }
+            argv.append(ctx.gpa, cas_path.?) catch return error.NoMem; // FILE1
+            argv.append(ctx.gpa, stage.args) catch return error.NoMem; // PATH2
+        },
+        // file-operand stages: [bin, flags..., cas_path].  head/tail/nl/
+        // expand have a synthesized flag vocabulary (specs.synthFlag);
+        // every other .cas_file binary rides its args as raw flag tokens.
+        .file_operand => {
+            if (specs.synthFlag(binary)) |sf| {
+                // head/tail: [-n, N] with the default 10 when args are
+                // empty (dflt != null); nl/expand: [-b|-t, args] only when
+                // args are non-empty (dflt == null)
+                if (sf.dflt != null or stage.args.len > 0) {
+                    const v = if (stage.args.len > 0) stage.args else sf.dflt.?;
+                    const nz = std.fmt.bufPrintZ(&cnt, "{s}", .{v}) catch return error.BadStateDir;
+                    argv.append(ctx.gpa, sf.flag) catch return error.NoMem;
+                    argv.append(ctx.gpa, nz) catch return error.NoMem;
+                }
+            } else {
+                // U1: sort/uniq/cat/wc/cksum/sum/the 6 digests used to fall
+                // through the old chain with NO arm at all, so their stage
+                // args were claimed in the manifest and silently DROPPED
+                // ('sort:-r' hashed like 'sort').  The args now ride as flag
+                // tokens BEFORE the operand: a flag reaches the child's
+                // option parser, a non-flag becomes an extra operand and the
+                // child rejects it loudly (a second FILE operand is
+                // UnexpectedOperand — never a silent drop).
+                var it = std.mem.tokenizeAny(u8, stage.args, " \t");
+                while (it.next()) |tok| {
+                    argv.append(ctx.gpa, tok) catch return error.NoMem;
+                }
+            }
+        },
+        .native => unreachable, // the dispatch table never execs find/grep
+    }
+    if (spec.role == .file_operand) {
         argv.append(ctx.gpa, cas_path.?) catch return error.NoMem;
     }
 
@@ -690,29 +699,30 @@ fn execDispatch(ctx: *RunContext, stage: *const Stage, binary: []const u8, input
         },
     }
 
-    if (std.mem.eql(u8, binary, "wc")) {
-        return wcPostProcess(ctx.gpa, res.stdout);
-    }
-    if (std.mem.eql(u8, binary, "cksum")) {
-        return cksumPostProcess(ctx.gpa, res.stdout);
-    }
-    if (std.mem.eql(u8, binary, "sha256sum") or
-        std.mem.eql(u8, binary, "md5sum") or
-        std.mem.eql(u8, binary, "sha1sum") or
-        std.mem.eql(u8, binary, "sha224sum") or
-        std.mem.eql(u8, binary, "sha384sum") or
-        std.mem.eql(u8, binary, "sha512sum"))
-    {
-        // all GNU-style "{hex}  {path}" digests share the sha256sum shape
-        return sha256sumPostProcess(ctx.gpa, res.stdout);
-    }
-    if (std.mem.eql(u8, binary, "sum")) {
-        return sumPostProcess(ctx.gpa, res.stdout);
-    }
-    if (text_operand_stage) {
-        return singleTextPostProcess(ctx.gpa, res.stdout);
-    }
-    return gpa_dupe(ctx.gpa, res.stdout);
+    // stdout postprocess by the table's wire_mode.  single_digest_strip's
+    // token layouts differ per binary (wc: l w b path; cksum: sum bytes
+    // path; sum: checksum blocks path; digests: "{hex}  {path}"), so that
+    // arm picks the parser with the ONE sanctioned binary-name comparison
+    // in this fn — U1 bars std.mem.eql on `binary` everywhere else.
+    return switch (spec.wire_mode) {
+        // raw lines/bytes and canonical wire rows: interned verbatim
+        .lines, .bytes, .rows => gpa_dupe(ctx.gpa, res.stdout),
+        // exactly one line -> canonical bare-Text single
+        // (basename/dirname/realpath)
+        .single_text => singleTextPostProcess(ctx.gpa, res.stdout),
+        // the checksum line ends in a filename token that IS the state-dir
+        // CAS path (T2/wc-trap): strip it and re-emit the stage's DECLARED
+        // single as canonical JSON (S8)
+        .single_digest_strip => if (std.mem.eql(u8, binary, "wc"))
+            wcPostProcess(ctx.gpa, res.stdout)
+        else if (std.mem.eql(u8, binary, "cksum"))
+            cksumPostProcess(ctx.gpa, res.stdout)
+        else if (std.mem.eql(u8, binary, "sum"))
+            sumPostProcess(ctx.gpa, res.stdout)
+        else
+            // all GNU-style "{hex}  {path}" digests share the sha256sum shape
+            sha256sumPostProcess(ctx.gpa, res.stdout),
+    };
 }
 
 /// wc filename-strip (T2): wc with a FILE operand emits "{l} {w} {b} {path}\n".
@@ -2144,5 +2154,74 @@ test "exec dispatch: text-operand stage errors are StageFailed (hermetic)" {
         defer gpa.free(input);
         const stages = [_]Stage{.{ .name = "realpath", .args = "", .shape_in = .{ .tag = .single }, .shape_out = .{ .tag = .single } }};
         try testing.expectError(error.StageFailed, run(&stages, input, fix.state, bin_dir, gpa, testing.io));
+    }
+}
+
+test "exec dispatch: sort:-r and sort hash DIFFERENTLY (args reach the child)" {
+    // U1 regression: the old per-binary mem.eql chain had NO arm for sort, so
+    // execDispatch appended ONLY the CAS blob path and silently DROPPED
+    // stage.args — `fx-compose 'sort:-r' --input F` recorded "args":"-r" in
+    // the manifest but produced the SAME final hash as 'sort'.  A
+    // reverse-sorting fake makes the two pipelines' final hashes differ iff
+    // "-r" actually rides in argv.
+    const gpa = testing.allocator;
+    const fix = try tmpStateDir(gpa);
+    defer {
+        testRmTree(fix.state);
+        gpa.free(fix.state);
+        _ = rmdir(fix.tmp.ptr);
+        gpa.free(fix.tmp);
+    }
+
+    var binbuf: [std.posix.PATH_MAX]u8 = undefined;
+    const bin_dir = std.fmt.bufPrintZ(&binbuf, "{s}/bin", .{fix.tmp}) catch unreachable;
+    _ = mkdir(bin_dir.ptr, 0o755);
+    // tac: with "-r" reverse the file, else cat it — the argv the child sees
+    // is pinned by the hash difference itself ($1 is "-r" or the CAS path)
+    try writeFakeBin(bin_dir, "sort",
+        \\#!/bin/sh
+        \\if [ "$1" = "-r" ]; then tac "$2"; else cat "$1"; fi
+        \\
+    );
+
+    const input = "1\n2\n3\n";
+    const plain = [_]Stage{.{ .name = "sort", .args = "", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+    const rev = [_]Stage{.{ .name = "sort", .args = "-r", .shape_in = .{ .tag = .lines }, .shape_out = .{ .tag = .lines } }};
+
+    const rep = try run(&plain, input, fix.state, bin_dir, gpa, testing.io);
+    defer freeRunReport(gpa, &rep);
+    const rep_rev = try run(&rev, input, fix.state, bin_dir, gpa, testing.io);
+    defer freeRunReport(gpa, &rep_rev);
+
+    try testing.expect(!std.mem.eql(u8, rep.final_hash, rep_rev.final_hash));
+    const out = try caslog.casGet(gpa, fix.state, rep_rev.final_hash);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("3\n2\n1\n", out);
+}
+
+test "fx-stages name set == dispatch-table name set (drift pin)" {
+    // every dispatch-table entry must have a table row (an EXEC binary with
+    // no row would fall back to error.UnknownCommand at dispatch time, not
+    // silently drop args — but the drift is a bug either way) and vice versa
+    for (dispatchTable()) |e| {
+        try testing.expect(specs.lookup(e.name) != null);
+    }
+    for (specs.all) |s| {
+        var found = false;
+        for (dispatchTable()) |e| {
+            if (std.mem.eql(u8, e.name, s.name)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+    // idempotence is decided in ONE place: the two tables must agree
+    for (specs.all) |s| {
+        for (dispatchTable()) |e| {
+            if (std.mem.eql(u8, e.name, s.name)) {
+                try testing.expectEqual(e.idempotent, s.idempotent);
+            }
+        }
     }
 }
