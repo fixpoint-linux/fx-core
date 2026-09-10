@@ -2,3 +2,8 @@
 .zig-cache
 zig-out/
 fxprobe
+
+# Elm docs site
+node_modules/
+elm-stuff/
+dist/

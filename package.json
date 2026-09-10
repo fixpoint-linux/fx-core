@@ -1,0 +1,14 @@
+{
+    "name": "fx-core-docs",
+    "version": "1.0.0",
+    "description": "The fx-core command reference — generated from the Dhall schemas.",
+    "private": true,
+    "type": "commonjs",
+    "scripts": {
+        "build": "./vendor/dhake/dhake.com"
+    },
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "happy-dom": "^20.11.6"
+    }
+}
