@@ -230,8 +230,10 @@ pub fn build(b: *std.Build) void {
     // --long=value; meta_many: many-positional + single mix + a List Text
     // default with content; meta_noflags: the zero-flag/zero-positional
     // skeleton).  At gate time each is generated into the LOCAL build cache
-    // (.zig-cache/gen-meta/) and `build-obj`d — non-compiling emission of
-    // ANY shape now fails `zig build test` (and `zig build gen-cli-check`)
+    // (.zig-cache/gen-meta/), `build-obj`d AND its test blocks RUN
+    // (addTest+addRunArtifact — fix-2: compiling alone let a runtime-failing
+    // Value coercion ship green) — non-compiling OR runtime-failing emission
+    // of ANY shape now fails `zig build test` (and `zig build gen-cli-check`)
     // instead of a future batch.  Nothing under src/generated/ or the
     // installed artifacts changes: the meta outputs are cache-only, bind no
     // command, and never appear in a commit.
@@ -272,6 +274,28 @@ pub fn build(b: *std.Build) void {
         });
         meta_obj.step.dependOn(&meta_run.step);
         gen_cli_check_step.dependOn(&meta_obj.step);
+
+        // AND RUN THEM (fix-2 SHOULD-FIX 1 — the false gate claim): a
+        // Value-coercion regression that compiles but fails at RUNTIME used
+        // to ship green (build-obj never executes the test blocks, and ls
+        // has no Value flag, so Value semantics had zero live tests).  These
+        // addTest+addRunArtifact steps execute the meta fixtures' test
+        // blocks — meta_values alone runs 21 live vectors over Value-flag
+        // coercion (Natural/Integer/Double, --num=5 inline, missing-value
+        // and BadValue failures), Optional binding and the -A/-D conflict.
+        const meta_test = b.addTest(.{
+            .name = "meta_" ++ schema_name,
+            .root_module = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = out_abs },
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        meta_test.step.dependOn(&meta_run.step);
+        const run_meta_test = b.addRunArtifact(meta_test);
+        run_meta_test.step.dependOn(&meta_obj.step);
+        test_step.dependOn(&run_meta_test.step);
     }
 
     // The generator tool's own unit tests (identifier/escape helpers).

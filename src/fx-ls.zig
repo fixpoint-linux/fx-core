@@ -445,10 +445,12 @@ test "evalDhallArgs rows flag" {
 // the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
 // back to a record literal (fx-cli.renderDhallRecord) and evaluated by THIS
 // file's evalDhallArgs — the exact runtime path `fx-ls '{ ... }'` takes.  Both
-// sides are re-encoded to the canonical term_to_json wire shape and compared
-// as strings, so the assertion is exact and FIELD-COMPLETE by construction: a
-// new ty field that one side forgot to bind breaks the comparison itself, not
-// merely an individually-written assert.
+// sides are re-encoded to the canonical term_to_json wire shape (the SHARED
+// comptime-reflection encoder fx-cli.encodeOptionsWire) and compared as
+// strings, so the assertion is exact and FIELD-COMPLETE by construction: the
+// encoder walks Options via @typeInfo, so a new ty field appears in BOTH
+// encodings or the build itself fails — there is no hand-maintained field
+// list to forget (the false-green class fix-2 killed).
 //
 // The comparison target is the DHALL-RECORD semantics, never the deleted hand
 // parser's behavior where they differ: the generated parser is deliberately
@@ -461,97 +463,29 @@ fn lsSchemaSrc() [:0]u8 {
         @panic("cannot locate schemas/ls.dhall (run tests from the fx-core root)");
 }
 
-/// Encode Options as the canonical wire-JSON bytes term_to_json produces for
-/// the completed record — keys in the ty record order (dhall-c sorted:
-/// all,long,path,rows,sort), bools as true/false, the nullary union as
-/// {"<Ctor>":{}} — the exact JSON evalDhallArgs's walk consumes.  Caller
-/// owns the returned list.
-fn encodeOptionsWire(gpa: Allocator, o: Options) !std.ArrayList(u8) {
-    var b = std.ArrayList(u8).empty;
-    errdefer b.deinit(gpa);
-    try b.appendSlice(gpa, "{\"all\":");
-    try b.appendSlice(gpa, if (o.all) "true" else "false");
-    try b.appendSlice(gpa, ",\"long\":");
-    try b.appendSlice(gpa, if (o.long) "true" else "false");
-    try b.appendSlice(gpa, ",\"path\":\"");
-    try b.appendSlice(gpa, o.path);
-    try b.appendSlice(gpa, "\",\"rows\":");
-    try b.appendSlice(gpa, if (o.rows) "true" else "false");
-    try b.appendSlice(gpa, ",\"sort\":{\"");
-    try b.appendSlice(gpa, @tagName(o.sort));
-    try b.appendSlice(gpa, "\":{}}}");
-    return b;
-}
-
-/// Pretty-print an argv vector for the mismatch diagnostic (0.16 has no
-/// {s} formatting for slices-of-slices).
-fn dbgArgv(buf: []u8, argv: []const []const u8) []const u8 {
-    var n: usize = 0;
-    const put = struct {
-        fn f(b: []u8, len: *usize, s: []const u8) void {
-            for (s) |ch| {
-                if (len.* >= b.len) return;
-                b[len.*] = ch;
-                len.* += 1;
-            }
-        }
-    }.f;
-    put(buf, &n, "[");
-    for (argv, 0..) |a, i| {
-        if (i != 0) put(buf, &n, " ");
-        put(buf, &n, "'");
-        put(buf, &n, a);
-        put(buf, &n, "'");
-    }
-    put(buf, &n, "]");
-    return buf[0..n];
-}
-
-/// One differential vector: `argv` (the POSIX form, exactly as main() passes
-/// it) must yield the same canonical encoding as `user_record` (the record
-/// form, completed against the schema, rendered, and driven through
-/// evalDhallArgs).  On mismatch, both encodings and the inputs are printed.
+/// One differential vector for fx-ls — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies): the generated parser, the schema candidates, and this
+/// file's real runtime record evaluator are the whole per-command surface.
 fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
-    // Everything duped per vector (a bound path operand, the rendered record,
-    // the wire encodings) lives in ONE short-lived arena over the testing
-    // allocator, freed wholesale at return: the default path "." is a static
-    // literal while a bound path is a parser dupe, and the arena makes that
-    // distinction irrelevant to the caller.
+    return cli.expectPosixEqualsRecord(cli_ls, &.{ "schemas/ls.dhall", "fx-core/schemas/ls.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+// Golden-bytes ANCHOR for the shared encoder (review SHOULD-FIX 2): a
+// symmetric bug in cli.encodeOptionsWire (wrong key order or wrong shape on
+// BOTH sides of every differential vector) would pass the matrix — this pins
+// the all-defaults encoding to the exact canonical term_to_json bytes
+// (ASCII default path, so it depends on no escape parity).
+test "ANCHOR: encodeOptionsWire(Options{}) is the canonical all-defaults JSON" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
-
-    const posix_o = try cli_ls.parsePosix(argv, gpa);
-
-    const schema_src = lsSchemaSrc(); // testing.allocator-owned
-    defer std.testing.allocator.free(schema_src);
-    var c = try cli.completeSrc(gpa, schema_src, user_record);
-    defer c.deinit(gpa);
-    const rendered = try cli.renderDhallRecord(gpa, &c.value, c.ty);
-    defer gpa.free(rendered);
-    // evalDhallArgs takes the NUL-terminated argv form (parse_source wants a
-    // C string); the renderer returns a plain slice, so dupeZ bridges (the
-    // same bridge fx-cli's own round-trip test uses)
-    const rendered_z = try gpa.dupeZ(u8, rendered);
-    defer gpa.free(rendered_z);
-    const record_o = try evalDhallArgs(rendered_z, gpa);
-
-    var wire_posix = try encodeOptionsWire(gpa, posix_o);
-    defer wire_posix.deinit(gpa);
-    var wire_record = try encodeOptionsWire(gpa, record_o);
-    defer wire_record.deinit(gpa);
-    std.testing.expectEqualStrings(wire_record.items, wire_posix.items) catch |e| {
-        var abuf: [256]u8 = undefined;
-        std.debug.print(
-            \\differential mismatch: POSIX argv vs Dhall-record form
-            \\  argv:            {s}
-            \\  user record:     {s}
-            \\  POSIX encoding:  {s}
-            \\  record encoding: {s}
-            \\
-        , .{ dbgArgv(&abuf, argv), user_record, wire_posix.items, wire_record.items });
-        return e;
-    };
+    var w = try cli.encodeOptionsWire(Options, gpa, Options{});
+    defer w.deinit(gpa);
+    try std.testing.expectEqualStrings(
+        "{\"all\":false,\"long\":false,\"path\":\".\",\"rows\":false,\"sort\":{\"Name\":{}}}",
+        w.items,
+    );
 }
 
 test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
@@ -589,6 +523,25 @@ test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" 
     // --- --rows (the Lens-3 dispatch flag) composes with the rest ---
     try expectPosixEqualsRecord(&.{ "fx-ls", "--rows" }, "{ rows = True }");
     try expectPosixEqualsRecord(&.{ "fx-ls", "--rows", "-a", "/tmp" }, "{ path = \"/tmp\", all = True, rows = True }");
+
+    // --- exotic operand bytes (SHOULD-FIX 3a): a path with a space and a
+    // quote pins the record side's renderDhallRecord Dhall escaping against
+    // the raw POSIX operand — the encoder must JSON-escape both sides the
+    // same way (the mutator batch hits filenames-with-spaces day one) ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "a b.txt" }, "{ path = \"a b.txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "say \"hi\".txt" }, "{ path = \"say \\\"hi\\\".txt\" }");
+
+    // --- operand-BEFORE-flag interleave (SHOULD-FIX 3b): GNU parity, both
+    // parsers accept an operand ahead of the flags that follow it ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "/tmp", "-l" }, "{ path = \"/tmp\", long = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "op", "-l", "-a" }, "{ path = \"op\", long = True, all = True }");
+
+    // --- duplicate-flag idempotence (SHOULD-FIX 3c): a repeated flag binds
+    // the same value twice — bools stay true, the union selector re-selects
+    // (the same alternative twice is NOT a Conflict; only the -S -t pair is)
+    // ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-l", "-l" }, "{ long = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-S", "-S" }, "{ sort = < Name | Size | MTime >.Size }");
 }
 
 test "DIFFERENTIAL: -S with -t is error.Conflict in BOTH orders (not last-wins)" {
@@ -618,6 +571,11 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
     try std.testing.expectError(error.UnknownOption, cli_ls.parsePosix(&.{ "fx-ls", "-Zz" }, gpa));
     try std.testing.expectError(error.UnknownOption, cli_ls.parsePosix(&.{ "fx-ls", "--bogus" }, gpa));
 
+    // --long=value is a VALUE-FLAG spelling only (schemas/README.md): on a
+    // Flag-kind long like --long the whole token is unknown — the = suffix
+    // does not split (SHOULD-FIX 3d: pin the rejection class explicitly)
+    try std.testing.expectError(error.UnknownOption, cli_ls.parsePosix(&.{ "fx-ls", "--long=true" }, gpa));
+
     // a second bare operand: UnexpectedOperand (the record form cannot
     // express a second positional at all)
     try std.testing.expectError(error.UnexpectedOperand, cli_ls.parsePosix(&.{ "fx-ls", "a", "b" }, gpa));
@@ -638,8 +596,11 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
     // unparseable or out-of-range number): fx-ls has NO Value flag and no
     // numeric ty field, so both classes are unreachable on this command.
     // The generator's behavior for them is pinned by schemas/meta_values.dhall
-    // (compiled + run by the gen-cli meta-gate); the STEP-3 value-flag
-    // commands (head/tail -n, seq) add live vectors to their own matrices.
+    // — generated, COMPILED and RUN by the gen-cli meta-gate (build.zig
+    // addTest+addRunArtifact: 21 live vectors incl. --num=5 inline value,
+    // missing-value and BadValue coercion failures) — and the STEP-3
+    // value-flag commands (head/tail -n, seq) add live vectors to their own
+    // matrices.
 }
 
 // ---------------------------------------------------------------------------

@@ -367,8 +367,13 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > argv matrix — each vector runs `cli_ls.parsePosix(argv)` against the record
 > form completed from the schema, rendered by `renderDhallRecord`, and driven
 > through the runtime `evalDhallArgs`, both sides compared as canonical
-> term_to_json bytes (field-complete by construction).  The generated parser
-> is deliberately stricter where the hand parser drifted: `-S -t` is
+> term_to_json bytes (field-complete by construction).  The encoder and the
+> differential runner are SHARED (`fx-cli.encodeOptionsWire` /
+> `fx-cli.expectPosixEqualsRecord`) — a comptime-reflection encoder over the
+> generated `Options` struct, so no hand-maintained field list can drift, and
+> a migrated command's differential is a one-line wrapper supplying its
+> generated parser module, schema path and record evaluator.  The generated
+> parser is deliberately stricter where the hand parser drifted: `-S -t` is
 > `error.Conflict` (schema `mutually_exclusive`), a second bare operand is
 > rejected, and `-la` clustering / `--long` long forms are accepted.  The
 > remaining commands migrate in flag-shape batches, each landing with its own

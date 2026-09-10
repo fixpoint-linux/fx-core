@@ -888,6 +888,177 @@ pub fn readSchemaFile(gpa: Allocator, candidates: []const []const u8) Error![:0]
 }
 
 // ---------------------------------------------------------------------------
+// canonical Options wire encoding + the generic differential runner
+// (fix-2: the shared STEP-3 template — ONE home for all 58 migrations)
+// ---------------------------------------------------------------------------
+
+/// Encode a generated Options struct (cli_<name>.Options) as the canonical
+/// wire-JSON bytes term_to_json produces for the completed record: "{...}"
+/// with keys in COMPTIME FIELD ORDER — dhall-c sort_fields() alphabetizes the
+/// ty record and the generator emits the struct in that same sorted order, so
+/// comptime order IS the canonical key order — bool as true/false, a nullary
+/// union as {"<Ctor>":{}} (the enum tag is the ctor name the generator
+/// emits), numbers as {d}, Text JSON-escaped exactly like dhall-c's shared
+/// qstr escaper (serialize.zig) so a '"' or '\' in a bound operand encodes
+/// identically on both sides of a differential vector.
+///
+/// Field coverage is @typeInfo reflection, NOT a hand-maintained list — the
+/// false-green class fix-2 kills: a STEP-3 schema field the encoder "forgets"
+/// is impossible, and an unsupported field type is a COMPILE error naming the
+/// field.  Optional and many-slice fields deliberately have no arms yet (no
+/// schema uses them through this path); when the STEP-3 batches introduce
+/// them, add `.optional` (null / Some payload) and slice (JSON array) arms —
+/// the Text arm's exact-type check below is what forces that decision loudly
+/// instead of silently encoding `?T` as "" (Zig `for` over an optional is
+/// legal and iterates 0-or-1 times).  Double fields print via Zig {d}; parity
+/// with dhall-c's dbl_fmt gets pinned by the first Double-schema differential.
+pub fn encodeOptionsWire(comptime T: type, gpa: Allocator, o: T) Error!std.ArrayList(u8) {
+    var b = std.ArrayList(u8).empty;
+    errdefer b.deinit(gpa);
+    try b.appendSlice(gpa, "{");
+    inline for (@typeInfo(T).@"struct".fields, 0..) |f, fi| {
+        if (fi != 0) try b.appendSlice(gpa, ",");
+        try b.appendSlice(gpa, "\"");
+        try b.appendSlice(gpa, f.name);
+        try b.appendSlice(gpa, "\":");
+        switch (@typeInfo(f.type)) {
+            .bool => try b.appendSlice(gpa, if (@field(o, f.name)) "true" else "false"),
+            .@"enum" => {
+                // nullary-union ctor -> {"<Ctor>":{}}
+                try b.appendSlice(gpa, "{\"");
+                try b.appendSlice(gpa, @tagName(@field(o, f.name)));
+                try b.appendSlice(gpa, "\":{}}");
+            },
+            // 1100 covers any {d} rendering of an f64 (denormals ~1100 chars)
+            .int, .float => {
+                var nb: [1100]u8 = undefined;
+                const s = std.fmt.bufPrint(&nb, "{d}", .{@field(o, f.name)}) catch unreachable;
+                try b.appendSlice(gpa, s);
+            },
+            else => {
+                // Text ([]const u8) — the only remaining v1 field shape.
+                // Exact comptime type check: anything else (an Optional, a
+                // many-slice, ...) must grow its own arm above, never sneak
+                // through here mis-encoded.
+                if (f.type != []const u8)
+                    @compileError(std.fmt.comptimePrint(
+                        "encodeOptionsWire: field '{s}' is not Text; add an arm (Optional/List land with STEP 3)",
+                        .{f.name},
+                    ));
+                try b.append(gpa, '"');
+                for (@field(o, f.name)) |c| switch (c) {
+                    '"' => try b.appendSlice(gpa, "\\\""),
+                    '\\' => try b.appendSlice(gpa, "\\\\"),
+                    8 => try b.appendSlice(gpa, "\\b"),
+                    12 => try b.appendSlice(gpa, "\\f"),
+                    '\n' => try b.appendSlice(gpa, "\\n"),
+                    '\r' => try b.appendSlice(gpa, "\\r"),
+                    '\t' => try b.appendSlice(gpa, "\\t"),
+                    else => {
+                        if (c < 0x20) {
+                            var hb: [8]u8 = undefined;
+                            const h = std.fmt.bufPrint(&hb, "\\u{x:0>4}", .{c}) catch unreachable;
+                            try b.appendSlice(gpa, h);
+                        } else try b.append(gpa, c);
+                    },
+                };
+                try b.append(gpa, '"');
+            },
+        }
+    }
+    try b.appendSlice(gpa, "}");
+    return b;
+}
+
+/// Pretty-print an argv vector for the mismatch diagnostic (0.16 has no {s}
+/// formatting for slices-of-slices).
+pub fn dbgArgv(buf: []u8, argv: []const []const u8) []const u8 {
+    var n: usize = 0;
+    const put = struct {
+        fn f(b: []u8, len: *usize, s: []const u8) void {
+            for (s) |ch| {
+                if (len.* >= b.len) return;
+                b[len.*] = ch;
+                len.* += 1;
+            }
+        }
+    }.f;
+    put(buf, &n, "[");
+    for (argv, 0..) |a, i| {
+        if (i != 0) put(buf, &n, " ");
+        put(buf, &n, "'");
+        put(buf, &n, a);
+        put(buf, &n, "'");
+    }
+    put(buf, &n, "]");
+    return buf[0..n];
+}
+
+/// One generic differential vector — THE drift-kill proof every migrated
+/// command copies (STEP-2 template, shared here so the 58 migrations copy
+/// nothing but a one-line wrapper): `argv` (the POSIX form, exactly as
+/// main() passes it) must yield the same canonical encoding as `user_record`
+/// (the Dhall record form of the same intent) completed against the schema
+/// ((dflt // user) : ty via completeSrc), rendered back to a record literal
+/// (renderDhallRecord) and driven through the command's OWN runtime record
+/// evaluator `evalFn` — the exact path `fx-<name> '{ ... }'` takes.  Both
+/// sides are encoded by encodeOptionsWire and compared as strings.
+///
+/// Per-command surface = { Cli (the cli_<name> module), schema_candidates,
+/// evalFn } — everything else lives here, once.
+pub fn expectPosixEqualsRecord(
+    comptime Cli: type,
+    schema_candidates: []const []const u8,
+    evalFn: anytype,
+    argv: []const []const u8,
+    user_record: [:0]const u8,
+) !void {
+    // Everything duped per vector (a bound path operand, the rendered record,
+    // the wire encodings) lives in ONE short-lived arena over the testing
+    // allocator, freed wholesale at return: the default path "." is a static
+    // literal while a bound path is a parser dupe, and the arena makes that
+    // distinction irrelevant to the caller.  A rejected vector needs the same
+    // arena (the generated parser does not free operand dupes bound before a
+    // failing token — same discipline as the hand parsers it replaced).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try Cli.parsePosix(argv, gpa);
+
+    const schema_src = readSchemaFile(std.testing.allocator, schema_candidates) catch
+        @panic("cannot locate schema file (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    var c = try completeSrc(gpa, schema_src, user_record);
+    defer c.deinit(gpa);
+    const rendered = try renderDhallRecord(gpa, &c.value, c.ty);
+    defer gpa.free(rendered);
+    // evalFn takes the NUL-terminated argv form (parse_source wants a C
+    // string); the renderer returns a plain slice, so dupeZ bridges (the
+    // same bridge the round-trip test below uses)
+    const rendered_z = try gpa.dupeZ(u8, rendered);
+    defer gpa.free(rendered_z);
+    const record_o = try evalFn(rendered_z, gpa);
+
+    var wire_posix = try encodeOptionsWire(Cli.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try encodeOptionsWire(Cli.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    std.testing.expectEqualStrings(wire_record.items, wire_posix.items) catch |e| {
+        var abuf: [256]u8 = undefined;
+        std.debug.print(
+            \\differential mismatch: POSIX argv vs Dhall-record form
+            \\  argv:            {s}
+            \\  user record:     {s}
+            \\  POSIX encoding:  {s}
+            \\  record encoding: {s}
+            \\
+        , .{ dbgArgv(&abuf, argv), user_record, wire_posix.items, wire_record.items });
+        return e;
+    };
+}
+
+// ---------------------------------------------------------------------------
 // tests — the STEP 0 proof
 // ---------------------------------------------------------------------------
 

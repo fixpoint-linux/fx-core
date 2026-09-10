@@ -37,13 +37,35 @@ cluster rejected, value short does not cluster, `--long=value` binds).
 
 `meta_values` / `meta_many` / `meta_noflags` are fixtures for the GENERATOR
 META-GATE: at `zig build test` time each is generated into the local build
-cache (`.zig-cache/gen-meta/`) and `build-obj`d, so a non-compiling emission
-of ANY shape — including test blocks — fails the gate instead of the first
-STEP-3 batch that uses that shape.  `ls.dhall` alone exercises none of the
-Value/Optional/many-positional shapes, which is how two non-compiling
-emissions shipped invisibly through it (see the handoff-cmdif review).
+cache (`.zig-cache/gen-meta/`), `build-obj`d, and its test blocks RUN — so a
+non-compiling OR runtime-failing emission of ANY shape fails the gate instead
+of the first STEP-3 batch that uses that shape (Value-flag coercion semantics
+are otherwise untested: `ls` has no Value flag).  `ls.dhall` alone exercises
+none of the Value/Optional/many-positional shapes, which is how two
+non-compiling emissions shipped invisibly through it (see the handoff-cmdif
+review).
 Keep the fixtures growing with the vocabulary: when a new emission shape is
 added to the generator, extend a meta fixture to exercise it.
+
+## The manual smoke (STABLE fixture — do NOT use /tmp)
+
+The per-command differential matrix is the authoritative equality proof, but
+each migration also runs this manual smoke on a REAL binary.  Use a STABLE
+fixture dir (e.g. `mktemp -d`, or any frozen directory) — NEVER a bare `/tmp`
+or other shared/live directory: `fx-ls` itself `mkdtemp`s `/tmp/fx-ls-*` per
+run and appends to its own prior output file, so two invocations against
+`/tmp` differ even posix-vs-posix (verified during STEP 2; 58 future batch
+runners should not re-derive this).
+
+```sh
+FXD=$(mktemp -d); : > "$FXD/a"; : > "$FXD/b"
+LD_LIBRARY_PATH=../datalog-dafsa ./zig-out/bin/fx-ls -l -a -S "$FXD" > /tmp/a.out
+LD_LIBRARY_PATH=../datalog-dafsa ./zig-out/bin/fx-ls \
+  "{ path = \"$FXD\", long = True, all = True, sort = < Name | Size | MTime >.Size }" \
+  > /tmp/b.out
+cmp /tmp/a.out /tmp/b.out   # -> byte-identical
+rm -rf "$FXD" /tmp/a.out /tmp/b.out
+```
 
 ## Known v1 limitations (documented, by design)
 
