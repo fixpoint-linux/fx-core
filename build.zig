@@ -239,7 +239,7 @@ pub fn build(b: *std.Build) void {
     // installed artifacts changes: the meta outputs are cache-only, bind no
     // command, and never appear in a commit.
     // -----------------------------------------------------------------------
-    const meta_schemas = [_][]const u8{ "meta_values", "meta_many", "meta_noflags" };
+    const meta_schemas = [_][]const u8{ "meta_values", "meta_many", "meta_noflags", "meta_boolflags" };
     inline for (meta_schemas) |schema_name| {
         const out_rel = std.fmt.comptimePrint("cli_{s}.zig", .{schema_name});
         const schema_path = std.fmt.comptimePrint("schemas/{s}.dhall", .{schema_name});

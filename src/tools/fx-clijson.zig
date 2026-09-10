@@ -975,10 +975,30 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         \\pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
         \\
     );
-    // degenerate shapes: a no-flags/no-positionals schema never mutates o
-    // and never allocates — discard the unused parameter so the emitted
-    // file compiles (caught by the meta_noflags gate fixture)
-    if (!has_flags and !has_pos) try out.put("    _ = gpa;\n");
+    // Does the emitted body actually use gpa?  gpa is touched only by a Text
+    // (or Optional Text) Value-flag binding (the dupe) or by a positional
+    // (bindOperand dupes).  A schema whose flags are all Bool/union selectors
+    // and that has no positionals never references gpa — discarding it keeps
+    // the emitted file compiling (bool-only commands date/ps/top/uname, and
+    // the meta_noflags gate fixture).  Note Zig REJECTS a discard of a
+    // parameter that IS used ("pointless discard"), so this must be precise.
+    const gpa_used = blk: {
+        if (has_pos) break :blk true;
+        for (s.posix.flags) |f| {
+            if (f.kind != .value) continue;
+            const fty = s.ty.findField(f.field) orelse continue;
+            switch (fty.*) {
+                .text => break :blk true,
+                .optional => |inner| switch (inner.*) {
+                    .text => break :blk true,
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        break :blk false;
+    };
+    if (!gpa_used) try out.put("    _ = gpa;\n");
 
     if (has_groups) try out.put("    var seen: u32 = 0; // bit i set once flags[i] matched\n");
     if (many_id) |mid| {
