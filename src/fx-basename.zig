@@ -450,8 +450,19 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+    // THE `-` OPERAND (stdin): a shell's RUN mode pipes a value into this
+    // stage, but the operand must arrive in argv — so a lone `-` takes the
+    // value from stdin instead (the `cat -` / `sha256sum -` convention).  A
+    // literal pathname of "-" is not a plausible operand here, so claiming the
+    // token is safe; this is a deliberate divergence from reading it as a path.
     const stdout_file = std.Io.File.stdout();
-    const name = opts.input;
+    const name = if (cli.isStdinOperand(opts.input))
+        cli.readOperandLine(opt_alloc) catch {
+            std.debug.print("fx-basename: failed to read the '-' operand from stdin\n", .{});
+            std.process.exit(1);
+        }
+    else
+        opts.input;
     if (name.len == 0) {
         std.debug.print("fx-basename: missing operand\n", .{});
         std.process.exit(1);

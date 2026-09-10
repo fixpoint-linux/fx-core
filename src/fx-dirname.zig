@@ -385,13 +385,28 @@ pub fn main(init: std.process.Init) !void {
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
-    if (opts.names.len == 0) {
+    // THE `-` OPERAND (stdin): a shell's RUN mode pipes a value into this
+    // stage, but the operand must arrive in argv — so a lone `-` takes the
+    // value from stdin instead (the `cat -` / `sha256sum -` convention).  A
+    // literal pathname of "-" is not a plausible operand here, so claiming the
+    // token is safe; this is a deliberate divergence from reading it as a path.
+    // `-` alone (or only `-` operands) => the value(s) come from stdin.
+    var stdin_names: []const []const u8 = &.{};
+    if (opts.names.len == 1 and cli.isStdinOperand(opts.names[0])) {
+        const line = cli.readOperandLine(opt_alloc) catch {
+            std.debug.print("fx-dirname: failed to read the '-' operand from stdin\n", .{});
+            std.process.exit(1);
+        };
+        stdin_names = opt_alloc.dupe([]const u8, &.{line}) catch std.process.exit(1);
+    }
+    const names = if (stdin_names.len > 0) stdin_names else opts.names;
+    if (names.len == 0) {
         std.debug.print("fx-dirname: missing operand\n", .{});
         std.process.exit(1);
     }
 
     const stdout_file = std.Io.File.stdout();
-    for (opts.names) |n| {
+    for (names) |n| {
         const r = dirnameOf(n);
         _ = std.Io.File.writeStreamingAll(stdout_file, init.io, r) catch return error.WriteFailed;
         _ = std.Io.File.writeStreamingAll(stdout_file, init.io, "\n") catch return error.WriteFailed;

@@ -1145,6 +1145,47 @@ fn isIdentByte(ch: u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// the `-` operand convention (the ONE I/O-touching helper here)
+// ---------------------------------------------------------------------------
+
+/// Read ONE operand value from stdin: the `-` operand convention shared by the
+/// text-operand commands (basename/dirname/realpath).  A shell's RUN mode pipes
+/// a value into such a stage, but those commands need their operand in argv, so
+/// the pipeline passes `-` and the command takes the value from stdin instead —
+/// the same convention `cat -` / `sha256sum -` use.  Trailing CR/LF is stripped;
+/// an empty read yields an empty slice (the caller reports its own missing-operand
+/// error).  libc read on fd 0, matching the extern-read idiom the commands
+/// already use (this module is otherwise pure — no io plumbing, no arena).
+pub fn readOperandLine(gpa: Allocator) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = read(0, &tmp, tmp.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        const chunk = tmp[0..@intCast(n)];
+        if (std.mem.indexOfScalar(u8, chunk, '\n')) |nl| {
+            out.appendSlice(gpa, chunk[0..nl]) catch return error.OutOfMemory;
+            break;
+        }
+        out.appendSlice(gpa, chunk) catch return error.OutOfMemory;
+    }
+    var s = out.toOwnedSlice(gpa) catch return error.OutOfMemory;
+    // strip a trailing CR so a CRLF pipe behaves like a text file
+    if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
+    return s;
+}
+
+/// True when an operand token is the stdin marker, i.e. exactly "-".  (A bare
+/// `-` is never a plausible literal pathname for these commands, which is why
+/// the convention is safe to claim; it is a deliberate divergence from reading
+/// `-` as a filename and is documented on each command.)
+pub fn isStdinOperand(tok: []const u8) bool {
+    return tok.len == 1 and tok[0] == '-';
+}
+
+// ---------------------------------------------------------------------------
 // schema file loading (tests / the STEP-1 generator)
 // ---------------------------------------------------------------------------
 
@@ -1966,4 +2007,17 @@ test "evalSchemaSrc: optional out section loads, preserves declared order via ou
     var s2 = try evalSchemaSrc(gpa, no_out);
     defer s2.deinit(gpa);
     try testing.expect(s2.out == null);
+}
+
+test "the '-' operand convention: isStdinOperand claims ONLY a lone dash" {
+    // A lone `-` is the stdin marker for the text-operand commands
+    // (basename/dirname/realpath).  It must NOT claim anything else — a real
+    // pathname beginning with a dash is not a stdin marker, and "" is not one
+    // either (an empty operand is a missing-operand error, not a pipe read).
+    try testing.expect(isStdinOperand("-"));
+    try testing.expect(!isStdinOperand(""));
+    try testing.expect(!isStdinOperand("--"));
+    try testing.expect(!isStdinOperand("-x"));
+    try testing.expect(!isStdinOperand("x-"));
+    try testing.expect(!isStdinOperand("/tmp/-"));
 }
