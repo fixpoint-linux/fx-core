@@ -353,6 +353,27 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > and `seq:3 |> paste:/tmp/b |> sort` type-check; `paste |> find` (lines vs
 > rows) and `sort |> seq` (lines vs none) are rejected with `ShapeMismatch`.
 
+> **Single-schema command interfaces (2026-09, cmdif):** each command's TWO
+> arg forms — the typed Dhall record and the POSIX flags — are now derived
+> from ONE source, `schemas/<name>.dhall` (a `{ ty, dflt, posix }` record
+> literal).  `fx-cli.zig` is the shared schema evaluator (completion is
+> `(dflt // user) : ty`, defaults LEFT-biased); `src/tools/fx-clijson.zig`
+> generates a PURE-Zig POSIX parser (`src/generated/cli_<name>.zig`, imported
+> by the command binary as its own module — no dhall at runtime, plan RISK 4)
+> and `zig build gen-cli-check` (wired into `test`) fails on a stale or
+> hand-edited generated file.  `fx-ls` is migrated (the STEP-2 template): its
+> hand `parsePosixArgs`/`Options`/`SortTag` are deleted, and the
+> **differential test** in `fx-ls.zig` proves the two arg forms equal over an
+> argv matrix — each vector runs `cli_ls.parsePosix(argv)` against the record
+> form completed from the schema, rendered by `renderDhallRecord`, and driven
+> through the runtime `evalDhallArgs`, both sides compared as canonical
+> term_to_json bytes (field-complete by construction).  The generated parser
+> is deliberately stricter where the hand parser drifted: `-S -t` is
+> `error.Conflict` (schema `mutually_exclusive`), a second bare operand is
+> rejected, and `-la` clustering / `--long` long forms are accepted.  The
+> remaining commands migrate in flag-shape batches, each landing with its own
+> differential matrix (the same template).
+
 **Determinism as proof, not hope.** Replaying a pipeline re-runs each stage and
 compares the produced intermediate against the recorded sha256. A divergence is a
 *caught non-deterministic command* (or a CAS hash collision — astronomically

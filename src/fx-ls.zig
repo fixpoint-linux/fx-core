@@ -10,14 +10,21 @@
 // first), which is just a Zig reverse.  Name sort is a Zig lex sort over the
 // resolved name syms (the engine's sym ids are insertion-ordered, not lex).
 //
-// Two arg forms:
+// Two arg forms, ONE source of truth (schemas/ls.dhall — the STEP-2
+// migration template for the whole fx-core corpus):
 //   fx-ls '{ path = ".", long = True, all = True, sort = < Name | Size | MTime >.Size }'  Dhall
-//   fx-ls [-l] [-a] [-S|-t] [PATH]                                          POSIX fallback
+//   fx-ls [-l] [-a] [-S|-t] [PATH]                                          POSIX
 //
-// Dhall record: { path : Text, long : Bool, all : Bool,
-//                 sort : < Name | Size | MTime > }  with defaults path=".",
-//                 long=False, all=False, sort=Name.  The nullary union
-//                 serializes as {"sort":{"Size":{}}} (find's union-parse idiom).
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_ls.zig,
+// emitted from schemas/ls.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  The Dhall
+// record form is evaluated by evalDhallArgs below (parse -> infer ->
+// normalize -> term_to_json -> field walk).  The two are proven equal field
+// for field by the differential test below — the drift-kill proof every
+// migrated command copies.  Deliberate strengthening of the generated parser
+// over the hand parser it replaced: -S and -t together are error.Conflict
+// (not silent last-wins), short clusters (-la) and --long/--all long forms
+// are accepted, and a second bare operand is error.UnexpectedOperand.
 //
 // Long-format line: mode-string(10) + space + width-10 size + space + mtime +
 // space + name.  No uid/gid/owner columns and no "total N" line (documented
@@ -34,6 +41,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
+const cli_ls = @import("cli-ls");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -61,18 +70,12 @@ extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/ls.dhall)
 // ---------------------------------------------------------------------------
 
-const SortTag = enum { Name, Size, MTime }; // Dhall < Name | Size | MTime >
-
-const Options = struct {
-    path: []const u8 = ".",
-    long: bool = false,
-    all: bool = false,
-    sort: SortTag = .Name,
-    rows: bool = false, // --rows: canonical wire rows instead of display text
-};
+const SortTag = cli_ls.sort; // Dhall < Name | Size | MTime >
+const Options = cli_ls.Options;
+const parsePosixArgs = cli_ls.parsePosix; // the generated POSIX parser
 
 /// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
 /// registry's builtin("ls") output type ("{ name : Text, size : Natural,
@@ -433,70 +436,210 @@ test "evalDhallArgs rows flag" {
 }
 
 // ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 2; the template every
+// STEP-3 migration copies)
 // ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal (fx-cli.renderDhallRecord) and evaluated by THIS
+// file's evalDhallArgs — the exact runtime path `fx-ls '{ ... }'` takes.  Both
+// sides are re-encoded to the canonical term_to_json wire shape and compared
+// as strings, so the assertion is exact and FIELD-COMPLETE by construction: a
+// new ty field that one side forgot to bind breaks the comparison itself, not
+// merely an individually-written assert.
+//
+// The comparison target is the DHALL-RECORD semantics, never the deleted hand
+// parser's behavior where they differ: the generated parser is deliberately
+// stricter on -S -t (error.Conflict, both orders — asserted below as its own
+// vector class), so no equality vector carries that combination.
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-l")) {
-            o.long = true;
-        } else if (std.mem.eql(u8, a, "-a")) {
-            o.all = true;
-        } else if (std.mem.eql(u8, a, "-S")) {
-            o.sort = .Size;
-        } else if (std.mem.eql(u8, a, "-t")) {
-            o.sort = .MTime;
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-ls: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            o.path = try gpa.dupe(u8, a);
+/// Locate schemas/ls.dhall (tests run from varying CWDs).  Caller frees.
+fn lsSchemaSrc() [:0]u8 {
+    return cli.readSchemaFile(std.testing.allocator, &.{ "schemas/ls.dhall", "fx-core/schemas/ls.dhall" }) catch
+        @panic("cannot locate schemas/ls.dhall (run tests from the fx-core root)");
+}
+
+/// Encode Options as the canonical wire-JSON bytes term_to_json produces for
+/// the completed record — keys in the ty record order (dhall-c sorted:
+/// all,long,path,rows,sort), bools as true/false, the nullary union as
+/// {"<Ctor>":{}} — the exact JSON evalDhallArgs's walk consumes.  Caller
+/// owns the returned list.
+fn encodeOptionsWire(gpa: Allocator, o: Options) !std.ArrayList(u8) {
+    var b = std.ArrayList(u8).empty;
+    errdefer b.deinit(gpa);
+    try b.appendSlice(gpa, "{\"all\":");
+    try b.appendSlice(gpa, if (o.all) "true" else "false");
+    try b.appendSlice(gpa, ",\"long\":");
+    try b.appendSlice(gpa, if (o.long) "true" else "false");
+    try b.appendSlice(gpa, ",\"path\":\"");
+    try b.appendSlice(gpa, o.path);
+    try b.appendSlice(gpa, "\",\"rows\":");
+    try b.appendSlice(gpa, if (o.rows) "true" else "false");
+    try b.appendSlice(gpa, ",\"sort\":{\"");
+    try b.appendSlice(gpa, @tagName(o.sort));
+    try b.appendSlice(gpa, "\":{}}}");
+    return b;
+}
+
+/// Pretty-print an argv vector for the mismatch diagnostic (0.16 has no
+/// {s} formatting for slices-of-slices).
+fn dbgArgv(buf: []u8, argv: []const []const u8) []const u8 {
+    var n: usize = 0;
+    const put = struct {
+        fn f(b: []u8, len: *usize, s: []const u8) void {
+            for (s) |ch| {
+                if (len.* >= b.len) return;
+                b[len.*] = ch;
+                len.* += 1;
+            }
         }
+    }.f;
+    put(buf, &n, "[");
+    for (argv, 0..) |a, i| {
+        if (i != 0) put(buf, &n, " ");
+        put(buf, &n, "'");
+        put(buf, &n, a);
+        put(buf, &n, "'");
     }
-    return o;
+    put(buf, &n, "]");
+    return buf[0..n];
 }
 
-test "parsePosixArgs defaults" {
-    const o = try parsePosixArgs(&.{"fx-ls"}, std.testing.allocator);
-    try std.testing.expectEqualStrings(".", o.path);
-    try std.testing.expect(!o.long);
-    try std.testing.expect(!o.all);
-    try std.testing.expectEqual(@as(SortTag, .Name), o.sort);
+/// One differential vector: `argv` (the POSIX form, exactly as main() passes
+/// it) must yield the same canonical encoding as `user_record` (the record
+/// form, completed against the schema, rendered, and driven through
+/// evalDhallArgs).  On mismatch, both encodings and the inputs are printed.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    // Everything duped per vector (a bound path operand, the rendered record,
+    // the wire encodings) lives in ONE short-lived arena over the testing
+    // allocator, freed wholesale at return: the default path "." is a static
+    // literal while a bound path is a parser dupe, and the arena makes that
+    // distinction irrelevant to the caller.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_ls.parsePosix(argv, gpa);
+
+    const schema_src = lsSchemaSrc(); // testing.allocator-owned
+    defer std.testing.allocator.free(schema_src);
+    var c = try cli.completeSrc(gpa, schema_src, user_record);
+    defer c.deinit(gpa);
+    const rendered = try cli.renderDhallRecord(gpa, &c.value, c.ty);
+    defer gpa.free(rendered);
+    // evalDhallArgs takes the NUL-terminated argv form (parse_source wants a
+    // C string); the renderer returns a plain slice, so dupeZ bridges (the
+    // same bridge fx-cli's own round-trip test uses)
+    const rendered_z = try gpa.dupeZ(u8, rendered);
+    defer gpa.free(rendered_z);
+    const record_o = try evalDhallArgs(rendered_z, gpa);
+
+    var wire_posix = try encodeOptionsWire(gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try encodeOptionsWire(gpa, record_o);
+    defer wire_record.deinit(gpa);
+    std.testing.expectEqualStrings(wire_record.items, wire_posix.items) catch |e| {
+        var abuf: [256]u8 = undefined;
+        std.debug.print(
+            \\differential mismatch: POSIX argv vs Dhall-record form
+            \\  argv:            {s}
+            \\  user record:     {s}
+            \\  POSIX encoding:  {s}
+            \\  record encoding: {s}
+            \\
+        , .{ dbgArgv(&abuf, argv), user_record, wire_posix.items, wire_record.items });
+        return e;
+    };
 }
 
-test "parsePosixArgs long all S t path" {
-    const args = [_][:0]const u8{ "fx-ls", "-l", "-a", "-S", "/tmp" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.path);
-    try std.testing.expect(o.long);
-    try std.testing.expect(o.all);
-    try std.testing.expectEqual(@as(SortTag, .Size), o.sort);
-    try std.testing.expectEqualStrings("/tmp", o.path);
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- flags: each alone, plus every pairwise-reachable combination ---
+    try expectPosixEqualsRecord(&.{ "fx-ls" }, "{ }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-l" }, "{ long = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "--long" }, "{ long = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-a" }, "{ all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "--all" }, "{ all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-l", "-a" }, "{ long = True, all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-l", "-t" }, "{ long = True, sort = < Name | Size | MTime >.MTime }");
+
+    // --- the sort union-selector flags: every alternative round-trips.
+    // Name is the DEFAULT — it has no POSIX spelling, so it is pinned by the
+    // empty-argv vector and the explicit-record vector below.
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-S" }, "{ sort = < Name | Size | MTime >.Size }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-t" }, "{ sort = < Name | Size | MTime >.MTime }");
+    try expectPosixEqualsRecord(&.{ "fx-ls" }, "{ sort = < Name | Size | MTime >.Name }");
+
+    // --- short-flag clustering: -la == -l -a, any composition order ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-la" }, "{ long = True, all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-al" }, "{ long = True, all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-laS" }, "{ long = True, all = True, sort = < Name | Size | MTime >.Size }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-tl" }, "{ long = True, sort = < Name | Size | MTime >.MTime }");
+
+    // --- the flagship: fx-ls -l -a -S /tmp (the plan's smoke pair) ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-l", "-a", "-S", "/tmp" }, "{ path = \"/tmp\", long = True, all = True, sort = < Name | Size | MTime >.Size }");
+
+    // --- positional PATH: bare operand, bare '-' operand, '--' terminator ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "op" }, "{ path = \"op\" }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-" }, "{ path = \"-\" }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "--", "-l" }, "{ path = \"-l\" }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "-l", "--", "/tmp" }, "{ path = \"/tmp\", long = True }");
+
+    // --- --rows (the Lens-3 dispatch flag) composes with the rest ---
+    try expectPosixEqualsRecord(&.{ "fx-ls", "--rows" }, "{ rows = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ls", "--rows", "-a", "/tmp" }, "{ path = \"/tmp\", all = True, rows = True }");
 }
 
-test "parsePosixArgs -t sets MTime" {
-    const args = [_][:0]const u8{ "fx-ls", "-t" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(@as(SortTag, .MTime), o.sort);
+test "DIFFERENTIAL: -S with -t is error.Conflict in BOTH orders (not last-wins)" {
+    // The deliberate, schema-pinned strengthening (schemas/ls.dhall
+    // mutually_exclusive = [[\"-S\",\"-t\"]]): the hand parser this file used
+    // to carry silently let the last flag win; the generated parser rejects
+    // the combination.  The Dhall-record form cannot express the conflict at
+    // all (it names `sort` exactly once) — which is why the equality matrix
+    // above contains no such vector, and the assertion here runs against the
+    // generated parser directly.
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.Conflict, cli_ls.parsePosix(&.{ "fx-ls", "-S", "-t" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_ls.parsePosix(&.{ "fx-ls", "-t", "-S" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_ls.parsePosix(&.{ "fx-ls", "-St" }, gpa));
 }
 
-test "parsePosixArgs unknown option rejected" {
-    const args = [_][:0]const u8{ "fx-ls", "-r" };
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
-}
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
 
-test "parsePosixArgs --rows" {
-    const args = [_][:0]const u8{ "fx-ls", "--rows", "-a", "/tmp" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.path);
-    try std.testing.expect(o.rows);
-    try std.testing.expect(o.all);
-    try std.testing.expectEqualStrings("/tmp", o.path);
+    // unknown option (POSIX) ~ unknown field (record form, below)
+    try std.testing.expectError(error.UnknownOption, cli_ls.parsePosix(&.{ "fx-ls", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_ls.parsePosix(&.{ "fx-ls", "--bogus" }, gpa));
+
+    // a second bare operand: UnexpectedOperand (the record form cannot
+    // express a second positional at all)
+    try std.testing.expectError(error.UnexpectedOperand, cli_ls.parsePosix(&.{ "fx-ls", "a", "b" }, gpa));
+
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_ls.parsePosix(&.{ "fx-ls", "-lZ" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, bogus union constructor.  The POSIX form has no
+    // spelling that could reach any of these (its analogue is -Zz above).
+    const schema_src = lsSchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ sort = < Name | Size | MTime >.Foo }"));
+
+    // MissingValue / BadValue (a Value flag with no next token / an
+    // unparseable or out-of-range number): fx-ls has NO Value flag and no
+    // numeric ty field, so both classes are unreachable on this command.
+    // The generator's behavior for them is pinned by schemas/meta_values.dhall
+    // (compiled + run by the gen-cli meta-gate); the STEP-3 value-flag
+    // commands (head/tail -n, seq) add live vectors to their own matrices.
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +901,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/ls.dhall -> src/generated/cli_ls.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 

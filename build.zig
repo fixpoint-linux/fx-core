@@ -342,8 +342,24 @@ pub fn build(b: *std.Build) void {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{c.name});
         // fx-ls/fx-du gain a `--rows` wire mode (Lens-3 dispatch) and import
         // the fx-wire codec module to emit canonical rows; the rest keep
-        // dhall only.
-        const imports: []const std.Build.Module.Import = if (c.wire)
+        // dhall only.  fx-ls (STEP 2, the migration template) additionally
+        // imports its COMMITTED generated POSIX parser (src/generated/
+        // cli_ls.zig — a pure-std module of its own, never the dhall core;
+        // plan RISK 4) and, for its differential test, the fx-cli schema
+        // evaluator (test-block-only references).
+        const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, c.name, "fx-ls"))
+            &.{
+                .{ .name = "dhall", .module = dhall_mod },
+                .{ .name = "fx-wire", .module = wire_mod },
+                .{ .name = "cli-ls", .module = b.createModule(.{
+                    .root_source_file = b.path("src/generated/cli_ls.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }) },
+                .{ .name = "fx-cli", .module = cli_mod },
+            }
+        else if (c.wire)
             &.{
                 .{ .name = "dhall", .module = dhall_mod },
                 .{ .name = "fx-wire", .module = wire_mod },
