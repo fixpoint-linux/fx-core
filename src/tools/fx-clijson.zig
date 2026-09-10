@@ -392,6 +392,21 @@ fn flagToken(f: cli.Flag) []const u8 {
     return "?";
 }
 
+/// True if flags[ai] and flags[bi] co-occur in some mutually_exclusive group
+/// (by index, so a flag named by either its short or long token counts).
+fn mutexTogether(s: *const cli.Schema, ai: usize, bi: usize) bool {
+    for (s.posix.mutually_exclusive) |grp| {
+        var has_a = false;
+        var has_b = false;
+        for (grp) |nm| {
+            if (flagIndex(s, nm) == ai) has_a = true;
+            if (flagIndex(s, nm) == bi) has_b = true;
+        }
+        if (has_a and has_b) return true;
+    }
+    return false;
+}
+
 fn validateBindings(s: *const cli.Schema) GenError!void {
     if (s.posix.flags.len > 32)
         return fail("{d} flags: more than 32 is not supported in v1", .{s.posix.flags.len});
@@ -1645,11 +1660,13 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
     {
         // clusterable letters (argumentless shorts), schema order
         var cflag: [32]cli.Flag = undefined;
+        var cidx: [32]usize = undefined;
         var cletter: [32]u8 = undefined;
         var nc: usize = 0;
-        for (s.posix.flags) |f| {
+        for (s.posix.flags, 0..) |f, fi| {
             if (clusterLetter(f)) |c| {
                 cflag[nc] = f;
+                cidx[nc] = fi;
                 cletter[nc] = c;
                 nc += 1;
             }
@@ -1659,6 +1676,11 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
         outer: for (0..nc) |ai| {
             for (ai + 1..nc) |bi| {
                 if (std.mem.eql(u8, cflag[ai].field, cflag[bi].field)) continue;
+                // ... and must NOT be mutually exclusive with each other: a
+                // cluster of two mutex flags is a CONFLICT (test (2) below),
+                // so emitting a "binds both" success test for the same argv
+                // would be unsatisfiable (caught live by fx-id -ug).
+                if (mutexTogether(s, cidx[ai], cidx[bi])) continue;
                 try out.put("\ntest \"cli_");
                 try out.put(name);
                 try out.put(": cluster -");
@@ -1889,6 +1911,23 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
     // ---- mutual exclusion (first group) ----
     if (s.posix.mutually_exclusive.len > 0) {
         const grp = s.posix.mutually_exclusive[0];
+        // A Value-kind flag consumes the NEXT argv token as its value, so a
+        // bare "-s -r" would parse -r as -s's value and never reach the
+        // exclusion guard (caught live by fx-truncate -s -r).  Emit a dummy
+        // value token after every Value member so the two flags are actually
+        // both SET and the conflict fires.  Text value -> "x"; numeric -> "1".
+        const valTok = struct {
+            fn of(ty: *const cli.TypeExpr) []const u8 {
+                return switch (ty.*) {
+                    .text => "x",
+                    .optional => |inner| switch (inner.*) {
+                        .text => "x",
+                        else => "1",
+                    },
+                    else => "1",
+                };
+            }
+        }.of;
         try out.put("\ntest \"cli_");
         try out.put(name);
         try out.put(": ");
@@ -1899,10 +1938,19 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
         try out.put(prologue);
         try out.put("    const argv = [_][]const u8{ \"");
         try out.put(disp);
-        try out.put("\", \"");
-        try out.put(grp[0]);
-        try out.put("\", \"");
-        try out.put(grp[1]);
+        for (grp[0..2]) |nm| {
+            try out.put("\", \"");
+            try out.put(nm);
+            if (flagIndex(s, nm)) |fi| {
+                const gf = s.posix.flags[fi];
+                if (gf.kind == .value) {
+                    const fty = s.ty.findField(gf.field) orelse
+                        return fail("mutex flag '{s}': binds unknown ty field '{s}'", .{ nm, gf.field });
+                    try out.put("\", \"");
+                    try out.put(valTok(fty));
+                }
+            }
+        }
         try out.put("\" };\n    try std.testing.expectError(error.Conflict, parsePosix(&argv, gpa));\n}\n");
     }
 

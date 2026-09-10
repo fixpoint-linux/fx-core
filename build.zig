@@ -63,9 +63,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fx-find.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "dhall", .module = dhall_mod },
-            },
+            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, "fx-find", &.{}),
         }),
     });
 
@@ -83,9 +81,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fx-grep.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "dhall", .module = dhall_mod },
-            },
+            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, "fx-grep", &.{}),
         }),
     });
     grep.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
@@ -116,9 +112,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fx-diff.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "dhall", .module = dhall_mod },
-            },
+            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, "fx-diff", &.{}),
         }),
     });
     diff.root_module.link_libc = true;
@@ -187,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // command) are migrated; further STEP-3 commands grow this table.  The
     // meta_* fixtures live in meta_schemas below — they are NOT commands
     // and are never committed under src/generated/.
-    const gen_schemas = [_][]const u8{ "ls", "whoami" };
+    const gen_schemas = [_][]const u8{ "basename", "cat", "chgrp", "chmod", "chown", "cksum", "comm", "cp", "date", "df", "diff", "dirname", "du", "echo", "env", "expand", "find", "grep", "head", "hostname", "id", "link", "ln", "ls", "md5sum", "mkdir", "mkfifo", "mv", "nl", "paste", "ps", "realpath", "rm", "rmdir", "seq", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "sort", "sum", "tail", "tee", "top", "touch", "tree", "truncate", "uname", "uniq", "unlink", "wc", "what", "whoami", "why", "yes" };
     const gen_cli_step = b.step("gen-cli", "Regenerate src/generated/cli_<name>.zig from schemas/<name>.dhall (commit the result)");
     const gen_cli_check_step = b.step("gen-cli-check", "Verify committed src/generated/cli_*.zig match their schemas (regen no-op gate)");
     test_step.dependOn(gen_cli_check_step);
@@ -367,32 +361,19 @@ pub fn build(b: *std.Build) void {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{c.name});
         // fx-ls/fx-du gain a `--rows` wire mode (Lens-3 dispatch) and import
         // the fx-wire codec module to emit canonical rows; the rest keep
-        // dhall only.  fx-ls (STEP 2, the migration template) additionally
-        // imports its COMMITTED generated POSIX parser (src/generated/
-        // cli_ls.zig — a pure-std module of its own, never the dhall core;
-        // plan RISK 4) and, for its differential test, the fx-cli schema
-        // evaluator (test-block-only references).
-        const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, c.name, "fx-ls"))
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "fx-wire", .module = wire_mod },
-                .{ .name = "cli-ls", .module = b.createModule(.{
-                    .root_source_file = b.path("src/generated/cli_ls.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .link_libc = true,
-                }) },
-                .{ .name = "fx-cli", .module = cli_mod },
-            }
-        else if (c.wire)
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "fx-wire", .module = wire_mod },
-            }
-        else
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-            };
+        // dhall only.  Every command also picks up its COMMITTED generated
+        // POSIX parser + the fx-cli evaluator via cliImports when src/
+        // generated/cli_<bare>.zig exists (all of this table today; the
+        // unused imports are legal Zig until the source migrates).
+        const imports = cliImports(
+            b,
+            target,
+            optimize,
+            dhall_mod,
+            cli_mod,
+            c.name,
+            if (c.wire) &.{.{ .name = "fx-wire", .module = wire_mod }} else &.{},
+        );
         const cmd_exe = b.addExecutable(.{
             .name = c.name,
             .root_module = b.createModule(.{
@@ -514,16 +495,22 @@ pub fn build(b: *std.Build) void {
     };
     inline for (mut_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const imports = cliImports(
+            b,
+            target,
+            optimize,
+            dhall_mod,
+            cli_mod,
+            name,
+            &.{.{ .name = "caslog", .module = caslog_mod }},
+        );
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "dhall", .module = dhall_mod },
-                    .{ .name = "caslog", .module = caslog_mod },
-                },
+                .imports = imports,
             }),
         });
         cmd_exe.root_module.link_libc = true;
@@ -559,15 +546,14 @@ pub fn build(b: *std.Build) void {
     };
     inline for (check_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "dhall", .module = dhall_mod },
-                },
+                .imports = imports,
             }),
         });
         cmd_exe.root_module.link_libc = true;
@@ -599,15 +585,14 @@ pub fn build(b: *std.Build) void {
     };
     inline for (trivial_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "dhall", .module = dhall_mod },
-                },
+                .imports = imports,
             }),
         });
         cmd_exe.root_module.link_libc = true;
@@ -632,10 +617,9 @@ pub fn build(b: *std.Build) void {
     // no caslog linkage).  NOTE: fx-hostname is an inetutils program, not a
     // GNU coreutils binary — GNU coreutils has no `hostname`; we implement it
     // anyway as a print-only tool (see fx-hostname.zig).
-    // fx-whoami (STEP 3, first system-batch migration) additionally imports
-    // its COMMITTED generated POSIX parser (src/generated/cli_whoami.zig —
-    // a pure-std module of its own, never the dhall core; plan RISK 4) and,
-    // for its differential test, the fx-cli schema evaluator.
+    // fx-whoami (STEP 3, first system-batch migration) imports its COMMITTED
+    // generated POSIX parser + the fx-cli evaluator like every command with a
+    // src/generated/cli_<bare>.zig — via the shared cliImports helper.
     // -----------------------------------------------------------------------
     const system_cmds = [_][]const u8{
         "fx-id",       "fx-whoami",  "fx-hostname", "fx-env",
@@ -643,21 +627,7 @@ pub fn build(b: *std.Build) void {
     };
     inline for (system_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
-        const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "fx-whoami"))
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "cli-whoami", .module = b.createModule(.{
-                    .root_source_file = b.path("src/generated/cli_whoami.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .link_libc = true,
-                }) },
-                .{ .name = "fx-cli", .module = cli_mod },
-            }
-        else
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-            };
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -693,15 +663,14 @@ pub fn build(b: *std.Build) void {
     };
     inline for (text_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "dhall", .module = dhall_mod },
-                },
+                .imports = imports,
             }),
         });
         cmd_exe.root_module.link_libc = true;
@@ -743,15 +712,15 @@ pub fn build(b: *std.Build) void {
         // All four gain a `--rows` wire mode (Lens-3 dispatch) and import
         // the fx-wire codec module to emit canonical rows — including the
         // pure fx-df; none of them keep dhall only.
-        const imports: []const std.Build.Module.Import = if (c.wire)
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-                .{ .name = "fx-wire", .module = wire_mod },
-            }
-        else
-            &.{
-                .{ .name = "dhall", .module = dhall_mod },
-            };
+        const imports = cliImports(
+            b,
+            target,
+            optimize,
+            dhall_mod,
+            cli_mod,
+            c.name,
+            if (c.wire) &.{.{ .name = "fx-wire", .module = wire_mod }} else &.{},
+        );
         const cmd_exe = b.addExecutable(.{
             .name = c.name,
             .root_module = b.createModule(.{
@@ -878,17 +847,26 @@ pub fn build(b: *std.Build) void {
     const prov_cmds = [_][]const u8{ "fx-what", "fx-why" };
     inline for (prov_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
+        const imports = cliImports(
+            b,
+            target,
+            optimize,
+            dhall_mod,
+            cli_mod,
+            name,
+            &.{
+                .{ .name = "provenance", .module = prov_mod },
+                .{ .name = "store", .module = store_mod },
+                .{ .name = "closure", .module = closure_mod },
+            },
+        );
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src_path),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "provenance", .module = prov_mod },
-                    .{ .name = "store", .module = store_mod },
-                    .{ .name = "closure", .module = closure_mod },
-                },
+                .imports = imports,
             }),
         });
         cmd_exe.root_module.link_libc = true;
@@ -905,4 +883,54 @@ pub fn build(b: *std.Build) void {
         const run_cmd_tests = b.addRunArtifact(cmd_tests);
         test_step.dependOn(&run_cmd_tests.step);
     }
+}
+
+/// STEP 3 shared import wiring: the per-command module imports for every
+/// table-driven fx-* command batch.  Always appends the dhall facade (typed
+/// args); `extra` carries each batch's own modules (fx-wire, caslog, the
+/// provenance engine, ...) unchanged.  When the command has a COMMITTED
+/// generated POSIX parser (src/generated/cli_<bare>.zig, bare = the command
+/// name minus the "fx-" prefix), it additionally gains:
+///   cli-<bare> : a PURE-STD module over the generated parser (never the
+///                dhall core — plan RISK 4; unused imports are legal Zig,
+///                so unmigrated sources keep compiling until they migrate)
+///   fx-cli     : the schema evaluator, for the migrated command's
+///                differential (generated vs Dhall-eval) test block
+/// Existence is checked at build.zig RUNTIME against the build root (build.zig
+/// is a normal program — comptime file access is not possible), so a missing
+/// parser simply leaves that command's imports as extra ++ { dhall }.
+fn cliImports(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    dhall_mod: *std.Build.Module,
+    cli_mod: *std.Build.Module,
+    name: []const u8,
+    extra: []const std.Build.Module.Import,
+) []const std.Build.Module.Import {
+    const bare = if (std.mem.startsWith(u8, name, "fx-")) name["fx-".len..] else name;
+    const gen_path = std.fmt.allocPrint(b.allocator, "src/generated/cli_{s}.zig", .{bare}) catch
+        @panic("OOM");
+
+    // Runtime existence probe (faccessat with mode 0 == exists): any error
+    // other than success means no generated parser for this command.
+    const gen_exists = if (b.build_root.handle.access(b.graph.io, gen_path, .{})) |_| true else |_| false;
+
+    const total = extra.len + 1 + (if (gen_exists) @as(usize, 2) else 0);
+    const imports = b.allocator.alloc(std.Build.Module.Import, total) catch @panic("OOM");
+    @memcpy(imports[0..extra.len], extra);
+    imports[extra.len] = .{ .name = "dhall", .module = dhall_mod };
+    if (gen_exists) {
+        imports[extra.len + 1] = .{
+            .name = std.fmt.allocPrint(b.allocator, "cli-{s}", .{bare}) catch @panic("OOM"),
+            .module = b.createModule(.{
+                .root_source_file = b.path(gen_path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        };
+        imports[extra.len + 2] = .{ .name = "fx-cli", .module = cli_mod };
+    }
+    return imports;
 }
