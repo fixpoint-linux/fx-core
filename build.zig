@@ -182,7 +182,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const gen_schemas = [_][]const u8{"ls"}; // STEP 3 grows this table
+    // gen_schemas: the COMMITTED generated parsers (regen no-op gates +
+    // test wiring).  ls is the only real command migrated so far; STEP 3
+    // grows this table.  The meta_* fixtures live in meta_schemas below —
+    // they are NOT commands and are never committed under src/generated/.
+    const gen_schemas = [_][]const u8{"ls"};
     const gen_cli_step = b.step("gen-cli", "Regenerate src/generated/cli_<name>.zig from schemas/<name>.dhall (commit the result)");
     const gen_cli_check_step = b.step("gen-cli-check", "Verify committed src/generated/cli_*.zig match their schemas (regen no-op gate)");
     test_step.dependOn(gen_cli_check_step);
@@ -213,6 +217,61 @@ pub fn build(b: *std.Build) void {
         chk_run.addArg(schema_path);
         chk_run.addArg(out_path);
         gen_cli_check_step.dependOn(&chk_run.step);
+    }
+
+    // -----------------------------------------------------------------------
+    // GENERATOR META-GATE (fix-1 D): the review's blocker shipped because
+    // the gate never COMPILED what the generator emits — ls.dhall exercises
+    // none of the Value/Optional shapes, so a non-compiling emission waited
+    // for the first STEP-3 schema to explode at build time.  The meta_*
+    // fixtures under schemas/ are NOT commands: they exist to exercise
+    // every emission shape (meta_values: Natural/Integer/Double Value flags
+    // + Optional Text/Natural/Integer/Double fields + clustering +
+    // --long=value; meta_many: many-positional + single mix + a List Text
+    // default with content; meta_noflags: the zero-flag/zero-positional
+    // skeleton).  At gate time each is generated into the LOCAL build cache
+    // (.zig-cache/gen-meta/) and `build-obj`d — non-compiling emission of
+    // ANY shape now fails `zig build test` (and `zig build gen-cli-check`)
+    // instead of a future batch.  Nothing under src/generated/ or the
+    // installed artifacts changes: the meta outputs are cache-only, bind no
+    // command, and never appear in a commit.
+    // -----------------------------------------------------------------------
+    const meta_schemas = [_][]const u8{ "meta_values", "meta_many", "meta_noflags" };
+    inline for (meta_schemas) |schema_name| {
+        const out_rel = std.fmt.comptimePrint("cli_{s}.zig", .{schema_name});
+        const schema_path = std.fmt.comptimePrint("schemas/{s}.dhall", .{schema_name});
+
+        const meta_tool = b.addExecutable(.{ .name = "fx-clijson", .root_module = clijson_mod });
+        const meta_run = b.addRunArtifact(meta_tool);
+        meta_run.setCwd(b.path("."));
+        meta_run.addArg("generate");
+        meta_run.addArg(schema_name);
+        meta_run.addArg(schema_path);
+        // runtime path into the LOCAL build cache (.zig-cache/gen-meta/):
+        // the emitted file is a gate-time artifact only — never committed,
+        // never installed, never imported by any command binary.
+        const out_abs = b.cache_root.join(b.allocator, &.{ "gen-meta", out_rel }) catch @panic("OOM");
+        meta_run.addArg(out_abs);
+        gen_cli_check_step.dependOn(&meta_run.step);
+
+        // build-obj the freshly emitted file: a parse/compile error in the
+        // emission IS the gate failure (pure std — no module imports).
+        // NOTE: build-obj analyzes test blocks too, so the generated
+        // self-tests are compiled as well — both non-compiling emission
+        // classes from the review (undeclared `e`, bare `o.f?`) fail here.
+        const meta_obj = b.addObject(.{
+            .name = "meta_" ++ schema_name,
+            .root_module = b.createModule(.{
+                // cwd_relative, not src_path: the file lives in the cache,
+                // outside the build root's source tree
+                .root_source_file = .{ .cwd_relative = out_abs },
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        meta_obj.step.dependOn(&meta_run.step);
+        gen_cli_check_step.dependOn(&meta_obj.step);
     }
 
     // The generator tool's own unit tests (identifier/escape helpers).

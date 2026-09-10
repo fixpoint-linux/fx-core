@@ -37,9 +37,11 @@ pub const ParseError = error{
 /// Parse POSIX-style argv into Options.  args[0] is the program name
 /// (skipped); `--` ends flag parsing; every matched flag sets its
 /// field, coerced inline (the Dhall type never sees argv strings).
-/// Text operands are gpa-owned dupes on success; on error earlier
-/// dupes are not freed (same discipline as the hand parsers this
-/// replaces).
+/// Accepted spellings: exact short/long tokens, argumentless short
+/// clusters (-la == -l -a; a Value short never clusters) and inline
+/// --long=value for Value longs.  Text operands are gpa-owned
+/// dupes on success; on error earlier dupes are not freed (same
+/// discipline as the hand parsers this replaces).
 pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
     var seen: u32 = 0; // bit i set once flags[i] matched
     var next_pos: usize = 0; // next single-positional slot to fill
@@ -57,6 +59,42 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             continue;
         }
         var matched = false;
+        if (a.len > 2 and a[0] == '-' and a[1] != '-') {
+            var cluster = true;
+            for (a[1..]) |ch| {
+                var letter_matched = false;
+                if (ch == 'S') {
+                    if ((seen & (1 << 1)) != 0) {
+                        std.debug.print("fx-ls: options '-S' and '-t' are mutually exclusive\n", .{});
+                        return error.Conflict;
+                    }
+                    o.sort = .Size;
+                    seen |= 1 << 0;
+                    letter_matched = true;
+                }
+                if (ch == 't') {
+                    if ((seen & (1 << 0)) != 0) {
+                        std.debug.print("fx-ls: options '-t' and '-S' are mutually exclusive\n", .{});
+                        return error.Conflict;
+                    }
+                    o.sort = .MTime;
+                    seen |= 1 << 1;
+                    letter_matched = true;
+                }
+                if (ch == 'l') {
+                    o.long = true;
+                    seen |= 1 << 2;
+                    letter_matched = true;
+                }
+                if (ch == 'a') {
+                    o.all = true;
+                    seen |= 1 << 3;
+                    letter_matched = true;
+                }
+                if (!letter_matched) cluster = false;
+            }
+            if (cluster) continue;
+        }
         if (!matched and (std.mem.eql(u8, a, "-S"))) {
             if ((seen & (1 << 1)) != 0) {
                 std.debug.print("fx-ls: options '-S' and '-t' are mutually exclusive\n", .{});
@@ -144,6 +182,32 @@ test "cli_ls: -l binds long" {
     const argv = [_][]const u8{ "fx-ls", "-l" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expect(o.long);
+}
+
+test "cli_ls: cluster -Sl binds both" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-ls", "-Sl" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expect(o.sort == .Size);
+    try std.testing.expect(o.long);
+}
+
+test "cli_ls: cluster -St conflicts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-ls", "-St" };
+    try std.testing.expectError(error.Conflict, parsePosix(&argv, gpa));
+}
+
+test "cli_ls: cluster with unknown letter rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-ls", "-SA" };
+    try std.testing.expectError(error.UnknownOption, parsePosix(&argv, gpa));
 }
 
 test "cli_ls: operand binds path" {

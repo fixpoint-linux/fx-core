@@ -37,6 +37,21 @@
 // set, the parser fails with error.Conflict instead of silently letting the
 // last flag win (the GNU drift this whole architecture exists to kill).
 //
+// ARGV SPELLINGS (review SHOULD-FIX 1 — DECIDED for v1 and pinned here, by
+// the generated tests, and by the schemas/meta-*.dhall fixtures): beyond
+// exact tokens the emitted parser accepts
+//   (a) short clustering of ARGUMENTLESS shorts: -la == -l -a.  A Value
+//       short never clusters — its argument boundary would be ambiguous —
+//       so `-n7` rejects with UnknownOption;
+//   (b) `--long=value` inline values for Value-kind long options (the
+//       separate-token `--long value` form stays valid too).
+// Both are UNCONDITIONAL generator vocabulary, not per-command schema
+// options: per-command variance here would re-create the drift this
+// architecture exists to kill (plan RISK 8).  They are a deliberate
+// strengthening over the hand parsers (exact tokens only) — the STEP-2+
+// differential tests must not assert the old rejection of these forms.
+// Operands that begin with '-' still need `--` (strict-getopt parity).
+//
 // POSITIONALS: single (many=False) Text fields fill in declared order (an
 // operand beyond the single slots is error.UnexpectedOperand); a many=True
 // List Text positional (must be last) accumulates every remaining operand
@@ -530,6 +545,16 @@ const Out = struct {
     }
 };
 
+/// Where a Value-kind flag's value comes from in the emitted arm.
+const BindingValue = union(enum) {
+    /// the next argv token (`-n 5` / `--long 5`)
+    next,
+    /// an inline `--long=value`: the payload is the offset of the value past
+    /// the '=' inside the matched long token (so the emitted code reads
+    /// args[i][<eq>..])
+    inline_long: []const u8,
+};
+
 /// The command's display name in diagnostics and usage(): fx-<name> (a name
 /// that already starts with "fx-" stays verbatim).  ALWAYS a gpa-owned dupe —
 /// callers free unconditionally (even when `name` is already an fx- name, the
@@ -541,13 +566,14 @@ fn displayName(gpa: Allocator, name: []const u8) GenError![]const u8 {
 }
 
 /// One line of bad-value diagnostic for an integer/Double flag: prints the
-/// command, the flag token, the offending argv token and the expected type
-/// (command+token baked into the literal; the ONE {s} takes the argv token).
-fn badValueMsg(gpa: Allocator, disp: []const u8, tok: []const u8, what: []const u8) GenError![]const u8 {
+/// command, the flag token, the offending value expression and the expected
+/// type (command+token baked into the literal; the ONE {s} takes the value —
+/// args[i], or args[i][N..] for an inline --long=value).
+fn badValueMsg(gpa: Allocator, disp: []const u8, tok: []const u8, what: []const u8, val: []const u8) GenError![]const u8 {
     return std.fmt.allocPrint(
         gpa,
-        "                std.debug.print(\"{s}: option '{s}': '{s}' " ++ "{s}" ++ "\\n\", .{{ args[i] }});\n",
-        .{ disp, tok, "{s}", what },
+        "                std.debug.print(\"{s}: option '{s}': '{s}' " ++ "{s}" ++ "\\n\", .{{ {s} }});\n",
+        .{ disp, tok, "{s}", what, val },
     ) catch return error.OutOfMemory;
 }
 
@@ -599,95 +625,281 @@ fn emitOptions(out: *Out, gpa: Allocator, s: *const cli.Schema) GenError!void {
     try out.put("};\n");
 }
 
-/// One Value-kind flag binding: consume the next argv token and coerce it to
-/// the field type, inline.  `disp` is the command display name for the
-/// diagnostic prefix.
-fn emitValueBinding(out: *Out, gpa: Allocator, disp: []const u8, f: cli.Flag, fty: *const cli.TypeExpr, id: []const u8) GenError!void {
-    const tok = flagToken(f);
+/// One Value-kind flag binding: consume the value from `bv` (the binding
+/// context — either the next argv token or an inline --long=value tail) and
+/// coerce it to the field type, inline.  `disp` is the command display name
+/// for the diagnostic prefix.  The emitted `catch {` is captureless: the
+/// diagnostic prints the offending token and never uses the capture (the
+/// review's undeclared-`e` blocker).  Returns gpa-owned source at the
+/// 12-space arm indent.
+fn valueBindingSrc(gpa: Allocator, disp: []const u8, f: cli.Flag, fty: *const cli.TypeExpr, id: []const u8, bv: BindingValue) GenError![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    const w = struct {
+        fn put(o: *std.ArrayList(u8), a: Allocator, s: []const u8) GenError!void {
+            o.appendSlice(a, s) catch return error.OutOfMemory;
+        }
+    };
+    // the diagnostic names the token the user actually typed: the short for
+    // the next-token form, the long for the inline --long=value form
+    const tok = if (bv == .inline_long) f.long orelse flagToken(f) else flagToken(f);
     const etok = try zigEscape(gpa, tok);
     defer gpa.free(etok);
+    const val: []const u8 = switch (bv) {
+        .next => "args[i]",
+        .inline_long => |eq| try std.fmt.allocPrint(gpa, "args[i][{s}..]", .{eq}),
+    };
+    defer if (bv == .inline_long) gpa.free(@constCast(val));
 
-    // the "requires a value" guard (shared by every value shape; the token is
-    // baked into the literal, so the args tuple is empty)
-    var line = std.ArrayList(u8).empty;
-    defer line.deinit(gpa);
-    try line.appendSlice(gpa, "            if (i + 1 >= args.len) {\n");
-    try line.appendSlice(gpa, "                std.debug.print(\"");
-    try line.appendSlice(gpa, disp);
-    try line.appendSlice(gpa, ": option '");
-    try line.appendSlice(gpa, etok);
-    try line.appendSlice(gpa, "' requires a value\\n\", .{});\n");
-    try line.appendSlice(gpa, "                return error.MissingValue;\n");
-    try line.appendSlice(gpa, "            }\n");
-    try line.appendSlice(gpa, "            i += 1;\n");
-    try out.put(line.items);
+    // the "requires a value" guard (only for the next-token form; an inline
+    // --long=value always carries its value — the token is baked into the
+    // literal, so the args tuple is empty)
+    if (bv == .next) {
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(gpa);
+        try line.appendSlice(gpa, "            if (i + 1 >= args.len) {\n");
+        try line.appendSlice(gpa, "                std.debug.print(\"");
+        try line.appendSlice(gpa, disp);
+        try line.appendSlice(gpa, ": option '");
+        try line.appendSlice(gpa, etok);
+        try line.appendSlice(gpa, "' requires a value\\n\", .{});\n");
+        try line.appendSlice(gpa, "                return error.MissingValue;\n");
+        try line.appendSlice(gpa, "            }\n");
+        try line.appendSlice(gpa, "            i += 1;\n");
+        try w.put(&out, gpa, line.items);
+    }
 
-    // bad-value diagnostics, per numeric flavor
+    // bad-value diagnostics, per numeric flavor (the ONE {s} takes the
+    // offending token, which differs between the two value forms)
     const natural_what = "is not a Natural (u64)";
     const integer_what = "is not an Integer (i64)";
     const double_what = "is not a Double";
+    const bad = struct {
+        fn msg(a: Allocator, d: []const u8, t: []const u8, what: []const u8, v: []const u8) GenError![]const u8 {
+            return badValueMsg(a, d, t, what, v);
+        }
+    };
 
     switch (fty.*) {
-        .text => try out.print("            o.{s} = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;\n", .{id}),
+        .text => {
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, " = gpa.dupe(u8, ");
+            try line.appendSlice(gpa, val);
+            try line.appendSlice(gpa, ") catch return error.OutOfMemory;\n");
+            try w.put(&out, gpa, line.items);
+        },
         .natural => {
-            try out.print("            o.{s} = std.fmt.parseInt(u64, args[i], 10) catch {{\n", .{id});
-            const m = try badValueMsg(gpa, disp, etok, natural_what);
+            const m = try bad.msg(gpa, disp, etok, natural_what, val);
             defer gpa.free(m);
-            try out.put(m);
-            try out.put("                _ = e;\n                return error.BadValue;\n            };\n");
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, " = std.fmt.parseInt(u64, ");
+            try line.appendSlice(gpa, val);
+            try line.appendSlice(gpa, ", 10) catch {\n");
+            try w.put(&out, gpa, line.items);
+            try w.put(&out, gpa, m);
+            try w.put(&out, gpa, "                return error.BadValue;\n            };\n");
         },
         .integer => {
-            try out.print("            o.{s} = std.fmt.parseInt(i64, args[i], 10) catch {{\n", .{id});
-            const m = try badValueMsg(gpa, disp, etok, integer_what);
+            const m = try bad.msg(gpa, disp, etok, integer_what, val);
             defer gpa.free(m);
-            try out.put(m);
-            try out.put("                _ = e;\n                return error.BadValue;\n            };\n");
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, " = std.fmt.parseInt(i64, ");
+            try line.appendSlice(gpa, val);
+            try line.appendSlice(gpa, ", 10) catch {\n");
+            try w.put(&out, gpa, line.items);
+            try w.put(&out, gpa, m);
+            try w.put(&out, gpa, "                return error.BadValue;\n            };\n");
         },
         .double => {
-            try out.print("            o.{s} = std.fmt.parseFloat(f64, args[i]) catch {{\n", .{id});
-            const m = try badValueMsg(gpa, disp, etok, double_what);
+            const m = try bad.msg(gpa, disp, etok, double_what, val);
             defer gpa.free(m);
-            try out.put(m);
-            try out.put("                _ = e;\n                return error.BadValue;\n            };\n");
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, " = std.fmt.parseFloat(f64, ");
+            try line.appendSlice(gpa, val);
+            try line.appendSlice(gpa, ") catch {\n");
+            try w.put(&out, gpa, line.items);
+            try w.put(&out, gpa, m);
+            try w.put(&out, gpa, "                return error.BadValue;\n            };\n");
         },
         .optional => |inner| {
             switch (inner.*) {
-                .text => try out.print("            o.{s} = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;\n", .{id}),
+                .text => {
+                    var line = std.ArrayList(u8).empty;
+                    defer line.deinit(gpa);
+                    try line.appendSlice(gpa, "            o.");
+                    try line.appendSlice(gpa, id);
+                    try line.appendSlice(gpa, " = gpa.dupe(u8, ");
+                    try line.appendSlice(gpa, val);
+                    try line.appendSlice(gpa, ") catch return error.OutOfMemory;\n");
+                    try w.put(&out, gpa, line.items);
+                },
                 .natural => {
-                    try out.print("            o.{s} = std.fmt.parseInt(u64, args[i], 10) catch {{\n", .{id});
-                    const m = try badValueMsg(gpa, disp, etok, natural_what);
+                    const m = try bad.msg(gpa, disp, etok, natural_what, val);
                     defer gpa.free(m);
-                    try out.put(m);
-                    try out.put("                _ = e;\n                return error.BadValue;\n            };\n");
+                    var line = std.ArrayList(u8).empty;
+                    defer line.deinit(gpa);
+                    try line.appendSlice(gpa, "            o.");
+                    try line.appendSlice(gpa, id);
+                    try line.appendSlice(gpa, " = std.fmt.parseInt(u64, ");
+                    try line.appendSlice(gpa, val);
+                    try line.appendSlice(gpa, ", 10) catch {\n");
+                    try w.put(&out, gpa, line.items);
+                    try w.put(&out, gpa, m);
+                    try w.put(&out, gpa, "                return error.BadValue;\n            };\n");
                 },
                 .integer => {
-                    try out.print("            o.{s} = std.fmt.parseInt(i64, args[i], 10) catch {{\n", .{id});
-                    const m = try badValueMsg(gpa, disp, etok, integer_what);
+                    const m = try bad.msg(gpa, disp, etok, integer_what, val);
                     defer gpa.free(m);
-                    try out.put(m);
-                    try out.put("                _ = e;\n                return error.BadValue;\n            };\n");
+                    var line = std.ArrayList(u8).empty;
+                    defer line.deinit(gpa);
+                    try line.appendSlice(gpa, "            o.");
+                    try line.appendSlice(gpa, id);
+                    try line.appendSlice(gpa, " = std.fmt.parseInt(i64, ");
+                    try line.appendSlice(gpa, val);
+                    try line.appendSlice(gpa, ", 10) catch {\n");
+                    try w.put(&out, gpa, line.items);
+                    try w.put(&out, gpa, m);
+                    try w.put(&out, gpa, "                return error.BadValue;\n            };\n");
                 },
                 .double => {
-                    try out.print("            o.{s} = std.fmt.parseFloat(f64, args[i]) catch {{\n", .{id});
-                    const m = try badValueMsg(gpa, disp, etok, double_what);
+                    const m = try bad.msg(gpa, disp, etok, double_what, val);
                     defer gpa.free(m);
-                    try out.put(m);
-                    try out.put("                _ = e;\n                return error.BadValue;\n            };\n");
+                    var line = std.ArrayList(u8).empty;
+                    defer line.deinit(gpa);
+                    try line.appendSlice(gpa, "            o.");
+                    try line.appendSlice(gpa, id);
+                    try line.appendSlice(gpa, " = std.fmt.parseFloat(f64, ");
+                    try line.appendSlice(gpa, val);
+                    try line.appendSlice(gpa, ") catch {\n");
+                    try w.put(&out, gpa, line.items);
+                    try w.put(&out, gpa, m);
+                    try w.put(&out, gpa, "                return error.BadValue;\n            };\n");
                 },
                 else => return fail("flag '{s}': Optional {s} value flags are not supported in v1", .{ tok, @tagName(inner.*) }),
             }
         },
         else => return fail("flag '{s}': unsupported Value field type", .{tok}),
     }
+    return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
+/// The letter a flag contributes to short clustering: its single argumentless
+/// short (Flag/Enum kinds — a Value short never clusters; its value boundary
+/// would be ambiguous, so `-n7` stays UnknownOption).
+fn clusterLetter(f: cli.Flag) ?u8 {
+    if (f.kind == .value) return null;
+    const sh = f.short orelse return null;
+    if (sh.len != 2) return null;
+    return sh[1];
+}
+
+/// A Zig character literal for `c` (ASCII printable fast path; \\u escape for
+/// everything else — cluster letters are schema-declared shorts, already
+/// validated to be exactly "-<c>").
+fn charLiteral(gpa: Allocator, c: u8) GenError![]const u8 {
+    return switch (c) {
+        '\'' => gpa.dupe(u8, "'\\''") catch return error.OutOfMemory,
+        '\\' => gpa.dupe(u8, "'\\\\'") catch return error.OutOfMemory,
+        0x20...0x26, 0x28...0x5b, 0x5d...0x7e => std.fmt.allocPrint(gpa, "'{c}'", .{c}) catch return error.OutOfMemory,
+        else => std.fmt.allocPrint(gpa, "'\\u{{{x}}}'", .{c}) catch return error.OutOfMemory,
+    };
+}
+
+/// The full body of one flag arm — exclusion guards (if any), the binding,
+/// the seen-bit set (if any) — at the 12-space arm indent.  Shared by the
+/// main argv arms AND the short-clustering pre-pass so a clustered letter
+/// behaves byte-identically to the same flag spelled alone.
+fn emitFlagBody(gpa: Allocator, disp: []const u8, s: *const cli.Schema, fi: usize, f: cli.Flag, fty: *const cli.TypeExpr, id: []const u8, bv: BindingValue) GenError![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    if (s.posix.mutually_exclusive.len > 0) {
+        const ex = try exclusionChecksSrc(gpa, disp, s, fi);
+        defer gpa.free(ex);
+        out.appendSlice(gpa, ex) catch return error.OutOfMemory;
+    }
+    switch (f.kind) {
+        .flag => {
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, " = true;\n");
+            out.appendSlice(gpa, line.items) catch return error.OutOfMemory;
+        },
+        .value => {
+            const vb = try valueBindingSrc(gpa, disp, f, fty, id, bv);
+            defer gpa.free(vb);
+            out.appendSlice(gpa, vb) catch return error.OutOfMemory;
+        },
+        .enum_ => |ctor| {
+            const cid = try ident(gpa, ctor);
+            defer if (cid.ptr != ctor.ptr) gpa.free(cid);
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, " = .");
+            try line.appendSlice(gpa, cid);
+            try line.appendSlice(gpa, ";\n");
+            out.appendSlice(gpa, line.items) catch return error.OutOfMemory;
+        },
+    }
+    if (s.posix.mutually_exclusive.len > 0) {
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(gpa);
+        try line.appendSlice(gpa, "            seen |= 1 << ");
+        try line.appendSlice(gpa, try std.fmt.allocPrint(gpa, "{d}", .{fi}));
+        try line.appendSlice(gpa, ";\n");
+        out.appendSlice(gpa, line.items) catch return error.OutOfMemory;
+    }
+    return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
+/// Append `src` to `out`, prefixing every non-empty line with `depth` extra
+/// spaces (re-indenting a body emitted at the 12-space arm indent for a
+/// deeper nesting — the clustering pre-pass).  Empty segments (a trailing
+/// newline) add nothing, so no trailing whitespace is introduced.
+fn putReindented(out: *Out, src: []const u8, depth: usize) GenError!void {
+    var rest = src;
+    var wrote = false;
+    while (rest.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const seg = rest[0..nl];
+        if (seg.len > 0) {
+            if (wrote) try out.put("\n");
+            var k: usize = 0;
+            while (k < depth) : (k += 1) try out.put(" ");
+            try out.put(seg);
+            wrote = true;
+        }
+        if (nl == rest.len) break;
+        rest = rest[nl + 1 ..];
+    }
+    if (wrote) try out.put("\n");
 }
 
 /// The mutual-exclusion guard(s) for flags[fi]: for every group containing
 /// fi, reject when ANY other member of that group is already seen (one guard
-/// per other member — groups may have more than two members).
-fn emitExclusionChecks(out: *Out, gpa: Allocator, disp: []const u8, s: *const cli.Schema, fi: usize) GenError!void {
+/// per other member — groups may have more than two members).  Returns
+/// gpa-owned source at the 12-space arm indent.
+fn exclusionChecksSrc(gpa: Allocator, disp: []const u8, s: *const cli.Schema, fi: usize) GenError![]const u8 {
     const me = flagToken(s.posix.flags[fi]);
     const eme = try zigEscape(gpa, me);
     defer gpa.free(eme);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
     for (s.posix.mutually_exclusive) |grp| {
         var includes_me = false;
         for (grp) |nm| {
@@ -699,9 +911,11 @@ fn emitExclusionChecks(out: *Out, gpa: Allocator, disp: []const u8, s: *const cl
             if (oi == fi) continue;
             const eo = try zigEscape(gpa, flagToken(s.posix.flags[oi]));
             defer gpa.free(eo);
-            try out.print("            if ((seen & (1 << {d})) != 0) {{\n", .{oi});
             var line = std.ArrayList(u8).empty;
             defer line.deinit(gpa);
+            try line.appendSlice(gpa, "            if ((seen & (1 << ");
+            try line.appendSlice(gpa, try std.fmt.allocPrint(gpa, "{d}", .{oi}));
+            try line.appendSlice(gpa, ")) != 0) {\n");
             try line.appendSlice(gpa, "                std.debug.print(\"");
             try line.appendSlice(gpa, disp);
             try line.appendSlice(gpa, ": options '");
@@ -709,10 +923,11 @@ fn emitExclusionChecks(out: *Out, gpa: Allocator, disp: []const u8, s: *const cl
             try line.appendSlice(gpa, "' and '");
             try line.appendSlice(gpa, eo);
             try line.appendSlice(gpa, "' are mutually exclusive\\n\", .{});\n");
-            try out.put(line.items);
-            try out.put("                return error.Conflict;\n            }\n");
+            try line.appendSlice(gpa, "                return error.Conflict;\n            }\n");
+            out.appendSlice(gpa, line.items) catch return error.OutOfMemory;
         }
     }
+    return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
 }
 
 fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) GenError!void {
@@ -752,12 +967,18 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         \\/// Parse POSIX-style argv into Options.  args[0] is the program name
         \\/// (skipped); `--` ends flag parsing; every matched flag sets its
         \\/// field, coerced inline (the Dhall type never sees argv strings).
-        \\/// Text operands are gpa-owned dupes on success; on error earlier
-        \\/// dupes are not freed (same discipline as the hand parsers this
-        \\/// replaces).
+        \\/// Accepted spellings: exact short/long tokens, argumentless short
+        \\/// clusters (-la == -l -a; a Value short never clusters) and inline
+        \\/// --long=value for Value longs.  Text operands are gpa-owned
+        \\/// dupes on success; on error earlier dupes are not freed (same
+        \\/// discipline as the hand parsers this replaces).
         \\pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
         \\
     );
+    // degenerate shapes: a no-flags/no-positionals schema never mutates o
+    // and never allocates — discard the unused parameter so the emitted
+    // file compiles (caught by the meta_noflags gate fixture)
+    if (!has_flags and !has_pos) try out.put("    _ = gpa;\n");
 
     if (has_groups) try out.put("    var seen: u32 = 0; // bit i set once flags[i] matched\n");
     if (many_id) |mid| {
@@ -772,8 +993,14 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         try out.put(line.items);
     }
     if (has_pos) try out.put("    var next_pos: usize = 0; // next single-positional slot to fill\n");
+    // `const o` when nothing can mutate it (no flags, no positionals —
+    // caught by the meta_noflags gate fixture)
+    if (has_flags or has_pos) {
+        try out.put("    var o = Options{};\n");
+    } else {
+        try out.put("    const o = Options{};\n");
+    }
     try out.put(
-        \\    var o = Options{};
         \\    var i: usize = 1;
         \\    var after_ddash = false;
         \\    while (i < args.len) : (i += 1) {
@@ -781,7 +1008,6 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         \\        if (after_ddash) {
         \\
     );
-
     // operand-or-reject inside the after-ddash arm
     if (has_pos) {
         try out.put("            try bindOperand(a, &o, &next_pos, gpa");
@@ -810,53 +1036,129 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
     // one if-branch per flag, then the unknown-option / operand fallthrough
     if (has_flags) {
         try out.put("        var matched = false;\n");
+        // SHORT CLUSTERING (review SHOULD-FIX 1, decided for v1): a -xyz
+        // token whose every letter is an argumentless short of this schema
+        // decomposes into the SAME per-letter bindings the main arms below
+        // perform — exclusion guards, seen bits and all — so `-St` fails
+        // with error.Conflict exactly like `-S -t` would.  A cluster
+        // containing a Value letter or any unknown letter matches nothing
+        // here and falls through to the arms / unknown-option diagnostic.
+        var any_clusterable = false;
+        for (s.posix.flags) |fl| {
+            if (clusterLetter(fl)) |_| {
+                any_clusterable = true;
+                break;
+            }
+        }
+        if (any_clusterable) {
+            try out.put("        if (a.len > 2 and a[0] == '-' and a[1] != '-') {\n");
+            try out.put("            var cluster = true;\n");
+            try out.put("            for (a[1..]) |ch| {\n");
+            try out.put("                var letter_matched = false;\n");
+            for (s.posix.flags, 0..) |f, fi| {
+                const c = clusterLetter(f) orelse continue;
+                const fty = s.ty.findField(f.field).?;
+                const id = try ident(gpa, f.field);
+                defer if (id.ptr != f.field.ptr) gpa.free(id);
+                // a cluster letter is by construction argumentless, so the
+                // binding context is irrelevant here (.next is a placeholder)
+                const body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .next);
+                defer gpa.free(body);
+                const cl = try charLiteral(gpa, c);
+                defer gpa.free(cl);
+                var line = std.ArrayList(u8).empty;
+                defer line.deinit(gpa);
+                try line.appendSlice(gpa, "                if (ch == ");
+                try line.appendSlice(gpa, cl);
+                try line.appendSlice(gpa, ") {\n");
+                try out.put(line.items);
+                try putReindented(out, body, 8);
+                try out.put("                    letter_matched = true;\n");
+                try out.put("                }\n");
+            }
+            try out.put("                if (!letter_matched) cluster = false;\n");
+            try out.put("            }\n");
+            try out.put("            if (cluster) continue;\n");
+            try out.put("        }\n");
+        }
         for (s.posix.flags, 0..) |f, fi| {
             const fty = s.ty.findField(f.field).?;
             const id = try ident(gpa, f.field);
             defer if (id.ptr != f.field.ptr) gpa.free(id);
 
+            // the condition: exact short token; exact long token; or — for a
+            // Value long — the --long=value prefix.  exactly one long test is
+            // emitted per flag: =value when the flag takes a value, exact
+            // match otherwise (an =value spelling of an argumentless long
+            // can never match: the exact test excludes '=')
             var cond = std.ArrayList(u8).empty;
             defer cond.deinit(gpa);
+            var parts: usize = 0;
+
+            // A Value flag with BOTH spellings needs two separate arms: the
+            // short form takes the NEXT argv token, the long form reads its
+            // inline =value tail — one binding expression cannot serve both
+            // (the meta_values gate fixture caught this: -n matched the long
+            // prefix test but sliced the token at the long's offset).
+            const split_value_arms = f.kind == .value and f.short != null and f.long != null;
+
+            if (split_value_arms) {
+                // short arm: exact -<c> token, value from the next argv token
+                try cond.appendSlice(gpa, "        if (!matched and std.mem.eql(u8, a, \"");
+                try cond.appendSlice(gpa, f.short.?);
+                try cond.appendSlice(gpa, "\")) {\n");
+                try out.put(cond.items);
+                const short_body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .next);
+                defer gpa.free(short_body);
+                try out.put(short_body);
+                try out.put("            matched = true;\n        }\n");
+                // long arm: --long=value only
+                var lcnd = std.ArrayList(u8).empty;
+                defer lcnd.deinit(gpa);
+                try lcnd.appendSlice(gpa, "        if (!matched and std.mem.startsWith(u8, a, \"");
+                try lcnd.appendSlice(gpa, f.long.?);
+                try lcnd.appendSlice(gpa, "=\")) {\n");
+                try out.put(lcnd.items);
+                const eq = try std.fmt.allocPrint(gpa, "{d}", .{f.long.?.len + 1});
+                defer gpa.free(eq);
+                const long_body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, .{ .inline_long = eq });
+                defer gpa.free(long_body);
+                try out.put(long_body);
+                try out.put("            matched = true;\n        }\n");
+                continue;
+            }
+
             try cond.appendSlice(gpa, "        if (!matched and (");
             if (f.short) |sh| {
                 try cond.appendSlice(gpa, "std.mem.eql(u8, a, \"");
                 try cond.appendSlice(gpa, sh);
                 try cond.appendSlice(gpa, "\")");
+                parts += 1;
             }
-            if (f.short != null and f.long != null) try cond.appendSlice(gpa, " or ");
             if (f.long) |l| {
-                try cond.appendSlice(gpa, "std.mem.eql(u8, a, \"");
-                try cond.appendSlice(gpa, l);
-                try cond.appendSlice(gpa, "\")");
+                if (parts > 0) try cond.appendSlice(gpa, " or ");
+                if (f.kind == .value) {
+                    try cond.appendSlice(gpa, "std.mem.startsWith(u8, a, \"");
+                    try cond.appendSlice(gpa, l);
+                    try cond.appendSlice(gpa, "=\")");
+                } else {
+                    try cond.appendSlice(gpa, "std.mem.eql(u8, a, \"");
+                    try cond.appendSlice(gpa, l);
+                    try cond.appendSlice(gpa, "\")");
+                }
+                parts += 1;
             }
             try cond.appendSlice(gpa, ")) {\n");
             try out.put(cond.items);
 
-            if (has_groups) try emitExclusionChecks(out, gpa, disp, s, fi);
-            switch (f.kind) {
-                .flag => {
-                    var line = std.ArrayList(u8).empty;
-                    defer line.deinit(gpa);
-                    try line.appendSlice(gpa, "            o.");
-                    try line.appendSlice(gpa, id);
-                    try line.appendSlice(gpa, " = true;\n");
-                    try out.put(line.items);
-                },
-                .value => try emitValueBinding(out, gpa, disp, f, fty, id),
-                .enum_ => |ctor| {
-                    const cid = try ident(gpa, ctor);
-                    defer if (cid.ptr != ctor.ptr) gpa.free(cid);
-                    var line = std.ArrayList(u8).empty;
-                    defer line.deinit(gpa);
-                    try line.appendSlice(gpa, "            o.");
-                    try line.appendSlice(gpa, id);
-                    try line.appendSlice(gpa, " = .");
-                    try line.appendSlice(gpa, cid);
-                    try line.appendSlice(gpa, ";\n");
-                    try out.put(line.items);
-                },
-            }
-            if (has_groups) try out.print("            seen |= 1 << {d};\n", .{fi});
+            const bv: BindingValue = if (f.kind == .value and f.long != null)
+                .{ .inline_long = try std.fmt.allocPrint(gpa, "{d}", .{f.long.?.len + 1}) }
+            else
+                .next;
+            defer if (bv == .inline_long) gpa.free(@constCast(bv.inline_long));
+            const body = try emitFlagBody(gpa, disp, s, fi, f, fty, id, bv);
+            defer gpa.free(body);
+            try out.put(body);
             try out.put("            matched = true;\n        }\n");
         }
         try out.put("        if (!matched) {\n            if (a.len > 1 and a[0] == '-') {\n");
@@ -908,7 +1210,14 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
     if (many_id) |mid| {
         var line = std.ArrayList(u8).empty;
         defer line.deinit(gpa);
-        try line.appendSlice(gpa, "    o.");
+        // Only overwrite the many field when operands actually bound: with
+        // zero operands the dflt default survives (dflt-first semantics —
+        // an empty accumulation is NOT a user override; caught by the
+        // meta_many gate fixture, where keep = ["a","b"] would otherwise be
+        // silently discarded on every bare-argv parse).
+        try line.appendSlice(gpa, "    if (");
+        try line.appendSlice(gpa, mid);
+        try line.appendSlice(gpa, "_items.items.len > 0) o.");
         try line.appendSlice(gpa, mid);
         try line.appendSlice(gpa, " = ");
         try line.appendSlice(gpa, mid);
@@ -942,6 +1251,17 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
             // many-only schema: o/next_pos are never read — discard them
             try out.put("    _ = o;\n    _ = next_pos;\n");
         }
+        // LIMITATION (v1, for the STEP-3 mutator batch): single slots fill
+        // STRICTLY IN ORDER — bindOperand cannot SKIP a slot, so with
+        // positionals [A(many=False), B(many=False)] the argv `fx-x B` binds
+        // operand[0] to A, not B (GNU getopt would fill A then leave B
+        // empty).  Harmless today: the corpus schemas are single-positional.
+        // A skip (fx-mv-style required-first) needs an emitted per-slot
+        // "already bound?" discriminator, not this sequential next_pos walk.
+        // Also note: in a [single, many] schema an `--`-ed SECOND single
+        // operand after the many list has begun appends to the many list
+        // instead of erroring — accepted for v1 (GNU treats post-`--` tokens
+        // as operands too).
         for (s.posix.positionals, 0..) |p, pi| {
             if (p.many) break;
             const id = try ident(gpa, p.field);
@@ -1056,7 +1376,7 @@ fn defaultAssert(out: *Out, gpa: Allocator, fname: []const u8, ty: *const cli.Ty
                     try line.appendSlice(gpa, e);
                     try line.appendSlice(gpa, "\", o.");
                     try line.appendSlice(gpa, id);
-                    try line.appendSlice(gpa, "?);\n");
+                    try line.appendSlice(gpa, ".?)\n");
                 } else {
                     try line.appendSlice(gpa, "    try std.testing.expect(o.");
                     try line.appendSlice(gpa, id);
@@ -1066,11 +1386,41 @@ fn defaultAssert(out: *Out, gpa: Allocator, fname: []const u8, ty: *const cli.Ty
             else => {}, // non-Text optionals: not asserted (none in v1 schemas)
         },
         .list => {
-            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(usize, ");
-            try line.appendSlice(gpa, try std.fmt.allocPrint(gpa, "{d}", .{dv.list.len}));
-            try line.appendSlice(gpa, "), o.");
-            try line.appendSlice(gpa, id);
-            try line.appendSlice(gpa, ".len);\n");
+            // content, not just length (review SHOULD-FIX 3: a length-only
+            // assert would pass a reordered default list silently — STEP 2+
+            // copies this template into every command's tests)
+            for (dv.list, 0..) |*item, li| {
+                if (item.* != .text)
+                    return fail("dflt: non-Text item in a List {s} default", .{@tagName(item.*)});
+                const e = try zigEscape(gpa, item.text);
+                defer gpa.free(e);
+                var lline = std.ArrayList(u8).empty;
+                defer lline.deinit(gpa);
+                try lline.appendSlice(gpa, "    try std.testing.expectEqual(@as(usize, ");
+                try lline.appendSlice(gpa, try std.fmt.allocPrint(gpa, "{d}", .{dv.list.len}));
+                try lline.appendSlice(gpa, "), o.");
+                try lline.appendSlice(gpa, id);
+                try lline.appendSlice(gpa, ".len);\n");
+                if (li == 0) try out.put(lline.items);
+                var iline = std.ArrayList(u8).empty;
+                defer iline.deinit(gpa);
+                try iline.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"");
+                try iline.appendSlice(gpa, e);
+                try iline.appendSlice(gpa, "\", o.");
+                try iline.appendSlice(gpa, id);
+                try iline.appendSlice(gpa, "[");
+                try iline.appendSlice(gpa, try std.fmt.allocPrint(gpa, "{d}", .{li}));
+                try iline.appendSlice(gpa, "]);\n");
+                try out.put(iline.items);
+            }
+            if (dv.list.len == 0) {
+                var lline = std.ArrayList(u8).empty;
+                defer lline.deinit(gpa);
+                try lline.appendSlice(gpa, "    try std.testing.expectEqual(@as(usize, 0), o.");
+                try lline.appendSlice(gpa, id);
+                try lline.appendSlice(gpa, ".len);\n");
+                try out.put(lline.items);
+            }
         },
         .union_ => {
             const cid = try ident(gpa, dv.union_ctor);
@@ -1200,22 +1550,22 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
                         .natural => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqual(@as(u64, 7), o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, "?);\n");
+                            try body.appendSlice(gpa, ".?)\n");
                         },
                         .integer => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqual(@as(i64, -7), o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, "?);\n");
+                            try body.appendSlice(gpa, ".?)\n");
                         },
                         .double => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqual(@as(f64, 0.5), o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, "?);\n");
+                            try body.appendSlice(gpa, ".?)\n");
                         },
                         else => {
                             try body.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"v\", o.");
                             try body.appendSlice(gpa, id);
-                            try body.appendSlice(gpa, "?);\n");
+                            try body.appendSlice(gpa, ".?)\n");
                         },
                     },
                     else => unreachable,
@@ -1237,6 +1587,220 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
         }
         try out.put(body.items);
         try out.put("}\n");
+    }
+
+    // ---- argv-spelling pins (review SHOULD-FIX 1: short clustering and
+    // --long=value are generator vocabulary now — a test here per schema
+    // exercising the shapes it has, so no migration batch can regress them
+    // quietly) ----
+    {
+        // clusterable letters (argumentless shorts), schema order
+        var cflag: [32]cli.Flag = undefined;
+        var cletter: [32]u8 = undefined;
+        var nc: usize = 0;
+        for (s.posix.flags) |f| {
+            if (clusterLetter(f)) |c| {
+                cflag[nc] = f;
+                cletter[nc] = c;
+                nc += 1;
+            }
+        }
+
+        // (1) a cluster of two letters binding DIFFERENT fields binds both
+        outer: for (0..nc) |ai| {
+            for (ai + 1..nc) |bi| {
+                if (std.mem.eql(u8, cflag[ai].field, cflag[bi].field)) continue;
+                try out.put("\ntest \"cli_");
+                try out.put(name);
+                try out.put(": cluster -");
+                try out.put(&[_]u8{cletter[ai]});
+                try out.put(&[_]u8{cletter[bi]});
+                try out.put(" binds both\" {\n");
+                try out.put(prologue);
+                try out.put("    const argv = [_][]const u8{ \"");
+                try out.put(disp);
+                try out.put("\", \"-");
+                try out.put(&[_]u8{ cletter[ai], cletter[bi] });
+                try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n");
+                for ([_]usize{ ai, bi }) |k| {
+                    const kid = try ident(gpa, cflag[k].field);
+                    defer if (kid.ptr != cflag[k].field.ptr) gpa.free(kid);
+                    var line = std.ArrayList(u8).empty;
+                    defer line.deinit(gpa);
+                    switch (cflag[k].kind) {
+                        .flag => {
+                            try line.appendSlice(gpa, "    try std.testing.expect(o.");
+                            try line.appendSlice(gpa, kid);
+                            try line.appendSlice(gpa, ");\n");
+                        },
+                        .enum_ => |ctor| {
+                            const cid = try ident(gpa, ctor);
+                            defer if (cid.ptr != ctor.ptr) gpa.free(cid);
+                            try line.appendSlice(gpa, "    try std.testing.expect(o.");
+                            try line.appendSlice(gpa, kid);
+                            try line.appendSlice(gpa, " == .");
+                            try line.appendSlice(gpa, cid);
+                            try line.appendSlice(gpa, ");\n");
+                        },
+                        .value => unreachable,
+                    }
+                    try out.put(line.items);
+                }
+                try out.put("}\n");
+                break :outer;
+            }
+        }
+
+        // (2) a cluster spanning a mutually_exclusive group conflicts (the
+        // clustering path runs the same exclusion guards as the plain arms)
+        outer2: for (s.posix.mutually_exclusive) |grp| {
+            for (grp, 0..) |nma, x| {
+                for (grp[x + 1 ..]) |nmb| {
+                    const fa_i = flagIndex(s, nma) orelse continue;
+                    const fb_i = flagIndex(s, nmb) orelse continue;
+                    const ca = clusterLetter(s.posix.flags[fa_i]) orelse continue;
+                    const cb = clusterLetter(s.posix.flags[fb_i]) orelse continue;
+                    try out.put("\ntest \"cli_");
+                    try out.put(name);
+                    try out.put(": cluster -");
+                    try out.put(&[_]u8{ca});
+                    try out.put(&[_]u8{cb});
+                    try out.put(" conflicts\" {\n");
+                    try out.put(prologue);
+                    try out.put("    const argv = [_][]const u8{ \"");
+                    try out.put(disp);
+                    try out.put("\", \"-");
+                    try out.put(&[_]u8{ ca, cb });
+                    try out.put("\" };\n    try std.testing.expectError(error.Conflict, parsePosix(&argv, gpa));\n}\n");
+                    break :outer2;
+                }
+            }
+        }
+
+        // an unused letter: with <=32 flags some ASCII letter always frees up
+        var unused: u8 = 0;
+        seek: for ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") |ch| {
+            for (s.posix.flags) |f| {
+                if (f.short) |sh| {
+                    if (sh.len == 2 and sh[1] == ch) continue :seek;
+                }
+            }
+            unused = ch;
+            break;
+        }
+
+        // (3) a cluster containing an unknown letter is an unknown option
+        if (nc > 0 and unused != 0) {
+            try out.put("\ntest \"cli_");
+            try out.put(name);
+            try out.put(": cluster with unknown letter rejected\" {\n");
+            try out.put(prologue);
+            try out.put("    const argv = [_][]const u8{ \"");
+            try out.put(disp);
+            try out.put("\", \"-");
+            try out.put(&[_]u8{ cletter[0], unused });
+            try out.put("\" };\n    try std.testing.expectError(error.UnknownOption, parsePosix(&argv, gpa));\n}\n");
+        }
+
+        for (s.posix.flags) |f| {
+            // (4) a Value short never clusters
+            if (f.kind == .value and f.short != null and nc > 0) {
+                try out.put("\ntest \"cli_");
+                try out.put(name);
+                try out.put(": value short ");
+                try out.put(f.short.?);
+                try out.put(" does not cluster\" {\n");
+                try out.put(prologue);
+                try out.put("    const argv = [_][]const u8{ \"");
+                try out.put(disp);
+                try out.put("\", \"");
+                try out.put(f.short.?);
+                try out.put(&[_]u8{cletter[0]});
+                try out.put("\" };\n    try std.testing.expectError(error.UnknownOption, parsePosix(&argv, gpa));\n}\n");
+            }
+            // (5) inline --long=value
+            if (f.kind == .value and f.long != null) {
+                const fty = s.ty.findField(f.field).?;
+                const id = try ident(gpa, f.field);
+                defer if (id.ptr != f.field.ptr) gpa.free(id);
+                const val: []const u8 = switch (fty.*) {
+                    .optional => |inner| switch (inner.*) {
+                        .natural => "7",
+                        .integer => "-7",
+                        .double => "0.5",
+                        else => "v",
+                    },
+                    .natural => "7",
+                    .integer => "-7",
+                    .double => "0.5",
+                    else => "v",
+                };
+                try out.put("\ntest \"cli_");
+                try out.put(name);
+                try out.put(": ");
+                try out.put(f.long.?);
+                try out.put("=value binds ");
+                try out.put(f.field);
+                try out.put("\" {\n");
+                try out.put(prologue);
+                try out.put("    const argv = [_][]const u8{ \"");
+                try out.put(disp);
+                try out.put("\", \"");
+                try out.put(f.long.?);
+                try out.put("=");
+                try out.put(val);
+                try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n");
+                var line = std.ArrayList(u8).empty;
+                defer line.deinit(gpa);
+                switch (fty.*) {
+                    .text => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"v\", o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .natural => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(u64, 7), o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .integer => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(i64, -7), o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .double => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(f64, 0.5), o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .optional => |inner| switch (inner.*) {
+                        .natural => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(u64, 7), o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        .integer => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(i64, -7), o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        .double => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(f64, 0.5), o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        else => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"v\", o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                    },
+                    else => unreachable,
+                }
+                try out.put(line.items);
+                try out.put("}\n");
+            }
+        }
     }
 
     // ---- first positional binds ----
