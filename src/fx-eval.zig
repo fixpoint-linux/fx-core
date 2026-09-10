@@ -227,7 +227,11 @@ pub fn nativeFind(args: []const u8, input: []const u8, state_dir: []const u8, gp
     }
 
     var entries = std.ArrayList(FindEntry).empty;
-    errdefer entries.deinit(gpa);
+    // NOTE: no `errdefer entries.deinit` here. The `defer` below already frees
+    // the entries AND the buffer on every exit path (normal and error), so an
+    // errdefer would double-deinit on error unwind — LIFO runs the defer first,
+    // then the errdefer frees the already-freed slice, and the allocator's
+    // memset on the stale pointer faults.
     defer {
         for (entries.items) |e| gpa.free(e.path);
         for (entries.items) |e| gpa.free(e.kind);
@@ -253,7 +257,7 @@ pub fn nativeFind(args: []const u8, input: []const u8, state_dir: []const u8, gp
 
     var fctx = FindWalkCtx{ .gpa = gpa, .entries = &entries, .skip_dev = skip_dev, .skip_ino = skip_ino };
     const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch
-        return error.BadStateDir;
+        return error.OpenRoot;
     // findWalkDir consumes root_fd via fdopendir (closedir closes it) — no
     // extra close here (B2 double-close).
     try findWalkDir(&fctx, root_fd, "");
@@ -1290,6 +1294,16 @@ test "replay rejects a tampered manifest shape_out (ShapeMismatch)" {
     };
     const err = replay(&tampered, fix.state, null, gpa, testing.io);
     try testing.expectError(error.ShapeMismatch, err);
+}
+
+test "native find on an unopenable root errors cleanly (no double-free)" {
+    // Regression: nativeFind's error path used to run BOTH an `errdefer
+    // entries.deinit` and the `defer` that frees the entries and the buffer,
+    // double-freeing the slice on unwind (a GPF in the caller: `fx-compose
+    // find:/nonexistent` aborted with SIGABRT). The testing allocator detects
+    // the double free, so simply reaching this error path is the assertion.
+    const gpa = testing.allocator;
+    try testing.expectError(error.OpenRoot, nativeFind("/nonexistent-path-xyz", "", "", gpa));
 }
 
 test "native find emits deterministic sorted JSONL rows" {
