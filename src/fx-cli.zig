@@ -892,26 +892,155 @@ pub fn readSchemaFile(gpa: Allocator, candidates: []const []const u8) Error![:0]
 // (fix-2: the shared STEP-3 template — ONE home for all 58 migrations)
 // ---------------------------------------------------------------------------
 
+/// The Text leaf: JSON-escape `s` exactly like dhall-c's shared qstr
+/// escaper (serialize.zig) — only `"` and `\` are backslash-escaped, plus
+/// \b \f \n \r \t and \u00XX for the remaining C0 controls; bytes >= 0x20
+/// pass through raw (UTF-8 is not re-encoded) — so a '"' or '\' in a bound
+/// operand encodes identically on both sides of a differential vector.
+fn encodeJsonText(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) Error!void {
+    try out.append(gpa, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        8 => try out.appendSlice(gpa, "\\b"),
+        12 => try out.appendSlice(gpa, "\\f"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        else => {
+            if (c < 0x20) {
+                var hb: [8]u8 = undefined;
+                const h = std.fmt.bufPrint(&hb, "\\u{x:0>4}", .{c}) catch unreachable;
+                try out.appendSlice(gpa, h);
+            } else try out.append(gpa, c);
+        },
+    };
+    try out.append(gpa, '"');
+}
+
+/// The canonical term_to_json bytes for ONE Options field of Zig type `VT`
+/// — encodeOptionsWire walks the struct with it and the Optional/List arms
+/// recurse on their payload through it, so ?T, List T and their nestings
+/// (Optional (List T), List (Optional T), Optionals of unions) all decode
+/// through the same shape rules.  Coverage is @typeInfo reflection, NOT a
+/// hand-maintained list — the false-green class fix-2 kills: an unsupported
+/// field type is a COMPILE error naming the field, never a silent
+/// mis-encoding (e.g. a `?T` iterated 0-or-1 times by a Zig `for`).
+///
+/// Encodings verified byte-for-byte against the REBUILT dhall-c zig core
+/// (`zig build-exe zig/src/main.zig -lc`; NEVER the stale committed APE):
+/// Some v -> v's JSON bare (Some "x" -> "x", Some 3 -> 3, Some <A|B>.B ->
+/// {"B":{}}), None -> null, List -> [e,e] with no spaces, records nested in
+/// either -> {"k":v}.
+fn encodeJsonField(comptime VT: type, gpa: Allocator, out: *std.ArrayList(u8), v: VT, comptime fname: []const u8) Error!void {
+    // Text FIRST, by exact type: []const u8 is itself a Zig .slice, so the
+    // switch below would happily read a Text field as List u8 and emit an
+    // array of byte numbers.  Text is the ONLY scalar []const-u8 shape a
+    // generated field carries (dhall Text); List Text is []const []const u8,
+    // whose elements land here one by one and take this same early return.
+    if (VT == []const u8) {
+        try encodeJsonText(gpa, out, v);
+        return;
+    }
+    switch (@typeInfo(VT)) {
+        .bool => try out.appendSlice(gpa, if (v) "true" else "false"),
+        .@"enum" => {
+            // nullary-union ctor -> {"<Ctor>":{}}
+            try out.appendSlice(gpa, "{\"");
+            try out.appendSlice(gpa, @tagName(v));
+            try out.appendSlice(gpa, "\":{}}");
+        },
+        .int => {
+            // u64 is Natural (the generator's mapping, tools/fx-clijson.zig
+            // zigType).  If a schema ever needs another int width, give it a
+            // distinct arm here — never let it fall through to a generic int.
+            if (VT != u64)
+                @compileError(std.fmt.comptimePrint(
+                    "encodeJsonField: field '{s}' is not Natural (u64); add an arm for this int type",
+                    .{fname},
+                ));
+            var nb: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&nb, "{d}", .{v}) catch unreachable;
+            try out.appendSlice(gpa, s);
+        },
+        .float => {
+            // f64 is Double.  1100 covers any {d} rendering (denormals
+            // ~1100 chars).  Zig {d} vs dhall-c's dbl_fmt (%g-style: 1.0,
+            // 1e+06) diverges at extreme magnitudes — pin parity with a
+            // differential BEFORE shipping the first Double schema field.
+            if (VT != f64)
+                @compileError(std.fmt.comptimePrint(
+                    "encodeJsonField: field '{s}' is not Double (f64); add an arm for this float type",
+                    .{fname},
+                ));
+            var nb: [1100]u8 = undefined;
+            const s = std.fmt.bufPrint(&nb, "{d}", .{v}) catch unreachable;
+            try out.appendSlice(gpa, s);
+        },
+        .optional => {
+            // Some -> the payload's JSON (BARE — dhall-c never wraps it),
+            // None -> null
+            const P = @typeInfo(VT).optional.child;
+            if (v) |payload| {
+                try encodeJsonField(P, gpa, out, payload, fname);
+            } else {
+                try out.appendSlice(gpa, "null");
+            }
+        },
+        .pointer => |pi| {
+            // List -> [e,e] with no spaces (dhall-c json_value emitter).  A
+            // slice type is a .pointer in @typeInfo (size == .slice); only
+            // that shape is allowed here — a generated List is []const E.
+            // The payload recursion is what keeps "[]const u8 is Text" from
+            // swallowing List Text: a bare []const u8 took the exact Text
+            // early-return above, []const []const u8 recurses with a slice
+            // payload that re-enters the Text leaf.
+            if (pi.size != .slice)
+                @compileError(std.fmt.comptimePrint(
+                    "encodeJsonField: field '{s}' is a non-slice pointer; add an arm for it",
+                    .{fname},
+                ));
+            try out.append(gpa, '[');
+            for (v, 0..) |item, i| {
+                if (i != 0) try out.appendSlice(gpa, ",");
+                try encodeJsonField(pi.child, gpa, out, item, fname);
+            }
+            try out.append(gpa, ']');
+        },
+        .@"struct" => {
+            // a record nested in an Optional/List (verified: {"n":1})
+            try out.append(gpa, '{');
+            inline for (@typeInfo(VT).@"struct".fields, 0..) |rf, ri| {
+                if (ri != 0) try out.appendSlice(gpa, ",");
+                try out.append(gpa, '"');
+                try out.appendSlice(gpa, rf.name);
+                try out.appendSlice(gpa, "\":");
+                try encodeJsonField(rf.type, gpa, out, @field(v, rf.name), rf.name);
+            }
+            try out.append(gpa, '}');
+        },
+        else => {
+            // Anything landing here is a type the generator does not emit
+            // (i64/u16/[]const u16/...): grow its arm explicitly, never
+            // mis-encode.  ([]const u8 never reaches this arm — the Text
+            // early-return above takes it.)
+            if (VT != []const u8)
+                @compileError(std.fmt.comptimePrint(
+                    "encodeJsonField: field '{s}' has an unsupported type; add an arm (Text=[]const u8, List=[]const E, Optional=?E, Natural=u64, Bool, union enum)",
+                    .{fname},
+                ));
+            try encodeJsonText(gpa, out, v);
+        },
+    }
+}
+
 /// Encode a generated Options struct (cli_<name>.Options) as the canonical
 /// wire-JSON bytes term_to_json produces for the completed record: "{...}"
 /// with keys in COMPTIME FIELD ORDER — dhall-c sort_fields() alphabetizes the
 /// ty record and the generator emits the struct in that same sorted order, so
-/// comptime order IS the canonical key order — bool as true/false, a nullary
-/// union as {"<Ctor>":{}} (the enum tag is the ctor name the generator
-/// emits), numbers as {d}, Text JSON-escaped exactly like dhall-c's shared
-/// qstr escaper (serialize.zig) so a '"' or '\' in a bound operand encodes
-/// identically on both sides of a differential vector.
-///
-/// Field coverage is @typeInfo reflection, NOT a hand-maintained list — the
-/// false-green class fix-2 kills: a STEP-3 schema field the encoder "forgets"
-/// is impossible, and an unsupported field type is a COMPILE error naming the
-/// field.  Optional and many-slice fields deliberately have no arms yet (no
-/// schema uses them through this path); when the STEP-3 batches introduce
-/// them, add `.optional` (null / Some payload) and slice (JSON array) arms —
-/// the Text arm's exact-type check below is what forces that decision loudly
-/// instead of silently encoding `?T` as "" (Zig `for` over an optional is
-/// legal and iterates 0-or-1 times).  Double fields print via Zig {d}; parity
-/// with dhall-c's dbl_fmt gets pinned by the first Double-schema differential.
+/// comptime order IS the canonical key order — and no whitespace (the
+/// emitter is the minimal "{\"k\":v}" / "[a,b]" form, byte-identical to
+/// `dhall to-json`).  Field-value shapes dispatch to encodeJsonField.
 pub fn encodeOptionsWire(comptime T: type, gpa: Allocator, o: T) Error!std.ArrayList(u8) {
     var b = std.ArrayList(u8).empty;
     errdefer b.deinit(gpa);
@@ -921,50 +1050,7 @@ pub fn encodeOptionsWire(comptime T: type, gpa: Allocator, o: T) Error!std.Array
         try b.appendSlice(gpa, "\"");
         try b.appendSlice(gpa, f.name);
         try b.appendSlice(gpa, "\":");
-        switch (@typeInfo(f.type)) {
-            .bool => try b.appendSlice(gpa, if (@field(o, f.name)) "true" else "false"),
-            .@"enum" => {
-                // nullary-union ctor -> {"<Ctor>":{}}
-                try b.appendSlice(gpa, "{\"");
-                try b.appendSlice(gpa, @tagName(@field(o, f.name)));
-                try b.appendSlice(gpa, "\":{}}");
-            },
-            // 1100 covers any {d} rendering of an f64 (denormals ~1100 chars)
-            .int, .float => {
-                var nb: [1100]u8 = undefined;
-                const s = std.fmt.bufPrint(&nb, "{d}", .{@field(o, f.name)}) catch unreachable;
-                try b.appendSlice(gpa, s);
-            },
-            else => {
-                // Text ([]const u8) — the only remaining v1 field shape.
-                // Exact comptime type check: anything else (an Optional, a
-                // many-slice, ...) must grow its own arm above, never sneak
-                // through here mis-encoded.
-                if (f.type != []const u8)
-                    @compileError(std.fmt.comptimePrint(
-                        "encodeOptionsWire: field '{s}' is not Text; add an arm (Optional/List land with STEP 3)",
-                        .{f.name},
-                    ));
-                try b.append(gpa, '"');
-                for (@field(o, f.name)) |c| switch (c) {
-                    '"' => try b.appendSlice(gpa, "\\\""),
-                    '\\' => try b.appendSlice(gpa, "\\\\"),
-                    8 => try b.appendSlice(gpa, "\\b"),
-                    12 => try b.appendSlice(gpa, "\\f"),
-                    '\n' => try b.appendSlice(gpa, "\\n"),
-                    '\r' => try b.appendSlice(gpa, "\\r"),
-                    '\t' => try b.appendSlice(gpa, "\\t"),
-                    else => {
-                        if (c < 0x20) {
-                            var hb: [8]u8 = undefined;
-                            const h = std.fmt.bufPrint(&hb, "\\u{x:0>4}", .{c}) catch unreachable;
-                            try b.appendSlice(gpa, h);
-                        } else try b.append(gpa, c);
-                    },
-                };
-                try b.append(gpa, '"');
-            },
-        }
+        try encodeJsonField(f.type, gpa, &b, @field(o, f.name), f.name);
     }
     try b.appendSlice(gpa, "}");
     return b;
@@ -1291,4 +1377,166 @@ test "completed record equals the POSIX-parsed Options for fx-ls -l -a -S /tmp" 
     try testing.expectEqual(true, c.value.findField("all").?.bool_); // o.all
     try testing.expectEqualStrings("Size", c.value.findField("sort").?.union_ctor); // o.sort == .Size
     try testing.expectEqual(false, c.value.findField("rows").?.bool_); // o.rows
+}
+
+// ---------------------------------------------------------------------------
+// encodeOptionsWire: Optional / List arms (STEP 3 pre-work)
+//
+// The ground truth for every expected byte string below was taken from the
+// REBUILT dhall-c zig core (zig/src/main.zig, `dhall to-json`, byte-identical
+// to the prebuilt /tmp/dhall-zig oracle), via parse_source -> infer_type ->
+// normalize -> term_to_json — the same pipeline the runtime record path
+// drives.  Probes (all committed to this file's history):
+//   { some_text = Some "x", none_text = None Text }            ->
+//     {"none_text":null,"some_text":"x"}
+//   { some_nat = Some 3, list_nat = [1,2,3], empty_list = [] } ->
+//     {"empty_list":[],"list_nat":[1,2,3],"some_nat":3}
+//   { list_opt = [Some 1, None Natural],
+//     some_list = Some ["a","b"],
+//     opt_list_none = None (List Text),
+//     union_list = [<X|Y>.X, <X|Y>.Y],
+//     some_union = Some <A|B>.B,
+//     rec_list = [{n=1},{n=2}], some_record = Some {n=1},
+//     empty Some-list = Some ([] : List Natural) }             ->
+//     {"list_opt":[1,null],"some_list":["a","b"],
+//      "opt_list_none":null,"union_list":[{"X":{}},{"Y":{}}],
+//      "some_union":{"B":{}},"rec_list":[{"n":1},{"n":2}],
+//      "some_record":{"n":1},"o_l":[]}
+// Some encodes its payload BARE (never wrapped) and None as null; a List is
+// "[e,e]" with no spaces — the minimal emitter in serialize.zig (json_value),
+// which has no pretty-printing mode at all.
+// ---------------------------------------------------------------------------
+
+test "encodeOptionsWire: Optional Text Some/None exact bytes vs dhall-c term_to_json" {
+    const gpa = testing.allocator;
+    const S = struct { none_text: ?[]const u8, some_text: ?[]const u8 };
+    // canonical key order = alphabetized ty order = struct decl order
+    var w = try encodeOptionsWire(S, gpa, .{ .some_text = "x", .none_text = null });
+    defer w.deinit(gpa);
+    try testing.expectEqualStrings("{\"none_text\":null,\"some_text\":\"x\"}", w.items);
+}
+
+test "encodeOptionsWire: Optional Natural Some/None exact bytes vs dhall-c term_to_json" {
+    const gpa = testing.allocator;
+    const S = struct { none_nat: ?u64, some_nat: ?u64 };
+    var w = try encodeOptionsWire(S, gpa, .{ .none_nat = null, .some_nat = 3 });
+    defer w.deinit(gpa);
+    try testing.expectEqualStrings("{\"none_nat\":null,\"some_nat\":3}", w.items);
+}
+
+test "encodeOptionsWire: List Text exact bytes vs dhall-c term_to_json" {
+    const gpa = testing.allocator;
+    // []const []const u8 = List Text: element recursion must hit the Text
+    // leaf, NOT re-read the strings as byte lists
+    const S = struct { empty: []const []const u8, tags: []const []const u8 };
+    var w = try encodeOptionsWire(S, gpa, .{ .tags = &.{ "b", "a" }, .empty = &.{} });
+    defer w.deinit(gpa);
+    try testing.expectEqualStrings("{\"empty\":[],\"tags\":[\"b\",\"a\"]}", w.items);
+}
+
+test "encodeOptionsWire: nested Optional(List)/List(Optional)/Optionals-of-unions exact bytes vs dhall-c term_to_json" {
+    const gpa = testing.allocator;
+    const Tag = enum { X, Y };
+    const Rec = struct { n: u64 };
+    const S = struct {
+        list_opt: []const ?u64,
+        opt_list_none: ?[]const []const u8,
+        opt_list_some: ?[]const []const u8,
+        opt_nat: ?u64,
+        opt_union: ?Tag,
+        rec_list: []const Rec,
+        union_list: []const Tag,
+    };
+    var w = try encodeOptionsWire(S, gpa, .{
+        .list_opt = &.{ 1, null },
+        .opt_list_none = null,
+        .opt_list_some = &.{ "a", "b" },
+        .opt_nat = null,
+        .opt_union = .Y,
+        .rec_list = &.{ .{ .n = 1 }, .{ .n = 2 } },
+        .union_list = &.{ .X, .Y },
+    });
+    defer w.deinit(gpa);
+    try testing.expectEqualStrings(
+        "{\"list_opt\":[1,null],\"opt_list_none\":null,\"opt_list_some\":[\"a\",\"b\"],\"opt_nat\":null,\"opt_union\":{\"Y\":{}},\"rec_list\":[{\"n\":1},{\"n\":2}],\"union_list\":[{\"X\":{}},{\"Y\":{}}]}",
+        w.items,
+    );
+}
+
+// THE GROUND-TRUTH bridge: the vendored dhall-c core — the EXACT module the
+// binaries link and the EXACT runtime pipeline evalDhallArgs drives
+// (parse_source -> infer_type -> normalize -> term_to_json) — evaluates a
+// record carrying every encoded shape, and encodeOptionsWire must emit the
+// same bytes for the mirror-image Options struct.  Every arm above is pinned
+// against the real serializer here, in-process, on every `zig build test`.
+fn gtRecord() [:0]const u8 {
+    return "{ list_nat = [ 1, 2 ]" ++
+        ", list_opt = [ Some 1, None Natural ]" ++
+        ", none_text = None Text" ++
+        ", opt_nat = Some 3" ++
+        ", opt_rec = Some { n = 3 }" ++
+        ", opt_tag = None < A | B >" ++
+        ", opt_tags = Some [ \"a\", \"b\" ]" ++
+        ", rec_list = [ { n = 1 }, { n = 2 } ]" ++
+        ", some_text = Some \"x\"" ++
+        ", tag_list = [ < A | B >.A, < A | B >.B ] }";
+}
+
+const TagAB = enum { A, B };
+const NRec = struct { n: u64 };
+
+const GtRec = struct {
+    list_nat: []const u64,
+    list_opt: []const ?u64,
+    none_text: ?[]const u8,
+    opt_nat: ?u64,
+    opt_rec: ?NRec,
+    opt_tag: ?TagAB,
+    opt_tags: ?[]const []const u8,
+    rec_list: []const NRec,
+    some_text: ?[]const u8,
+    tag_list: []const TagAB,
+};
+
+test "GROUND-TRUTH: encodeOptionsWire == vendored term_to_json bytes (all shapes)" {
+    const gpa = testing.allocator;
+
+    // --- the vendored dhall-c core's own JSON bytes (runtime pipeline,
+    // verbatim from the ROUND-TRIP test above) ---
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    arena.arena_reset(arena.dhall_arena.?);
+    const src_z = try gpa.dupeZ(u8, gtRecord());
+    defer gpa.free(src_z);
+    const loader = import_mod.import_loader_new();
+    defer import_mod.import_loader_free(loader);
+    var p: dhall.Parser = std.mem.zeroes(dhall.Parser);
+    p.loader = loader;
+    var err: dhall.DhallError = undefined;
+    ast.dhall_error_clear(&err);
+    const t = parser.parse_source(&p, src_z, null, &err) orelse return error.DhallParse;
+    _ = typecheck.infer_type(&p, t, &err) orelse return error.DhallType;
+    normalize.normalize_clear_error();
+    const nf = normalize.normalize(t);
+    if (normalize.normalize_has_error()) return error.DhallNormalize;
+    var ob = std.ArrayList(u8).initCapacity(gpa, 4096) catch unreachable;
+    defer ob.deinit(gpa);
+    const out = ast.Out{ .b = &ob };
+    if (!serialize.term_to_json(out, nf, &err)) return error.DhallSerialize;
+
+    // --- the mirror-image Options struct, encoded by reflection ---
+    var w = try encodeOptionsWire(GtRec, gpa, .{
+        .list_nat = &.{ 1, 2 },
+        .list_opt = &.{ 1, null },
+        .none_text = null,
+        .opt_nat = 3,
+        .opt_rec = .{ .n = 3 },
+        .opt_tag = null,
+        .opt_tags = &.{ "a", "b" },
+        .rec_list = &.{ .{ .n = 1 }, .{ .n = 2 } },
+        .some_text = "x",
+        .tag_list = &.{ .A, .B },
+    });
+    defer w.deinit(gpa);
+
+    try testing.expectEqualStrings(w.items, ob.items);
 }
