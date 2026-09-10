@@ -3,12 +3,23 @@
 // aggregate (the W4-pinned shape: keep the distinguishing column existentially
 // quantified in the aggregate rule's body).
 //
-// Two arg forms:
+// Two arg forms, ONE source of truth (schemas/uniq.dhall — the fx-ls
+// migration template):
 //   fx-uniq '{ count = True, global = True, input = "/tmp/f" }'   Dhall record
-//   fx-uniq [-c] [-g] [FILE]                                      POSIX fallback
+//   fx-uniq [-c] [-g] [FILE]                                      POSIX
 //
-// Dhall record: { count : Bool, global : Bool, input : Optional Text } with
-// defaults count=False, global=False, input=None (stdin).
+// Dhall record: { count : Bool, global : Bool, input : Text } with defaults
+// count=False, global=False, input="" ("" = stdin: the schema spells the
+// single positional plain Text, so the struct's old `input : Optional Text`
+// stdin spelling converged onto the "" placeholder — omit the field instead
+// of `{ input = None Text }`, which is ill-typed against this ty).
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_uniq.zig,
+// emitted from schemas/uniq.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Strengthened
+// over the hand parser it replaced: -c -g together form short clusters (-cg),
+// --count/--global long aliases are accepted, `--` ends flag parsing, and a
+// second bare operand is error.UnexpectedOperand (not TooManyArgs).
 //
 // Semantics:
 //   DEFAULT (POSIX adjacent): read lines, collapse only ADJACENT runs of equal
@@ -36,6 +47,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_uniq = @import("cli-uniq");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -64,14 +77,11 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/uniq.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    count: bool = false,
-    global: bool = false,
-    input: ?[]const u8 = null, // null = stdin
-};
+const Options = cli_uniq.Options;
+const parsePosixArgs = cli_uniq.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     count: bool = false,
@@ -227,26 +237,99 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-c")) {
-            o.count = true;
-        } else if (std.mem.eql(u8, a, "-g")) {
-            o.global = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-uniq: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else if (o.input == null) {
-            o.input = try gpa.dupe(u8, a);
-        } else {
-            std.debug.print("fx-uniq: too many positional arguments\n", .{});
-            return error.TooManyArgs;
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal (fx-cli.renderDhallRecord) and evaluated by THIS
+// file's evalDhallArgs — the exact runtime path `fx-uniq '{ ... }'` takes.
+// Both sides are re-encoded to the canonical wire shape
+// (fx-cli.encodeOptionsWire) and compared as strings.
+//
+// `input` is the "" = stdin placeholder (schemas/uniq.dhall): an absent field
+// completes to "" on BOTH sides, so the stdin vectors carry no input key.
+
+fn uniqSchemaSrc() [:0]u8 {
+    return cli.readSchemaFile(std.testing.allocator, &.{ "schemas/uniq.dhall", "fx-core/schemas/uniq.dhall" }) catch
+        @panic("cannot locate schemas/uniq.dhall (run tests from the fx-core root)");
+}
+
+/// One differential vector for fx-uniq — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_uniq, &.{ "schemas/uniq.dhall", "fx-core/schemas/uniq.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- empty argv: stdin (input keeps its "" default), no counts ---
+    try expectPosixEqualsRecord(&.{"fx-uniq"}, "{ }");
+
+    // --- the two bool flags: short and long, alone ---
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-c" }, "{ count = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "--count" }, "{ count = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-g" }, "{ global = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "--global" }, "{ global = True }");
+
+    // --- pairs of flags, every order ---
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-c", "-g" }, "{ count = True, global = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "--global", "--count" }, "{ count = True, global = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-g", "-c" }, "{ count = True, global = True }");
+
+    // --- short clusters: -cg == -c -g in any composition ---
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-cg" }, "{ count = True, global = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-gc" }, "{ count = True, global = True }");
+
+    // --- the FILE positional: bare operand, '-' operand, '--' terminator ---
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "/tmp/f" }, "{ input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-" }, "{ input = \"-\" }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "--", "-c" }, "{ input = \"-c\" }");
+
+    // --- flags and the positional interleaved both ways ---
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-c", "/tmp/f" }, "{ count = True, input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "/tmp/f", "-c" }, "{ count = True, input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-cg", "/tmp/f" }, "{ count = True, global = True, input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "/tmp/f", "-cg" }, "{ count = True, global = True, input = \"/tmp/f\" }");
+
+    // --- duplicate-flag idempotence: a repeated bool binds the same value ---
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-c", "-c" }, "{ count = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uniq", "-g", "-g", "/tmp/f" }, "{ global = True, input = \"/tmp/f\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option (POSIX) ~ unknown field (record form, below)
+    try std.testing.expectError(error.UnknownOption, cli_uniq.parsePosix(&.{ "fx-uniq", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_uniq.parsePosix(&.{ "fx-uniq", "--bogus" }, gpa));
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_uniq.parsePosix(&.{ "fx-uniq", "-cA" }, gpa));
+
+    // a second bare operand: UnexpectedOperand (the deliberate strengthening —
+    // the hand parser this replaced returned TooManyArgs; the record form
+    // cannot express a second positional at all)
+    try std.testing.expectError(error.UnexpectedOperand, cli_uniq.parsePosix(&.{ "fx-uniq", "a", "b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  (The old `{ input = None Text }` stdin spelling is
+    // likewise ill-typed against Text — pinned implicitly by the 5 there.)
+    const schema_src = uniqSchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ count = 5 }"));
+
+    // MissingValue / BadValue are unreachable on this command: uniq has no
+    // Value flag and no numeric ty field (the same note fx-ls carries; the
+    // generator's behavior for those classes is pinned by the gen-cli
+    // meta-gate).
 }
 
 // ---------------------------------------------------------------------------
@@ -304,20 +387,25 @@ fn readFdAll(gpa: Allocator, fd: c_int, out: *std.ArrayList(u8)) !void {
     }
 }
 
-/// Read the whole input: `path` if given, else stdin (fd 0).  Returns an
-/// owned slice; caller gpa.free's it.
+/// Read the whole input: `path` if given ("" = stdin, the schema's
+/// placeholder — no FILE operand), else stdin (fd 0).  Returns an owned
+/// slice; caller gpa.free's it.
 fn readInput(gpa: Allocator, path: ?[]const u8) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);
     if (path) |p| {
-        const z = std.posix.toPosixPath(p) catch return error.BadPath;
-        const fd = open(&z, O_RDONLY, 0);
-        if (fd < 0) {
-            std.debug.print("fx-uniq: cannot open '{s}'\n", .{p});
-            return error.OpenFailed;
+        if (p.len > 0) {
+            const z = std.posix.toPosixPath(p) catch return error.BadPath;
+            const fd = open(&z, O_RDONLY, 0);
+            if (fd < 0) {
+                std.debug.print("fx-uniq: cannot open '{s}'\n", .{p});
+                return error.OpenFailed;
+            }
+            defer _ = close(fd);
+            try readFdAll(gpa, fd, &buf);
+        } else {
+            try readFdAll(gpa, 0, &buf);
         }
-        defer _ = close(fd);
-        try readFdAll(gpa, fd, &buf);
     } else {
         try readFdAll(gpa, 0, &buf);
     }
@@ -474,45 +562,45 @@ test "jsonParseOpts defaults and None input" {
         return error.TestUnexpectedResult;
     try std.testing.expect(!o.count);
     try std.testing.expect(!o.global);
-    try std.testing.expect(o.input == null);
+    try std.testing.expect(o.input == null); // None completes to the "" = stdin placeholder in evalDhallArgs
 }
 
 test "evalDhallArgs record" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ count = True, global = True, input = \"/tmp/f\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
+    defer std.testing.allocator.free(o.input);
     try std.testing.expect(o.count);
     try std.testing.expect(o.global);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
-test "evalDhallArgs None input (stdin)" {
+test "evalDhallArgs None input is ill-typed against the schema (stdin = omit)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
-    try std.testing.expect(!o.count);
-    try std.testing.expect(!o.global);
-    try std.testing.expect(o.input == null);
+    const gpa = std.testing.allocator;
+    const schema_src = uniqSchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = None Text }"));
 }
 
 test "parsePosixArgs defaults (stdin)" {
-    const o = try parsePosixArgs(&.{"fx-uniq"}, std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const o = try parsePosixArgs(&.{"fx-uniq"}, gpa);
     try std.testing.expect(!o.count);
     try std.testing.expect(!o.global);
-    try std.testing.expect(o.input == null);
+    try std.testing.expectEqualStrings("", o.input);
 }
 
 test "parsePosixArgs c g file" {
-    const args = [_][:0]const u8{ "fx-uniq", "-c", "-g", "/tmp/f" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const args = [_][]const u8{ "fx-uniq", "-c", "-g", "/tmp/f" };
+    const o = try parsePosixArgs(&args, gpa);
     try std.testing.expect(o.count);
     try std.testing.expect(o.global);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
-}
-
-test "parsePosixArgs unknown option rejected" {
-    const args = [_][:0]const u8{"fx-uniq", "-x"};
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
 // The POSIX trap: adjacent semantics must NOT dedupe globally.
@@ -606,7 +694,7 @@ pub fn main(init: std.process.Init) !void {
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
-    const content = try readInput(gpa, opts.input);
+    const content = try readInput(gpa, if (opts.input.len > 0) opts.input else null);
     defer gpa.free(content);
 
     var entries = try computeFromContent(gpa, content, opts);

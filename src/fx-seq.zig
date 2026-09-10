@@ -3,12 +3,30 @@
 // Prints a sequence of integers: FIRST, FIRST+INC, ... LAST (inclusive).  Pure
 // libc + the dhall module for typed args — no datalog / journal dependency.
 //
-// Two arg forms:
-//   fx-seq '{ last = 5, first = 1, increment = 2 }'   Dhall record
-//   fx-seq [FIRST [INC]] LAST                        POSIX fallback
+// Two arg forms, ONE source of truth for the RECORD side
+// (schemas/seq.dhall):
+//   fx-seq '{ last = 5, first = 1, inc = 2 }'        Dhall record
+//   fx-seq [FIRST [INC]] LAST                        POSIX (HAND parser, below)
 //
-// - Dhall `last : Integer` (required) with `first`/`increment : Optional
-//   Integer` (default first=1, increment=1).
+// MIGRATION STATUS (a deliberate PARTIAL, unlike rm/rmdir/echo/env/tree):
+// Options is an ALIAS of the generated cli_seq.Options (i64 fields, from
+// schemas/seq.dhall ty) and the record side is differential-tested through
+// the schema completion — but the POSIX form STAYS on the hand parser.
+// schemas/seq.dhall documents why: seq's 1/2/3-operand ARITY SWITCH
+// (1 op = LAST, 2 = FIRST LAST, 3 = FIRST INC LAST) needs Integer-coercing
+// positionals plus per-arity slot mapping, and the v1 positional vocabulary
+// has NEITHER — so schemas/seq.dhall leaves `positionals = []` and
+// cli_seq.parsePosix rejects EVERY operand (accepting only the all-defaults
+// argv).  Replacing the hand parser would turn `fx-seq 5` into a loud
+// reject.  VOCABULARY GAP — reported; the generated parser here is
+// record-form only and exercises the differential's completion machinery.
+//
+// - Dhall `last : Integer` (REQUIRED in the record form; the runtime
+//   MissingLast check stays) with `first`/`inc : Integer` (default 1/1).
+//   NAME NOTE: the OLD hand JSON layer read the key "increment" while the
+//   struct field is `inc`; the schema spells the STRUCT name `inc`, so the
+//   record form now reads `{ last = 5, first = 1, inc = 2 }` ("increment" is
+//   a SchemaCheck rejection).
 // - POSIX: 1 arg => `1..LAST` step +1; 2 args => `FIRST..LAST` step +1; 3 args
 //   => `FIRST..LAST` step INC.  Direction follows the sign of INC.
 //
@@ -23,6 +41,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_seq = @import("cli-seq");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -36,19 +56,17 @@ const import_mod = dh.import_mod;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/seq.dhall).
+// The POSIX side stays HAND (see the header: the generated parsePosix cannot
+// express seq's Integer arity dispatch); only the type + record form migrate.
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    last: i128 = 0,
-    first: i128 = 1,
-    inc: i128 = 1,
-};
+const Options = cli_seq.Options; // i64 first/inc/last, the schema ty mapping
 
 const JsonOpts = struct {
     last: ?i128 = null,
     first: ?i128 = null,
-    increment: ?i128 = null,
+    inc: ?i128 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -167,8 +185,8 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
                 res.last = val;
             } else if (std.mem.eql(u8, key, "first")) {
                 res.first = val;
-            } else if (std.mem.eql(u8, key, "increment")) {
-                res.increment = val;
+            } else if (std.mem.eql(u8, key, "inc")) {
+                res.inc = val;
             }
         } else {
             return null;
@@ -228,9 +246,9 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
         return error.MissingLast;
     };
     return Options{
-        .last = last,
-        .first = opts.first orelse 1,
-        .inc = opts.increment orelse 1,
+        .last = @intCast(last),
+        .first = @intCast(opts.first orelse 1),
+        .inc = @intCast(opts.inc orelse 1),
     };
 }
 
@@ -256,9 +274,11 @@ fn parsePosixArgs(args: []const [:0]const u8) !Options {
         n += 1;
     }
     switch (n) {
-        1 => return Options{ .last = nums[0], .first = 1, .inc = 1 },
-        2 => return Options{ .last = nums[1], .first = nums[0], .inc = 1 },
-        3 => return Options{ .last = nums[2], .first = nums[0], .inc = nums[1] },
+        // @intCast: the schema field type is Integer as i64; an operand
+        // beyond i64 range is out of the generated surface's domain.
+        1 => return Options{ .last = @intCast(nums[0]), .first = 1, .inc = 1 },
+        2 => return Options{ .last = @intCast(nums[1]), .first = @intCast(nums[0]), .inc = 1 },
+        3 => return Options{ .last = @intCast(nums[2]), .first = @intCast(nums[0]), .inc = @intCast(nums[1]) },
         else => unreachable,
     }
 }
@@ -293,11 +313,11 @@ fn seqAppend(gpa: Allocator, first: i128, inc: i128, last: i128, out: *std.Array
 
 test "jsonParseOpts integer fields" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"last\":5,\"first\":1,\"increment\":2}", &buf) orelse
+    const o = jsonParseOpts("{\"last\":5,\"first\":1,\"inc\":2}", &buf) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?i128, 5), o.last);
     try std.testing.expectEqual(@as(?i128, 1), o.first);
-    try std.testing.expectEqual(@as(?i128, 2), o.increment);
+    try std.testing.expectEqual(@as(?i128, 2), o.inc);
 }
 
 test "jsonParseOpts negative integer" {
@@ -306,7 +326,7 @@ test "jsonParseOpts negative integer" {
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?i128, -2), o.last);
     try std.testing.expectEqual(@as(?i128, -2), o.first);
-    try std.testing.expectEqual(@as(?i128, null), o.increment);
+    try std.testing.expectEqual(@as(?i128, null), o.inc);
 }
 
 test "seqAppend ranges" {
@@ -344,6 +364,81 @@ test "seqAppend zero increment is an error" {
 }
 
 // ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — record-side half (the fx-ls/fx-whoami template,
+// applied to seq's schema-driven RECORD form only; see the header for why the
+// POSIX side stays hand-parsed)
+// ---------------------------------------------------------------------------
+//
+// The generated cli_seq.Options (schemas/seq.dhall ty) is the SAME type both
+// sides produce, so the record form is differential-tested through the schema
+// completion ((dflt // user) : ty, cli.completeSrc), rendered back to a
+// record literal (cli.renderDhallRecord) and evaluated by THIS file's
+// evalDhallArgs, then compared field-for-field against the expected Options —
+// pinning the completion defaults (first = +1, inc = +1) against the struct's.
+// (The cli.encodeOptionsWire string comparison the other migrations use has a
+// Natural-only int arm, so it cannot encode seq's Integer (i64) fields here.)
+
+/// One differential vector for fx-seq (record-side only — there is no POSIX
+/// spelling of a record in general, so the POSIX side is the all-defaults
+/// Options the generated parser yields).
+fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/seq.dhall", "fx-core/schemas/seq.dhall" }) catch
+        @panic("cannot locate schemas/seq.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    var c = try cli.completeSrc(gpa, schema_src, user_record);
+    defer c.deinit(gpa);
+    const rendered = try cli.renderDhallRecord(gpa, &c.value, c.ty);
+    defer gpa.free(rendered);
+    const rendered_z = try gpa.dupeZ(u8, rendered);
+    defer gpa.free(rendered_z);
+    const record_o = try evalDhallArgs(rendered_z, gpa);
+
+    try std.testing.expectEqual(expected, record_o);
+}
+
+test "DIFFERENTIAL: schema-completed record form matches the generated Options" {
+    // Integer literals carry dhall's SIGNED PREFIX (`+5`) — a bare `5`
+    // infers as Natural and the Integer annotation rejects it (the
+    // SchemaCheck the last test pins).  All-defaults first: `last` keeps its
+    // +0 PLACEHOLDER (the record form still requires an explicit last at
+    // runtime, per the MissingLast check in main()).
+    try expectRecordEqualsOptions("{ }", .{ .last = 0, .first = 1, .inc = 1 });
+    // the classic: 1..5 step 2
+    try expectRecordEqualsOptions("{ last = +5, first = +1, inc = +2 }", .{ .last = 5, .first = 1, .inc = 2 });
+    // negative bounds and step (Integer, not Natural)
+    try expectRecordEqualsOptions("{ last = -3, first = +1, inc = -1 }", .{ .last = -3, .first = 1, .inc = -1 });
+    // first only: inc keeps its +1 default
+    try expectRecordEqualsOptions("{ last = +9, first = -2 }", .{ .last = 9, .first = -2, .inc = 1 });
+}
+
+test "DIFFERENTIAL: generated parsePosix is record-form only (operands rejected)" {
+    // an arena over the testing allocator (the generated parser's documented
+    // no-free-on-error discipline)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // schemas/seq.dhall leaves positionals EMPTY (the Integer arity-dispatch
+    // VOCABULARY GAP): every operand is rejected.  This pins that decision —
+    // when the vocabulary grows Integer positionals, this test flips to the
+    // full POSIX-vs-record matrix.
+    try std.testing.expectError(error.UnexpectedOperand, cli_seq.parsePosix(&.{ "fx-seq", "5" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_seq.parsePosix(&.{ "fx-seq", "-n", "5" }, gpa));
+
+    // the record form's own rejections: the OLD "increment" key is gone from
+    // the schema (renamed to the struct's `inc`), and a wrong field type.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/seq.dhall", "fx-core/schemas/seq.dhall" }) catch
+        @panic("cannot locate schemas/seq.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ last = 5, increment = 2 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ last = \"5\" }"));
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -370,22 +465,27 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Stream one integer per line; constant memory regardless of range size.
+    // v stays i128 (wider than the i64 Options fields) so FIRST+INC can never
+    // overflow mid-iteration; @as widens each field for the compare.
     const stdout_file = std.Io.File.stdout();
     var buf: [64]u8 = undefined;
-    if (opts.inc > 0) {
-        var v = opts.first;
-        while (v <= opts.last) {
+    const first: i128 = opts.first;
+    const inc: i128 = opts.inc;
+    const last: i128 = opts.last;
+    if (inc > 0) {
+        var v = first;
+        while (v <= last) {
             const line = std.fmt.bufPrint(&buf, "{d}\n", .{v}) catch unreachable;
             _ = std.Io.File.writeStreamingAll(stdout_file, init.io, line) catch return error.WriteFailed;
-            const next = std.math.add(i128, v, opts.inc) catch break;
+            const next = std.math.add(i128, v, inc) catch break;
             v = next;
         }
     } else {
-        var v = opts.first;
-        while (v >= opts.last) {
+        var v = first;
+        while (v >= last) {
             const line = std.fmt.bufPrint(&buf, "{d}\n", .{v}) catch unreachable;
             _ = std.Io.File.writeStreamingAll(stdout_file, init.io, line) catch return error.WriteFailed;
-            const next = std.math.add(i128, v, opts.inc) catch break;
+            const next = std.math.add(i128, v, inc) catch break;
             v = next;
         }
     }

@@ -3,8 +3,20 @@
 // single NON-DIRECTORY path (no -r, no recursion).
 //
 // Two arg forms:
-//   fx-unlink '{ path = "/a" }'          Dhall record (single Optional Text)
-//   fx-unlink PATH                       POSIX fallback (exactly one operand)
+//   fx-unlink '{ path = "/a" }'          Dhall record (plain Text; ""/omitted
+//                                        = the missing-operand error path)
+//   fx-unlink PATH                       POSIX (exactly one operand)
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/
+// cli_unlink.zig, emitted from schemas/unlink.dhall by src/tools/
+// fx-clijson.zig — pure Zig, no dhall at runtime; `zig build gen-cli-check`
+// gates the regen).  NO flags on either surface: any multi-char "-..." token
+// is error.UnknownOption (`--` still ends flag parsing, so `-- -x` names the
+// FILE "-x"; a bare "-" binds as a file name), and a second operand is
+// error.UnexpectedOperand (the hand parser's TooManyOperands).  PATH is
+// REQUIRED: v1 has no required-operand vocabulary, so the schema spells ""
+// and main() turns the unbound placeholder into the missing-operand error
+// (the link/chmod precedent; the unlink.dhall note verbatim).
 //
 // Canonical args_json for the log entry: {"path":"<json-escaped>"} — the Dhall
 // form is normalized to the SAME schema so args_json is CLI-form-independent.
@@ -34,6 +46,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_unlink = @import("cli-unlink");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -83,12 +97,11 @@ const UnlinkErr = error{
 };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/unlink.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    path: ?[]const u8 = null,
-};
+const Options = cli_unlink.Options;
+const parsePosixArgs = cli_unlink.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     path: ?[]const u8 = null,
@@ -221,27 +234,70 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var path: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-unlink: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        if (path != null) {
-            std.debug.print("fx-unlink: extra operand '{s}'\n", .{a});
-            return error.TooManyOperands;
-        }
-        path = try gpa.dupe(u8, a);
-    }
-    if (path == null) {
-        std.debug.print("fx-unlink: missing operand\n", .{});
-        return error.MissingOperand;
-    }
-    return Options{ .path = path };
+// The POSIX form is parsed by the GENERATED parser (cli_unlink.parsePosix,
+// aliased to parsePosixArgs above; schemas/unlink.dhall ->
+// src/generated/cli_unlink.zig).  o.path == "" (or an omitted record field)
+// is the required-operand placeholder main() turns into the missing-operand
+// error.
+
+// ---------------------------------------------------------------------------
+// The differential test — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion and evaluated by THIS file's evalDhallArgs (the exact
+// runtime path `fx-unlink '{ ... }'` takes), via the SHARED runner
+// (fx-cli.expectPosixEqualsRecord).  Both forms converge on the single
+// { path : Text } schema; the no-flag surface pins its rejections separately
+// below.
+
+/// One differential vector (the shared generic runner; see fx-ls.zig).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_unlink, &.{ "schemas/unlink.dhall", "fx-core/schemas/unlink.dhall" }, evalDhallArgs, argv, user_record);
 }
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // the single PATH operand: plain, exotic bytes, and a token that spells a
+    // flag after `--`
+    try expectPosixEqualsRecord(&.{ "fx-unlink", "/tmp/a" }, "{ path = \"/tmp/a\" }");
+    try expectPosixEqualsRecord(&.{ "fx-unlink", "a b.txt" }, "{ path = \"a b.txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-unlink", "say \"hi\".txt" }, "{ path = \"say \\\"hi\\\".txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-unlink", "--", "-x" }, "{ path = \"-x\" }");
+    try expectPosixEqualsRecord(&.{ "fx-unlink", "--", "--weird" }, "{ path = \"--weird\" }");
+    try expectPosixEqualsRecord(&.{ "fx-unlink", "-" }, "{ path = \"-\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // NO flags: any multi-char "-..." token is unknown (the hand parser's
+    // class).  A bare "-" is a valid FILE NAME operand here (the generated
+    // parser binds it; the hand parser rejected it outright — the equality
+    // matrix above pins it as an operand).
+    try std.testing.expectError(error.UnknownOption, cli_unlink.parsePosix(&.{ "fx-unlink", "-r" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_unlink.parsePosix(&.{ "fx-unlink", "--bogus" }, gpa));
+    // a second operand (the hand parser's error.TooManyOperands)
+    try std.testing.expectError(error.UnexpectedOperand, cli_unlink.parsePosix(&.{ "fx-unlink", "a", "b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX analogue of the first is -r above.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/unlink.dhall", "fx-core/schemas/unlink.dhall" }) catch
+        @panic("cannot locate schemas/unlink.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = 5 }"));
+}
+
+// The POSIX form is parsed by the GENERATED parser (cli_unlink.parsePosix,
+// aliased to parsePosixArgs above).  See the differential block above for the
+// pinned surface.
 
 // ---------------------------------------------------------------------------
 // unlink logic
@@ -329,7 +385,7 @@ fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     out.append(gpa, '{') catch return error.NoMem;
     out.appendSlice(gpa, "\"path\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.path orelse "");
+    try caslog.jsonEscape(gpa, &out, o.path);
     out.append(gpa, '}') catch return error.NoMem;
     return out.toOwnedSlice(gpa) catch return error.NoMem;
 }
@@ -344,52 +400,57 @@ fn getCwd(gpa: Allocator) []const u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parsePosixArgs single operand" {
+test "parsePosixArgs (generated) single operand" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-unlink", "/tmp/a" };
+    const args = [_][]const u8{ "fx-unlink", "/tmp/a" };
     const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqualStrings("/tmp/a", o.path.?);
+    try std.testing.expectEqualStrings("/tmp/a", o.path);
 }
 
-test "parsePosixArgs missing operand errors" {
-    const args = [_][:0]const u8{"fx-unlink"};
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&args, std.testing.allocator));
-}
-
-test "parsePosixArgs extra operand errors" {
+test "parsePosixArgs (generated) no operand leaves the placeholder" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-unlink", "a", "b" };
-    try std.testing.expectError(error.TooManyOperands, parsePosixArgs(&args, aa));
+    const args = [_][]const u8{"fx-unlink"};
+    const o = try parsePosixArgs(&args, aa);
+    try std.testing.expectEqualStrings("", o.path); // main() raises missing-operand
 }
 
-test "parsePosixArgs unknown option errors" {
+test "parsePosixArgs (generated) extra operand errors" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-unlink", "-r", "a" };
+    const args = [_][]const u8{ "fx-unlink", "a", "b" };
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&args, aa));
+}
+
+test "parsePosixArgs (generated) unknown option errors" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-unlink", "-r", "a" };
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, aa));
 }
 
-test "evalDhallArgs single Optional Text path" {
+test "evalDhallArgs single Text path" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ path = \"/a\" }", aa);
-    try std.testing.expectEqualStrings("/a", o.path.?);
+    defer aa.free(o.path);
+    try std.testing.expectEqualStrings("/a", o.path);
 }
 
-test "evalDhallArgs path None -> null (missing operand upstream)" {
+test "evalDhallArgs path omitted -> placeholder (missing operand upstream)" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ path = None Text }", aa);
-    try std.testing.expect(o.path == null);
+    const o = try evalDhallArgs("{ }", aa);
+    try std.testing.expectEqualStrings("", o.path); // main() raises missing-operand
 }
 
 test "posixArgsJson canonical single-path schema" {
@@ -649,12 +710,21 @@ pub fn main(init: std.process.Init) !void {
     var opts: Options = undefined;
     if (args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], aa);
-        if (opts.path == null) {
+        if (opts.path.len == 0) {
             std.debug.print("fx-unlink: missing operand\n", .{});
             return error.MissingOperand;
         }
     } else {
+        // the GENERATED parser (schemas/unlink.dhall ->
+        // src/generated/cli_unlink.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
+        if (opts.path.len == 0) {
+            // PATH is required; the parser leaves the "" placeholder unbound
+            // (v1 has no required-operand vocabulary — the unlink.dhall note).
+            std.debug.print("fx-unlink: missing operand\n", .{});
+            return error.MissingOperand;
+        }
     }
 
     // Canonical args_json: {"path":"<json-escaped>"} — same schema for BOTH the
@@ -674,11 +744,11 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var effects = std.ArrayList(caslog.Effect).empty;
-    unlinkOne(aa, state_dir, opts.path.?, &effects) catch |e| {
+    unlinkOne(aa, state_dir, opts.path, &effects) catch |e| {
         switch (e) {
-            error.IsDirectory => std.debug.print("fx-unlink: cannot unlink \"{s}\": Is a directory\n", .{opts.path.?}),
-            error.UnsupportedType => std.debug.print("fx-unlink: cannot unlink \"{s}\": unsupported type\n", .{opts.path.?}),
-            else => std.debug.print("fx-unlink: cannot unlink \"{s}\"\n", .{opts.path.?}),
+            error.IsDirectory => std.debug.print("fx-unlink: cannot unlink \"{s}\": Is a directory\n", .{opts.path}),
+            error.UnsupportedType => std.debug.print("fx-unlink: cannot unlink \"{s}\": unsupported type\n", .{opts.path}),
+            else => std.debug.print("fx-unlink: cannot unlink \"{s}\"\n", .{opts.path}),
         }
         return e;
     };

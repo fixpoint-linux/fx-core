@@ -3,10 +3,12 @@
 // Prints system information from the kernel uname() syscall.  Pure libc + the
 // dhall module for typed args — no datalog / journal dependency.
 //
-// Two arg forms:
-//   fx-uname '{ all = false, kernel = false, nodename = false, release = false, version = false, machine = false, os = false }'
-//       Dhall record
-//   fx-uname [-a] [-s] [-n] [-r] [-v] [-m] [-o]       POSIX fallback
+// Two arg forms, ONE source of truth (schemas/uname.dhall — the STEP-3
+// migration template):
+//   fx-uname '{ all = True, ... }'    Dhall record (absent fields = False)
+//   fx-uname [-a] [-s] [-n] [-r] [-v] [-m] [-o]    POSIX (the GENERATED
+//       parser, src/generated/cli_uname.zig: shorts + GNU longs, clustered;
+//       any bare operand is error.UnexpectedOperand)
 //
 // - Dhall booleans select which fields to print (any subset; none => just
 //   sysname, matching bare `uname`).
@@ -24,6 +26,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_uname = @import("cli-uname");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -41,18 +45,11 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/uname.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    all: bool = false,
-    kernel: bool = false,
-    nodename: bool = false,
-    release: bool = false,
-    version: bool = false,
-    machine: bool = false,
-    os: bool = false,
-};
+const Options = cli_uname.Options;
+const parsePosixArgs = cli_uname.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     all: ?bool = null,
@@ -215,34 +212,78 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 1 and a[0] == '-') {
-            var j: usize = 1;
-            while (j < a.len) : (j += 1) {
-                switch (a[j]) {
-                    'a' => o.all = true,
-                    's' => o.kernel = true,
-                    'n' => o.nodename = true,
-                    'r' => o.release = true,
-                    'v' => o.version = true,
-                    'm' => o.machine = true,
-                    'o' => o.os = true,
-                    else => {
-                        std.debug.print("fx-uname: invalid option -- '{c}'\n", .{a[j]});
-                        return error.UnknownOption;
-                    },
-                }
-            }
-        } else {
-            std.debug.print("fx-uname: extra operand '{s}'\n", .{a});
-            return error.TooManyOperands;
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a bool-flag command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/uname.dhall
+// -> src/generated/cli_uname.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the shared runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.  uname has NO positionals; its surface is the
+// seven bool flags (shorts + GNU longs, clustered) plus rejection parity.
+
+/// One differential vector for fx-uname — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_uname, &.{ "schemas/uname.dhall", "fx-core/schemas/uname.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // the bare-uname default (sysname only): empty argv == the empty record
+    try expectPosixEqualsRecord(&.{"fx-uname"}, "{ }");
+    // each bool flag alone, short and long spellings
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-a" }, "{ all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "--all" }, "{ all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-s" }, "{ kernel = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "--kernel-name" }, "{ kernel = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-n" }, "{ nodename = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "--nodename" }, "{ nodename = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-r" }, "{ release = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "--release" }, "{ release = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-v" }, "{ version = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-m" }, "{ machine = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "--machine" }, "{ machine = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-o" }, "{ os = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "--operating-system" }, "{ os = True }");
+    // clusters compose; -v has NO long (the schema pins long = None so
+    // --version stays reserved for the conventional version-output flag)
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-srn" }, "{ kernel = True, nodename = True, release = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-ansrvmo" }, "{ all = True, kernel = True, nodename = True, release = True, version = True, machine = True, os = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-m", "-o" }, "{ machine = True, os = True }");
+    // flag-then-cluster interleave and duplicate flags (idempotent binds)
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-n", "-rv" }, "{ nodename = True, release = True, version = True }");
+    try expectPosixEqualsRecord(&.{ "fx-uname", "-a", "-a" }, "{ all = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that state bound BEFORE a failing token is not reclaimed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims it wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: uname accepts NO operands, and every -letter is a flag — an
+    // unknown cluster letter is error.UnknownOption (named per token), a
+    // bare operand is error.UnexpectedOperand (the hand parser's
+    // error.TooManyOperands), including after the '--' terminator
+    try std.testing.expectError(error.UnknownOption, cli_uname.parsePosix(&.{ "fx-uname", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_uname.parsePosix(&.{ "fx-uname", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_uname.parsePosix(&.{ "fx-uname", "op" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_uname.parsePosix(&.{ "fx-uname", "--", "op" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/uname.dhall", "fx-core/schemas/uname.dhall" }) catch
+        @panic("cannot locate schemas/uname.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ all = 5 }"));
 }
 
 test "jsonParseOpts all fields" {
@@ -258,16 +299,18 @@ test "evalDhallArgs record select all" {
     try std.testing.expect(o.all);
 }
 
-test "parsePosixArgs -a" {
-    const args = [_][:0]const u8{ "fx-uname", "-a" };
-    const o = try parsePosixArgs(&args);
-    try std.testing.expect(o.all);
-}
+test "generated parsePosix -a and combined -srm" {
+    // an arena: the generated parser is not gpa-leak-checked by design (the
+    // same discipline the differential harness applies)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
 
-test "parsePosixArgs combined -srnm" {
-    const args = [_][:0]const u8{ "fx-uname", "-srm" };
-    const o = try parsePosixArgs(&args);
-    try std.testing.expect(o.kernel and o.release and o.machine and !o.all);
+    const o1 = try parsePosixArgs(&.{ "fx-uname", "-a" }, gpa);
+    try std.testing.expect(o1.all);
+
+    const o2 = try parsePosixArgs(&.{ "fx-uname", "-srm" }, gpa);
+    try std.testing.expect(o2.kernel and o2.release and o2.machine and !o2.all);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +369,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        opts = try parsePosixArgs(args);
+        // the GENERATED parser (schemas/uname.dhall ->
+        // src/generated/cli_uname.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
+        opts = try parsePosixArgs(args, opt_alloc);
     }
 
     var uts: c.struct_utsname = undefined;

@@ -6,6 +6,14 @@
 //   fx-ln '{ src = "/a", dst = "/b", symbolic = False }'   Dhall record
 //   fx-ln [-s] TARGET LINK_NAME                            POSIX fallback
 //
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_ln.zig,
+// emitted from schemas/ln.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Against the
+// hand parser it replaced: -s also has the --symbolic long alias, short
+// clusters and -- are accepted, and a THIRD operand is error.UnexpectedOperand
+// (the exactly-two-operand check stays in main via the "" placeholder
+// defaults the schema pins for src/dst).
+//
 // - existing dst  -> same-relation NO-OP in BOTH forms:
 //                      hard: fstatat both, same st_dev+st_ino => no-op;
 //                      sym:  readlink(dst) == target        => no-op;
@@ -17,6 +25,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_ln = @import("cli-ln");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -56,21 +66,18 @@ extern fn unlink(path: [*:0]const u8) c_int;
 const LnErr = error{ FileExists, LinkFailed, SymlinkFailed, BadPath, NoMem, OpenFailed, ReadFailed, Missing };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/ln.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // TARGET (hard-link source / symlink target).
-    src: ?[]const u8 = null,
-    // LINK_NAME (the path being created).
-    dst: ?[]const u8 = null,
-    symbolic: bool = false,
-};
+const Options = cli_ln.Options;
+const parsePosixArgs = cli_ln.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
+    // The schema spells src/dst plain Text with "" placeholder defaults
+    // (schemas/ln.dhall ty comment: a single positional must bind plain
+    // Text), so the record form omits a field to leave it at its default.
     src: ?[]const u8 = null,
     dst: ?[]const u8 = null,
-    // null (None / absent) => default False.
     symbolic: ?bool = null,
 };
 
@@ -221,37 +228,11 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
         return error.DhallFields;
     };
 
-    var o = Options{ .symbolic = opts.symbolic orelse false };
+    var o = Options{};
+    if (opts.symbolic) |sym| o.symbolic = sym; // absent stays False
     if (opts.src) |v| o.src = try gpa.dupe(u8, v);
     if (opts.dst) |v| o.dst = try gpa.dupe(u8, v);
     return .{ .opts = o, .args_json = args_json };
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var symbolic = false;
-    var operands = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            if (std.mem.eql(u8, a, "-s")) {
-                symbolic = true;
-                continue;
-            }
-            std.debug.print("fx-ln: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try operands.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (operands.items.len != 2) {
-        std.debug.print("fx-ln: exactly TARGET and LINK_NAME required (got {d})\n", .{operands.items.len});
-        return error.BadArgs;
-    }
-    return Options{
-        .src = operands.items[0],
-        .dst = operands.items[1],
-        .symbolic = symbolic,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -338,9 +319,9 @@ fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     out.append(gpa, '{') catch return error.NoMem;
     out.appendSlice(gpa, "\"src\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.src orelse "");
+    try caslog.jsonEscape(gpa, &out, o.src);
     out.appendSlice(gpa, ",\"dst\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.dst orelse "");
+    try caslog.jsonEscape(gpa, &out, o.dst);
     out.appendSlice(gpa, ",\"symbolic\":") catch return error.NoMem;
     out.appendSlice(gpa, if (o.symbolic) "true" else "false") catch return error.NoMem;
     out.append(gpa, '}') catch return error.NoMem;
@@ -357,28 +338,80 @@ fn getCwd(gpa: Allocator) []const u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parsePosixArgs hard link TARGET LINK_NAME" {
-    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_i.deinit();
-    const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-ln", "/a", "/b" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expect(!o.symbolic);
-    try std.testing.expectEqualStrings("/a", o.src.?);
-    try std.testing.expectEqualStrings("/b", o.dst.?);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent (schema
+// completion -> renderDhallRecord -> THIS file's record evaluator), encoded
+// by the shared field-complete encoder and compared as strings.
+
+/// evalFn adapter for the shared runner: main unwraps DhallArgs for
+/// args_json; the differential compares only the Options.
+fn evalDhallOpts(src: [:0]const u8, gpa: Allocator) !Options {
+    return (try evalDhallArgs(src, gpa)).opts;
 }
 
-test "parsePosixArgs -s symbolic + wrong operand count" {
-    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_i.deinit();
-    const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-ln", "-s", "tgt", "lnk" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expect(o.symbolic);
-    try std.testing.expectEqualStrings("tgt", o.src.?);
-    try std.testing.expectEqualStrings("lnk", o.dst.?);
-    const bad = [_][:0]const u8{ "fx-ln", "one" };
-    try std.testing.expectError(error.BadArgs, parsePosixArgs(&bad, aa));
+/// One differential vector for fx-ln — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_ln, &.{ "schemas/ln.dhall", "fx-core/schemas/ln.dhall" }, evalDhallOpts, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- the two positionals, plain and with the -s flag in every slot ---
+    try expectPosixEqualsRecord(&.{ "fx-ln", "/a", "/b" }, "{ src = \"/a\", dst = \"/b\" }");
+    try expectPosixEqualsRecord(&.{ "fx-ln", "-s", "/a", "/b" }, "{ src = \"/a\", dst = \"/b\", symbolic = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ln", "t", "-s", "l" }, "{ src = \"t\", dst = \"l\", symbolic = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ln", "/a", "/b", "-s" }, "{ src = \"/a\", dst = \"/b\", symbolic = True }");
+
+    // --- the --symbolic long alias (the schema's natural long) ---
+    try expectPosixEqualsRecord(&.{ "fx-ln", "--symbolic", "t", "l" }, "{ src = \"t\", dst = \"l\", symbolic = True }");
+
+    // --- empty argv: both stay at the schema's "" placeholder defaults
+    // (the required-operand check is runtime, in main) ---
+    try expectPosixEqualsRecord(&.{"fx-ln"}, "{ }");
+
+    // --- `--` ends flag parsing: a later -s is the TARGET operand ---
+    try expectPosixEqualsRecord(&.{ "fx-ln", "--", "-s", "l" }, "{ src = \"-s\", dst = \"l\" }");
+    try expectPosixEqualsRecord(&.{ "fx-ln", "-s", "--", "/a", "/b" }, "{ src = \"/a\", dst = \"/b\", symbolic = True }");
+
+    // --- duplicate -s is idempotent (no conflict) ---
+    try expectPosixEqualsRecord(&.{ "fx-ln", "-s", "-s", "t", "l" }, "{ src = \"t\", dst = \"l\", symbolic = True }");
+
+    // --- exotic operand bytes: the record side's renderDhallRecord Dhall
+    // escaping must match the raw POSIX operands through the shared encoder
+    try expectPosixEqualsRecord(&.{ "fx-ln", "a b", "s\"y" }, "{ src = \"a b\", dst = \"s\\\"y\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed; the
+    // arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option (POSIX), long and short; a cluster with an unknown
+    // letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_ln.parsePosix(&.{ "fx-ln", "-x", "t", "l" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_ln.parsePosix(&.{ "fx-ln", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_ln.parsePosix(&.{ "fx-ln", "-sZ", "t", "l" }, gpa));
+
+    // a THIRD operand overflows the two positional slots: UnexpectedOperand
+    // (the hand parser rejected any count != 2 as BadArgs; the generated
+    // parser fills both slots first and rejects only the overflow)
+    try std.testing.expectError(error.UnexpectedOperand, cli_ln.parsePosix(&.{ "fx-ln", "a", "b", "c" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX form has no spelling that could reach
+    // either (its analogue is -x above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/ln.dhall", "fx-core/schemas/ln.dhall" }) catch
+        @panic("cannot locate schemas/ln.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ symbolic = 5 }"));
 }
 
 test "evalDhallArgs symbolic defaults false (None)" {
@@ -388,7 +421,7 @@ test "evalDhallArgs symbolic defaults false (None)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const d = try evalDhallArgs("{ src = \"/a\", dst = \"/b\" }", aa);
     try std.testing.expect(!d.opts.symbolic);
-    try std.testing.expectEqualStrings("/a", d.opts.src.?);
+    try std.testing.expectEqualStrings("/a", d.opts.src);
 }
 
 test "evalDhallArgs symbolic Some True" {
@@ -398,7 +431,7 @@ test "evalDhallArgs symbolic Some True" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const d = try evalDhallArgs("{ src = \"/a\", dst = \"/b\", symbolic = Some True }", aa);
     try std.testing.expect(d.opts.symbolic);
-    try std.testing.expectEqualStrings("/b", d.opts.dst.?);
+    try std.testing.expectEqualStrings("/b", d.opts.dst);
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {
@@ -533,15 +566,15 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    const src = opts.src orelse {
-        std.debug.print("fx-ln: missing TARGET operand\n", .{});
+    // The schema pins src/dst as plain Text with "" placeholder defaults, so
+    // "missing operand" is the empty string (the exactly-two count is
+    // enforced here at runtime — the generated parser fills the slots).
+    if (opts.src.len == 0 or opts.dst.len == 0) {
+        std.debug.print("fx-ln: exactly TARGET and LINK_NAME required\n", .{});
         return error.BadArgs;
-    };
-    const dst = opts.dst orelse {
-        std.debug.print("fx-ln: missing LINK_NAME operand\n", .{});
-        return error.BadArgs;
-    };
-
+    }
+    const src = opts.src;
+    const dst = opts.dst;
     const state_dir = caslog.resolveStateDir(aa) catch |e| {
         std.debug.print("fx-ln: cannot resolve state dir: {s}\n", .{@errorName(e)});
         return e;

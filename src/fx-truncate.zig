@@ -2,19 +2,29 @@
 // see concept.md).  Sets a file's size via truncate(2), capturing the ENTIRE
 // original file to CAS before mutating so fx-undo can restore it.
 //
-// Two arg forms:
-//   fx-truncate '{ path = "/f", size = Some "10", no_create = Some False }'
-//                                                        Dhall record
-//   fx-truncate [-c] -s SIZE|-r REF FILE...              POSIX fallback
+// Two arg forms (both derived from schemas/truncate.dhall — the fx-tail
+// migration template applied to the multi-value-flag command):
+//   fx-truncate '{ files = ["/f"], size = Some "10" }'     Dhall record
+//   fx-truncate [-c] -s SIZE|-r REF FILE...                POSIX
 //
-// Semantics (GNU-grounded):
-//   - `-s SIZE` : new size.  Absolute N; relative +N extends (pad with NUL
-//     bytes); -N shrinks (drops trailing bytes).  Optional binary suffix
-//     K=1024, M=1024^2, G=1024^3, T=1024^4 (case-insensitive).
-//   - `-r REF`  : set size to REF's size (REF must exist).
-//   - `-c`      : do not create the file if it is missing (no-op success).
-//   - default (no -c): a missing file is created empty, then sized.
-//   - A negative result (shrink past 0) clamps to size 0.
+// - `-s SIZE` : new size.  Absolute N; relative +N extends (pad with NUL
+//   bytes); -N shrinks (drops trailing bytes).  Optional binary suffix
+//   K=1024, M=1024^2, G=1024^3, T=1024^4 (case-insensitive).
+// - `-r REF`  : set size to REF's size (REF must exist).
+// - `-c`      : do not create the file if it is missing (no-op success).
+// - default (no -c): a missing file is created empty, then sized.
+// - A negative result (shrink past 0) clamps to size 0.
+// - The legacy singular `{ path = "/f" }` record spelling is REJECTED
+//   (strict typed record) — spell `files = [ "/f" ]`.
+//
+// Parsed by the GENERATED parser (src/generated/cli_truncate.zig, emitted
+// from schemas/truncate.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime): -s/-r are Value flags (next-token or --long=value),
+// mutually exclusive (error.Conflict in both orders — a deliberate
+// strengthening over the hand parser, which let the last flag win); the
+// attached GNU forms -sSIZE/-rREF are v1-unrepresentable (a Value short
+// never clusters).  The exactly-one-of size/ref and the missing-operand
+// checks stay in main().
 //
 // CRASH ORDER (fxstore invariant): read the ENTIRE original file, casPut (in),
 // THEN truncate(2), THEN log.  Effect {op=.truncate, path, kind=.file,
@@ -27,6 +37,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_truncate = @import("cli-truncate");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -77,22 +89,17 @@ const TruncErr = error{
 };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/truncate.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // One of `size` (string, with optional sign/suffix) or `ref`.
-    size: ?[]const u8 = null,
-    ref: ?[]const u8 = null,
-    no_create: bool = false,
-    files: []const []const u8 = &.{},
-};
+const Options = cli_truncate.Options;
+const parsePosixArgs = cli_truncate.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
     size: ?[]const u8 = null,
     reference: ?[]const u8 = null,
     no_create: ?bool = null,
+    files: ?[]const []const u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,7 +162,7 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
     }
     return null;
 }
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
@@ -168,14 +175,67 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
-            } else if (std.mem.eql(u8, key, "size")) {
+            if (std.mem.eql(u8, key, "size")) {
                 res.size = val;
-            } else if (std.mem.eql(u8, key, "reference")) {
+            } else if (std.mem.eql(u8, key, "reference") or std.mem.eql(u8, key, "ref")) {
                 res.reference = val;
             }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: `files` is read element-by-element (List Text);
+            // any other list is skipped balanced.  Elements point into the
+            // caller's scratch buf; the element ARRAY is gpa-owned.
+            if (std.mem.eql(u8, key, "files")) {
+                var items = std.ArrayList([]const u8).empty;
+                i += 1; // consume '['
+                jsonSkipWs(s, &i);
+                if (jsonExpect(s, &i, ']')) {
+                    res.files = items.toOwnedSlice(gpa) catch return null;
+                } else {
+                    var ok = true;
+                    while (ok) {
+                        jsonSkipWs(s, &i);
+                        if (i < s.len and s[i] == '"') {
+                            const el = jsonParseString(s, &i, buf[off..]) orelse return null;
+                            items.append(gpa, el) catch return null;
+                            off += el.len;
+                        } else return null;
+                        jsonSkipWs(s, &i);
+                        if (jsonExpect(s, &i, ',')) continue;
+                        if (jsonExpect(s, &i, ']')) break;
+                        ok = false;
+                    }
+                    if (!ok) return null;
+                    res.files = items.toOwnedSlice(gpa) catch return null;
+                }
+            } else {
+                var depth: usize = 0;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '[') depth += 1;
+                    if (s[i] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth != 0) return null;
+            }
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             const b = jsonParseBool(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "no_create")) res.no_create = b;
@@ -190,7 +250,45 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     return res;
 }
 
+const DhallArgs = struct {
+    opts: Options,
+    args_json: []const u8,
+};
+
+/// The runtime record evaluator in the harness shape: Options only (main()
+/// builds its args_json separately via evalDhallRecord; the differential
+/// runner needs exactly this signature).
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    const d = try evalDhallRecord(src, gpa);
+    return d.opts;
+}
+
+fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
+    // Repair the bare `None` spelling renderDhallRecord emits for the two
+    // Optional Text defaults (size/ref): the dhall-c grammar rejects it with
+    // no payload — give it the schema's payload (the fx-env/fx-du idiom).
+    // A Text value can never legally place a bare `None` between
+    // non-identifier bytes, so the rewrite is unambiguous.
+    var nb: [512]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareNone(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
+    // The record is checked against the schema's ty, spelled inline (single
+    // source of truth: schemas/truncate.dhall): the annotation makes the
+    // record form STRICTLY typed — the legacy singular `{ path = "/f" }`
+    // spelling is a type error, not a silently-mapped files[0].
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ files : List Text, no_create : Bool, ref : Optional Text, size : Optional Text }})",
+        .{zsrc},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -201,7 +299,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-truncate: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -227,58 +325,65 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
         return error.DhallSerialize;
     }
 
+    const args_json = try gpa.dupe(u8, ob.items);
+
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-truncate: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
 
     var o = Options{ .no_create = opts.no_create orelse false };
-    if (opts.path) |v| o.files = try std.mem.Allocator.dupe(gpa, []const u8, &.{try gpa.dupe(u8, v)});
+    if (opts.files) |fs| {
+        // elements point into the JSON scratch buf; dupe them out (the
+        // generated Options' List-Text views are gpa-owned like argv dupes)
+        const arr = try gpa.alloc([]const u8, fs.len);
+        for (fs, 0..) |item, idx| arr[idx] = try gpa.dupe(u8, item);
+        o.files = arr;
+    }
     if (opts.size) |v| o.size = try gpa.dupe(u8, v);
     if (opts.reference) |v| o.ref = try gpa.dupe(u8, v);
-    return o;
+    return .{ .opts = o, .args_json = args_json };
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-c")) {
-            o.no_create = true;
-            continue;
-        } else if (std.mem.eql(u8, a, "-s")) {
-            if (i + 1 >= args.len) return error.NoSizeArg;
+/// The bare-`None` repair (the fx-env/fx-du idiom): renderDhallRecord's
+/// Optional arm emits `None` with no payload, which does not parse — give it
+/// the schema's payload (`size`/`ref : Optional Text`).
+fn repairBareNone(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "None") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 4 == src.len or !isIdentByte(src[i + 4])))
+        {
+            // already annotated ("None Text", ...)?  The next non-space char
+            // of an annotated form is a letter.
+            var j = i + 4;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+            if (j < src.len and std.ascii.isAlphabetic(src[j])) {
+                @memcpy(buf[n .. n + 4], "None");
+                n += 4;
+                i += 4;
+                continue;
+            }
+            const rep = "None Text";
+            @memcpy(buf[n .. n + rep.len], rep);
+            n += rep.len;
+            i += 4;
+        } else {
+            buf[n] = src[i];
+            n += 1;
             i += 1;
-            o.size = try gpa.dupe(u8, args[i]);
-            continue;
-        } else if (std.mem.eql(u8, a, "-r")) {
-            if (i + 1 >= args.len) return error.NoSizeArg;
-            i += 1;
-            o.ref = try gpa.dupe(u8, args[i]);
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and std.mem.eql(u8, a[1..2], "s")) {
-            // -sSIZE (attached arg form).
-            o.size = try gpa.dupe(u8, a[2..]);
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and std.mem.eql(u8, a[1..2], "r")) {
-            o.ref = try gpa.dupe(u8, a[2..]);
-            continue;
-        } else if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-truncate: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
         }
-        try files.append(gpa, try gpa.dupe(u8, a));
     }
-    o.files = try files.toOwnedSlice(gpa);
-    if (o.files.len == 0) {
-        std.debug.print("fx-truncate: missing file operand\n", .{});
-        return error.MissingOperand;
-    }
-    return o;
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +599,96 @@ test "computeTarget abs/plus/minus/clamp" {
     try std.testing.expectEqual(@as(u64, 0), computeTarget(parseSize("-100").?, 3));
 }
 
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-tail template applied
+// to the multi-value-flag command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser
+// (schemas/truncate.dhall -> src/generated/cli_truncate.zig) must produce the
+// SAME Options as the Dhall record form of the same user intent, driven
+// through the shared runner (fx-cli.expectPosixEqualsRecord): schema
+// completion, renderDhallRecord, THIS file's evalDhallArgs, then a
+// field-complete encodeOptionsWire comparison of both sides.
+
+/// One differential vector for fx-truncate — a one-line wrapper over the
+/// SHARED generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template
+/// each migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_truncate, &.{ "schemas/truncate.dhall", "fx-core/schemas/truncate.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // the -s Value flag: next-token and inline long forms, alone and
+    // composed with a FILE operand and -c
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-s", "10", "/f" }, "{ files = [ \"/f\" ], no_create = False, ref = None Text, size = Some \"10\" }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "--size=+5", "/f" }, "{ files = [ \"/f\" ], no_create = False, ref = None Text, size = Some \"+5\" }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-c", "-s", "2K", "/f" }, "{ files = [ \"/f\" ], no_create = True, ref = None Text, size = Some \"2K\" }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-c", "/f", "-s", "0" }, "{ files = [ \"/f\" ], no_create = True, ref = None Text, size = Some \"0\" }");
+
+    // the -r Value flag: short, inline long, composed with -c and FILES
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-r", "/ref", "/f" }, "{ files = [ \"/f\" ], no_create = False, ref = Some \"/ref\", size = None Text }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "--reference=/ref", "/f" }, "{ files = [ \"/f\" ], no_create = False, ref = Some \"/ref\", size = None Text }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-c", "-r", "/ref", "/f", "/g" }, "{ files = [ \"/f\", \"/g\" ], no_create = True, ref = Some \"/ref\", size = None Text }");
+
+    // FILE operands in argv order; '-' operand; '--' terminator
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-s", "1", "/a", "/b" }, "{ files = [ \"/a\", \"/b\" ], no_create = False, ref = None Text, size = Some \"1\" }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-s", "1", "-" }, "{ files = [ \"-\" ], no_create = False, ref = None Text, size = Some \"1\" }");
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "--", "-s" }, "{ files = [ \"-s\" ], no_create = False, ref = None Text, size = None Text }");
+
+    // exotic operand bytes: escaping parity between the raw POSIX operand
+    // and the rendered record
+    try expectPosixEqualsRecord(&.{ "fx-truncate", "-s", "1", "a b.txt" }, "{ files = [ \"a b.txt\" ], no_create = False, ref = None Text, size = Some \"1\" }");
+}
+
+test "DIFFERENTIAL: -s + -r is error.Conflict in BOTH orders (not last-wins)" {
+    // The deliberate, schema-pinned strengthening (schemas/truncate.dhall
+    // mutually_exclusive = [[\"-s\",\"-r\"]]): the hand parser silently let
+    // the last flag win.  The Dhall-record form cannot express the conflict
+    // at all (it names size/ref each at most once) — so these vectors run
+    // against the generated parser directly, like fx-ls's -S -t.  An arena
+    // over the testing allocator: the -s/-r value dupes bound before the
+    // failing token are not freed on the error path (documented discipline).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    try std.testing.expectError(error.Conflict, cli_truncate.parsePosix(&.{ "fx-truncate", "-s", "1", "-r", "/ref" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_truncate.parsePosix(&.{ "fx-truncate", "-r", "/ref", "-s", "1" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_truncate.parsePosix(&.{ "fx-truncate", "--size=1", "--reference=/ref" }, gpa));
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator (the generated parser does not
+    // free operand dupes bound before a failing token — a failed parse
+    // exits the process; the arena reclaims them wholesale here)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; Value shorts never cluster, so the attached GNU forms
+    // -sSIZE / -rREF are v1-unrepresentable (the hand parser accepted them —
+    // documented divergence, schemas/truncate.dhall)
+    try std.testing.expectError(error.UnknownOption, cli_truncate.parsePosix(&.{ "fx-truncate", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_truncate.parsePosix(&.{ "fx-truncate", "-s5", "/f" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_truncate.parsePosix(&.{ "fx-truncate", "-rX", "/f" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_truncate.parsePosix(&.{ "fx-truncate", "-cA", "/f" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_truncate.parsePosix(&.{ "fx-truncate", "--bogus" }, gpa));
+
+    // a Value flag with no next token: MissingValue
+    try std.testing.expectError(error.MissingValue, cli_truncate.parsePosix(&.{ "fx-truncate", "-s" }, gpa));
+    try std.testing.expectError(error.MissingValue, cli_truncate.parsePosix(&.{ "fx-truncate", "-r" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the SINGULAR legacy spelling (rejected loudly —
+    // it used to map silently onto files[0])
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/truncate.dhall", "fx-core/schemas/truncate.dhall" }) catch
+        @panic("cannot locate schemas/truncate.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ files = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = \"/f\", size = Some \"1\" }"));
+}
+
 fn testTmpDir(gpa: Allocator) ![]const u8 {
     var tpl = "/tmp/fxtruncXXXXXX".*;
     const d = mkdtemp(&tpl) orelse return error.TmpFail;
@@ -684,8 +879,12 @@ pub fn main(init: std.process.Init) !void {
 
     var opts: Options = undefined;
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
-        opts = try evalDhallArgs(args[1], aa);
+        const d = try evalDhallRecord(args[1], aa);
+        opts = d.opts;
     } else {
+        // the GENERATED parser (schemas/truncate.dhall ->
+        // src/generated/cli_truncate.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
     }
 

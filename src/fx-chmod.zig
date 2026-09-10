@@ -1,12 +1,20 @@
 // fx-chmod.zig — Dhall-typed chmod coreutil over the global derivation log
 // (Option B; see concept.md).  Replaces the build.zig stub.
 //
-// Two arg forms:
-//   fx-chmod '{ path = "/x", mode = "644" }'            Dhall record
-//   fx-chmod MODE FILE...                               POSIX fallback
+// Two arg forms, ONE source of truth (schemas/chmod.dhall — the STEP-3
+// migration template):
+//   fx-chmod '{ mode = "644", paths = [ "/x" ] }'   Dhall record (the grown
+//       schema surface; the legacy singular `{ path = "/x", mode = "644" }`
+//       spelling is still accepted and mapped onto paths[0] at runtime)
+//   fx-chmod MODE FILE...                           POSIX (the GENERATED
+//       parser, src/generated/cli_chmod.zig; the FIRST operand is MODE, the
+//       rest FILE..., argv order; any "-..." token is error.UnknownOption)
 //
-// - mode is a numeric OCTAL string ("644") — parsed with radix 8.  Symbolic
-//   modes (u+r) are out of scope for v1 (rejected with a clear error).
+// - mode is a numeric OCTAL string ("644") — Text in the schema (a Natural
+//   field would read "0644" decimal and silently corrupt the bits, the
+//   mkfifo.dhall precedent), radix-8 parsed at use time by parseModeOctal.
+//   Symbolic modes (u+r) are out of scope for v1 (rejected with a clear
+//   error at use time).
 // - follows command-line symlinks (operates on the target; fstatat flags=0).
 // - recursion -R out of scope: processes the explicit path list, no descent.
 // - effect: one .chmod with e.mode = PRIOR mode (before the mutation), so undo
@@ -22,6 +30,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_chmod = @import("cli-chmod");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -55,20 +65,20 @@ extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 const ChmodErr = error{ StatFailed, ChmodFailed, BadPath, NoMem, BadMode };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/chmod.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered paths to chmod.  Empty => error (missing operand).
-    paths: []const []const u8 = &.{},
-    // Target mode (octal, e.g. 0o644).  Idempotence compares (mode & 0o7777).
-    mode: u32 = 0,
-};
+const Options = cli_chmod.Options;
+const parsePosixArgs = cli_chmod.parsePosix; // the generated POSIX parser
+//
+// The schema spells `mode` as Text (the octal literal string, "644" — a
+// Natural field would read "0644" decimal and silently corrupt the bits, the
+// mkfifo.dhall precedent) and `paths` as List Text.  The old hand struct's
+// derived `mode : u32` is now produced at use time by parseModeOctal (below).
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
-    // The mode as it appears in the Dhall record: an octal Text string ("644").
     mode: ?[]const u8 = null,
+    paths: ?[]const []const u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,7 +129,20 @@ fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
     }
     return null;
 }
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseBool(s: []const u8, i: *usize) ?bool {
+    jsonSkipWs(s, i);
+    if (std.mem.startsWith(u8, s[i.*..], "true")) {
+        i.* += 4;
+        return true;
+    }
+    if (std.mem.startsWith(u8, s[i.*..], "false")) {
+        i.* += 5;
+        return false;
+    }
+    return null;
+}
+
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
@@ -132,12 +155,70 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
-            } else if (std.mem.eql(u8, key, "mode")) {
+            if (std.mem.eql(u8, key, "mode")) {
                 res.mode = val;
             }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: `paths` is read element-by-element (List Text);
+            // any other list is skipped balanced.  Elements point into the
+            // caller's scratch buf where possible; the JSON text has no
+            // escapes for these operand bytes (term_to_json keeps raw UTF-8
+            // in \uXXXX-free form for our record surface), so slices are
+            // safe.  A separate element array is gpa-owned.
+            if (std.mem.eql(u8, key, "paths")) {
+                var items = std.ArrayList([]const u8).empty;
+                i += 1; // consume '['
+                jsonSkipWs(s, &i);
+                if (jsonExpect(s, &i, ']')) {
+                    res.paths = items.toOwnedSlice(gpa) catch return null;
+                } else {
+                    var ok = true;
+                    while (ok) {
+                        jsonSkipWs(s, &i);
+                        if (i < s.len and s[i] == '"') {
+                            const el = jsonParseString(s, &i, buf[off..]) orelse return null;
+                            items.append(gpa, el) catch return null;
+                            off += el.len;
+                        } else return null;
+                        jsonSkipWs(s, &i);
+                        if (jsonExpect(s, &i, ',')) continue;
+                        if (jsonExpect(s, &i, ']')) break;
+                        ok = false;
+                    }
+                    if (!ok) return null;
+                    res.paths = items.toOwnedSlice(gpa) catch return null;
+                }
+            } else {
+                var depth: usize = 0;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '[') depth += 1;
+                    if (s[i] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth != 0) return null;
+            }
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
+        } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
+            _ = jsonParseBool(s, &i) orelse return null;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4;
         } else {
@@ -161,9 +242,35 @@ const DhallArgs = struct {
     args_json: []const u8,
 };
 
-fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
+/// The runtime record evaluator in the harness shape: Options only (main()
+/// builds its args_json separately via dhallArgsJson below; the differential
+/// runner needs exactly this signature).
+fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    const d = try evalDhallRecord(src, gpa);
+    return d.opts;
+}
+
+fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
+
+    // The record is checked against the schema's ty, spelled inline (single
+    // source of truth: schemas/chmod.dhall; the differential test pins this
+    // copy to the schema — completeSrc re-checks the rendered record against
+    // the SCHEMA's ty).  The annotation is not decoration: the dhall subset
+    // cannot infer an EMPTY list literal (`paths = []`, the default the
+    // differential's rendered records always carry) without a surrounding
+    // type, and it makes the record form STRICTLY typed.  It also migrates
+    // the singular record form (`{ path = "/x", mode = "644" }`) onto the
+    // schema's `paths : List Text` surface — the old spelling is rejected
+    // loudly below instead of being silently mapped onto paths[0].
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ mode : Text, paths : List Text }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
 
     const loader = import_mod.import_loader_new();
     defer import_mod.import_loader_free(loader);
@@ -172,7 +279,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-chmod: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -202,7 +309,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
 
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-chmod: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
@@ -211,37 +318,80 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
         return error.DhallFields;
     }
 
-    var o = Options{ .mode = try parseModeOctal(opts.mode.?) };
-    if (opts.path) |pathv| {
-        const dup = try gpa.dupe(u8, pathv);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    // mode/paths elements are duped out of the JSON scratch buffer (the
+    // generated Options' Text/List-Text views are gpa-owned like argv dupes)
+    var o = Options{ .mode = try gpa.dupe(u8, opts.mode.?) };
+    if (opts.paths) |ps| {
+        const arr = try gpa.alloc([]const u8, ps.len);
+        for (ps, 0..) |item, idx| arr[idx] = try gpa.dupe(u8, item);
         o.paths = arr;
     }
     return .{ .opts = o, .args_json = args_json };
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var paths = std.ArrayList([]const u8).empty;
-    var mode: ?u32 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-chmod: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        if (mode == null) {
-            mode = try parseModeOctal(a);
-            continue;
-        }
-        try paths.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (mode == null) {
-        std.debug.print("fx-chmod: missing mode operand\n", .{});
-        return error.MissingOperand;
-    }
-    return Options{ .paths = try paths.toOwnedSlice(gpa), .mode = mode.? };
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a single-plus-many positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/chmod.dhall
+// -> src/generated/cli_chmod.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the shared runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.  chmod's surface: NO flags, MODE as the first
+// operand (Text, octal parsed at use time), the rest FILE... (many).
+
+/// One differential vector for fx-chmod — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_chmod, &.{ "schemas/chmod.dhall", "fx-core/schemas/chmod.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // MODE alone (no FILE operands is legal: zero effects, no log entry)
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "644" }, "{ mode = \"644\" }");
+    // MODE FILE... (the many positional keeps argv order)
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "644", "a" }, "{ mode = \"644\", paths = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "1777", "a", "b", "c" }, "{ mode = \"1777\", paths = [ \"a\", \"b\", \"c\" ] }");
+    // a leading-zero mode string survives BOTH forms as Text (a Natural
+    // field would have corrupted "0644" into decimal 644 — the schema note)
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "0644", "x" }, "{ mode = \"0644\", paths = [ \"x\" ] }");
+    // the '--' terminator and bare '-' are plain operands here (no flags)
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "--", "644", "-x" }, "{ mode = \"644\", paths = [ \"-x\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "600", "-" }, "{ mode = \"600\", paths = [ \"-\" ] }");
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "644", "a b.txt" }, "{ mode = \"644\", paths = [ \"a b.txt\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "644", "say \"hi\".txt" }, "{ mode = \"644\", paths = [ \"say \\\"hi\\\".txt\" ] }");
+    // duplicate operands bind twice (order-preserving List)
+    try expectPosixEqualsRecord(&.{ "fx-chmod", "644", "a", "a" }, "{ mode = \"644\", paths = [ \"a\", \"a\" ] }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: NO flags — every "-..." token is error.UnknownOption (the hand
+    // parser also rejected "-644"-style modes this way; GNU's symbolic
+    // u+r / -R recursion are documented scope cuts)
+    try std.testing.expectError(error.UnknownOption, cli_chmod.parsePosix(&.{ "fx-chmod", "-R", "644", "x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_chmod.parsePosix(&.{ "fx-chmod", "--bogus" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the SINGULAR legacy spelling (rejected loudly —
+    // it used to map silently onto paths[0])
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/chmod.dhall", "fx-core/schemas/chmod.dhall" }) catch
+        @panic("cannot locate schemas/chmod.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ mode = 644 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = \"/x\", mode = \"644\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +426,8 @@ fn walkChmod(gpa: Allocator, path: []const u8, target_mode: u32, effects: *std.A
 }
 
 /// Synthesize the canonical POSIX args record: {"paths":[...],"mode":"<octal>"}.
-/// The mode is rendered as an octal string to match the Dhall Text form.
+/// The mode is rendered as an octal string to match the Dhall Text form; the
+/// u32 view is derived from the Text at use time (parseModeOctal).
 fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     out.append(gpa, '{') catch return error.NoMem;
@@ -286,7 +437,7 @@ fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
         try caslog.jsonEscape(gpa, &out, p);
     }
     out.appendSlice(gpa, "],\"mode\":\"") catch return error.NoMem;
-    out.print(gpa, "{o}", .{o.mode}) catch return error.NoMem;
+    out.print(gpa, "{o}", .{try parseModeOctal(o.mode)}) catch return error.NoMem;
     out.appendSlice(gpa, "\"}") catch return error.NoMem;
     return out.toOwnedSlice(gpa) catch return error.NoMem;
 }
@@ -305,37 +456,49 @@ test "parsePosixArgs MODE and multiple files" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-chmod", "644", "a", "b" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqual(@as(u32, 0o644), o.mode);
+    const o = try parsePosixArgs(&.{ "fx-chmod", "644", "a", "b" }, aa);
+    try std.testing.expectEqual(@as(u32, 0o644), try parseModeOctal(o.mode));
     try std.testing.expectEqual(@as(usize, 2), o.paths.len);
     try std.testing.expectEqualStrings("a", o.paths[0]);
     try std.testing.expectEqualStrings("b", o.paths[1]);
 }
 
-test "parsePosixArgs octal mode is radix 8" {
+test "generated mode operand is Text: parseModeOctal keeps radix 8" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    // "1777" octal = 0o1777 = 1023, NOT decimal 1777.
-    const args = [_][:0]const u8{ "fx-chmod", "1777", "x" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqual(@as(u32, 0o1777), o.mode);
+    // "1777" octal = 0o1777 = 1023, NOT decimal 1777 — the octal parse now
+    // lives at USE time (parseModeOctal), the binding surface stays Text.
+    const o = try parsePosixArgs(&.{ "fx-chmod", "1777", "x" }, aa);
+    try std.testing.expectEqual(@as(u32, 0o1777), try parseModeOctal(o.mode));
 }
 
-test "parsePosixArgs non-numeric mode errors" {
-    const args = [_][:0]const u8{ "fx-chmod", "u+r", "x" };
-    try std.testing.expectError(error.BadMode, parsePosixArgs(&args, std.testing.allocator));
+test "parsePosixArgs non-numeric mode passes binding, fails at use time" {
+    // The generated parser binds Text verbatim; the BadMode error moved to
+    // parseModeOctal (called from main).  Bind-time acceptance + use-time
+    // rejection is the new contract.
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try parsePosixArgs(&.{ "fx-chmod", "u+r", "x" }, aa);
+    try std.testing.expectEqualStrings("u+r", o.mode);
+    try std.testing.expectError(error.BadMode, parseModeOctal(o.mode));
 }
 
-test "parsePosixArgs missing mode errors" {
-    const args = [_][:0]const u8{ "fx-chmod" };
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&args, std.testing.allocator));
+test "parsePosixArgs missing mode leaves mode empty (main errors MissingOperand)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try parsePosixArgs(&.{"fx-chmod"}, aa);
+    try std.testing.expectEqualStrings("", o.mode);
+    try std.testing.expectEqual(@as(usize, 0), o.paths.len);
 }
 
 test "parsePosixArgs unknown option errors" {
-    const args = [_][:0]const u8{ "fx-chmod", "-R", "644", "x" };
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-chmod", "-R", "644", "x" }, aa));
 }
 
 test "parseModeOctal accepts leading-zero forms and rejects bad input" {
@@ -347,15 +510,26 @@ test "parseModeOctal accepts leading-zero forms and rejects bad input" {
     try std.testing.expectError(error.BadMode, parseModeOctal("8")); // 8 not octal
 }
 
-test "evalDhallArgs path and octal mode" {
+test "evalDhallArgs paths and octal mode" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const d = try evalDhallArgs("{ path = \"/x\", mode = \"600\" }", aa);
-    try std.testing.expectEqual(@as(usize, 1), d.opts.paths.len);
-    try std.testing.expectEqualStrings("/x", d.opts.paths[0]);
-    try std.testing.expectEqual(@as(u32, 0o600), d.opts.mode);
+    const o = try evalDhallArgs("{ mode = \"600\", paths = [ \"/x\" ] }", aa);
+    try std.testing.expectEqual(@as(usize, 1), o.paths.len);
+    try std.testing.expectEqualStrings("/x", o.paths[0]);
+    try std.testing.expectEqual(@as(u32, 0o600), try parseModeOctal(o.mode));
+}
+
+test "evalDhallArgs legacy singular path spelling is rejected (strict record)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    // the old `{ path = "/x", mode = "644" }` surface is NOT the schema's
+    // ty — the annotated record form rejects it loudly instead of silently
+    // mapping path onto paths[0]
+    try std.testing.expectError(error.DhallType, evalDhallArgs("{ path = \"/x\", mode = \"600\" }", aa));
 }
 
 test "evalDhallArgs missing mode errors" {
@@ -363,7 +537,7 @@ test "evalDhallArgs missing mode errors" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ path = \"/x\" }", aa));
+    try std.testing.expectError(error.DhallType, evalDhallRecord("{ paths = [ \"/x\" ] }", aa));
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {
@@ -474,7 +648,7 @@ test "posixArgsJson renders octal mode string" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const o = Options{ .paths = &.{"a"}, .mode = 0o1777 };
+    const o = Options{ .paths = &.{"a"}, .mode = "1777" };
     const s = try posixArgsJson(aa, o);
     try std.testing.expectEqualStrings("{\"paths\":[\"a\"],\"mode\":\"1777\"}", s);
 }
@@ -490,10 +664,13 @@ pub fn main(init: std.process.Init) !void {
     var opts: Options = undefined;
     var args_json: []const u8 = undefined;
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
-        const d = try evalDhallArgs(args[1], aa);
+        const d = try evalDhallRecord(args[1], aa);
         opts = d.opts;
         args_json = d.args_json;
     } else {
+        // the GENERATED parser (schemas/chmod.dhall ->
+        // src/generated/cli_chmod.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
         args_json = posixArgsJson(aa, opts) catch {
             std.debug.print("fx-chmod: internal error building args\n", .{});
@@ -510,10 +687,21 @@ pub fn main(init: std.process.Init) !void {
         return e;
     };
 
+    // The generated parser binds MODE as Text; the missing-MODE check and the
+    // octal parse stay at use time (the ln/chown required-operand precedent).
+    if (opts.mode.len == 0) {
+        std.debug.print("fx-chmod: missing mode operand\n", .{});
+        std.process.exit(1);
+    }
+    const mode = parseModeOctal(opts.mode) catch |e| {
+        std.debug.print("fx-chmod: bad mode '{s}' (numeric octal string required)\n", .{opts.mode});
+        return e;
+    };
+
     var effects = std.ArrayList(caslog.Effect).empty;
     var failed: ?anyerror = null;
     for (opts.paths) |p| {
-        walkChmod(aa, p, opts.mode, &effects) catch |e| {
+        walkChmod(aa, p, mode, &effects) catch |e| {
             std.debug.print("fx-chmod: cannot chmod '{s}': {s}\n", .{ p, @errorName(e) });
             failed = e;
             break;

@@ -20,9 +20,19 @@
 // walk that only descends reachable dirs, but keeps the fixed-point shape the
 // engine exists for — same honesty as fx-find.)
 //
-// Two arg forms:
-//   fx-tree '{ root = ".", all = False, dirs_only = False, maxdepth = None }'
-//   fx-tree [-a] [-d] [-L N] [ROOT]                      POSIX fallback
+// Two arg forms, ONE source of truth (schemas/tree.dhall — the fx-ls
+// migration template):
+//   fx-tree '{ root = ".", all = True, dirs_only = False, maxdepth = Some 2,
+//              rows = False }'                                        Dhall
+//   fx-tree [-a] [-d] [-L N] [--rows] [ROOT]                           POSIX
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_tree.zig,
+// emitted from schemas/tree.dhall by src/tools/fx-clijson.zig; `zig build
+// gen-cli-check` gates the regen).  Equality with the Dhall-record form is
+// pinned field for field by the differential test below.  Deliberate
+// strengthening over the hand parser it replaced: -a and -d cluster (-ad),
+// the --all/--dirs-only long aliases are accepted, and `--` ends flag
+// parsing (a ROOT operand after it still binds).
 //
 // Dhall record: { root : Text, all : Bool, dirs_only : Bool,
 //                 maxdepth : Optional Natural }  with defaults root=".",
@@ -59,6 +69,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
+const cli_tree = @import("cli-tree");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -98,16 +110,10 @@ extern fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/tree.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    root: []const u8 = ".",
-    all: bool = false, // -a: list dotfiles too (filtered WALK-side)
-    dirs_only: bool = false, // -d: list directories only (still descends)
-    maxdepth: ?usize = null, // -L N: max display depth (root = 0)
-    rows: bool = false, // --rows: canonical wire rows instead of display text
-};
+const Options = cli_tree.Options; // maxdepth is Natural (u64), per the schema
 
 /// The rows-mode wire record type.  MUST stay identical to find's registry
 /// type (fx-eval.zig:196 / fx-pipeline builtin("find")) — the declared order
@@ -261,7 +267,7 @@ const JsonOpts = struct {
     root: ?[]const u8 = null,
     all: bool = false,
     dirs_only: bool = false,
-    maxdepth: ?usize = null,
+    maxdepth: ?u64 = null,
     rows: bool = false,
 };
 
@@ -325,12 +331,12 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
     return null;
 }
 
-fn jsonParseNumber(s: []const u8, i: *usize) ?usize {
+fn jsonParseNumber(s: []const u8, i: *usize) ?u64 {
     jsonSkipWs(s, i);
     const start = i.*;
     while (i.* < s.len and std.ascii.isDigit(s[i.*])) i.* += 1;
     if (i.* == start) return null;
-    return std.fmt.parseInt(usize, s[start..i.*], 10) catch null;
+    return std.fmt.parseInt(u64, s[start..i.*], 10) catch null;
 }
 
 // Parses an object like {"root":"/tmp","all":true,"dirs_only":false,
@@ -373,7 +379,66 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     return res;
 }
 
+/// Bare `None` (no type annotation) does not parse in the dhall-c grammar
+/// this repo links — it is only accepted as an argument of `Some` or after
+/// an explicit `None Natural`-style annotation.  The differential runner's
+/// record side renders completed schema values from fx-cli.renderDhallRecord,
+/// whose Optional arm emits the bare form (fx-cli.zig renderValue .none_ is
+/// type-blind), so `fx-tree '{ maxdepth = None }'` (and every None-default
+/// matrix vector) would die at PARSE time before the schema annotation could
+/// fix the type.  Repair the spelling at this command's single record-form
+/// entry point: `None` NOT followed by an identifier is given the schema's
+/// Optional payload type; an already-annotated `None Natural` is untouched.
+/// A real record literal can never legally contain a bare `None`, so the
+/// rewrite is unambiguous.
+fn repairBareNone(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "None") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 4 == src.len or !isIdentByte(src[i + 4])))
+        {
+            // already annotated ("None Natural", "None Text", ...)?  The
+            // next non-space char of an annotated form is a letter.
+            var j = i + 4;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+            if (j < src.len and std.ascii.isAlphabetic(src[j])) {
+                @memcpy(buf[n .. n + 4], "None");
+                n += 4;
+                i += 4;
+                continue;
+            }
+            @memcpy(buf[n .. n + 12], "None Natural");
+            n += 12;
+            i += 4;
+        } else {
+            buf[n] = src[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
+}
+
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // Repair a bare `None` before the C parser sees it (see repairBareNone —
+    // the differential runner's rendered records carry the unparseable
+    // spelling).  parse_source wants a C string, so the repaired copy is
+    // dupeZ'd; the unrepaired fast path passes `src` straight through.
+    var nb: [512:0]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareNone(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -384,7 +449,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, zsrc, null, &err);
     if (t == null) {
         std.debug.print("fx-tree: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -501,96 +566,74 @@ test "evalDhallArgs ill-typed record rejected" {
 // POSIX-style fallback arg parsing
 // ---------------------------------------------------------------------------
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var root_dupe = false; // o.root starts as the static default "."
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-a")) {
-            o.all = true;
-        } else if (std.mem.eql(u8, a, "-d")) {
-            o.dirs_only = true;
-        } else if (std.mem.eql(u8, a, "-L")) {
-            if (i + 1 >= args.len) {
-                std.debug.print("fx-tree: -L requires an argument\n", .{});
-                return error.BadMaxdepth;
-            }
-            i += 1;
-            o.maxdepth = std.fmt.parseInt(usize, args[i], 10) catch {
-                std.debug.print("fx-tree: bad -L '{s}'\n", .{args[i]});
-                return error.BadMaxdepth;
-            };
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-tree: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            if (root_dupe) {
-                gpa.free(o.root);
-                std.debug.print("fx-tree: extra operand '{s}'\n", .{a});
-                return error.TooManyOperands; // fx-df precedent: no silent overwrite
-            }
-            o.root = try gpa.dupe(u8, a);
-            root_dupe = true;
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (cli_tree) must
+// produce the SAME Options as the Dhall-record form of the same user intent
+// driven through the schema completion ((dflt // user) : ty,
+// cli.completeSrc), rendered back to a record literal
+// (cli.renderDhallRecord) and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-tree '{ ... }'` takes.  Both sides are re-encoded to
+// the canonical wire shape (the shared comptime-reflection encoder
+// cli.encodeOptionsWire) and compared as strings.
+
+/// One differential vector for fx-tree — a one-line wrapper over the SHARED
+/// generic runner (cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_tree, &.{ "schemas/tree.dhall", "fx-core/schemas/tree.dhall" }, evalDhallArgs, argv, user_record);
 }
 
-test "parsePosixArgs defaults" {
-    const o = try parsePosixArgs(&.{"fx-tree"}, std.testing.allocator);
-    try std.testing.expectEqualStrings(".", o.root);
-    try std.testing.expect(!o.all);
-    try std.testing.expect(!o.dirs_only);
-    try std.testing.expect(o.maxdepth == null);
-    try std.testing.expect(!o.rows);
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (root = ".")
+    try expectPosixEqualsRecord(&.{"fx-tree"}, "{ }");
+    // each flag alone (short and long aliases)
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-a" }, "{ all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "--all" }, "{ all = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-d" }, "{ dirs_only = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "--dirs-only" }, "{ dirs_only = True }");
+    // -L N: the Value flag, short-only per the schema (GNU tree spells no long)
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-L", "2" }, "{ maxdepth = Some 2 }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-L", "0" }, "{ maxdepth = Some 0 }");
+    // --rows composes with the rest
+    try expectPosixEqualsRecord(&.{ "fx-tree", "--rows" }, "{ rows = True }");
+    // the -a -d cluster, any composition order
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-ad" }, "{ all = True, dirs_only = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-da" }, "{ all = True, dirs_only = True }");
+    // the ROOT positional, bare and composed (the flagship: -a -d -L 2 /tmp)
+    try expectPosixEqualsRecord(&.{ "fx-tree", "/tmp" }, "{ root = \"/tmp\" }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-a", "-d", "-L", "2", "/tmp" }, "{ root = \"/tmp\", all = True, dirs_only = True, maxdepth = Some 2 }");
+    // a bare '-' is an operand; `--` ends flag parsing (the token after it is
+    // the ROOT even when it spells a flag)
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-" }, "{ root = \"-\" }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "--", "-a" }, "{ root = \"-a\" }");
+    try expectPosixEqualsRecord(&.{ "fx-tree", "-a", "--", "/x" }, "{ root = \"/x\", all = True }");
 }
 
-test "parsePosixArgs a d L path" {
-    const args = [_][:0]const u8{ "fx-tree", "-a", "-d", "-L", "2", "/tmp" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.root);
-    try std.testing.expect(o.all);
-    try std.testing.expect(o.dirs_only);
-    try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
-    try std.testing.expectEqualStrings("/tmp", o.root);
-}
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (a
+    // failed parse exits the process); the arena reclaims them wholesale
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
 
-test "parsePosixArgs L 0" {
-    const args = [_][:0]const u8{ "fx-tree", "-L", "0" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(@as(?usize, 0), o.maxdepth);
-}
+    // unknown option; -L with no value; -L with a non-Natural value
+    try std.testing.expectError(error.UnknownOption, cli_tree.parsePosix(&.{"fx-tree", "-x"}, gpa));
+    try std.testing.expectError(error.MissingValue, cli_tree.parsePosix(&.{"fx-tree", "-L"}, gpa));
+    try std.testing.expectError(error.BadValue, cli_tree.parsePosix(&.{ "fx-tree", "-L", "x" }, gpa));
+    // a second ROOT operand: the generated single-slot binding rejects it
+    // (the hand parser's TooManyOperands analogue)
+    try std.testing.expectError(error.UnexpectedOperand, cli_tree.parsePosix(&.{ "fx-tree", "/a", "/b" }, gpa));
 
-test "parsePosixArgs --rows" {
-    const args = [_][:0]const u8{ "fx-tree", "--rows", "-a", "/tmp" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.root);
-    try std.testing.expect(o.rows);
-    try std.testing.expect(o.all);
-    try std.testing.expectEqualStrings("/tmp", o.root);
-}
-
-test "parsePosixArgs unknown option rejected" {
-    const args = [_][:0]const u8{"fx-tree", "-x"};
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
-}
-
-test "parsePosixArgs second ROOT operand rejected" {
-    const two = [_][:0]const u8{ "fx-tree", "/a", "/b" };
-    try std.testing.expectError(error.TooManyOperands, parsePosixArgs(&two, std.testing.allocator));
-}
-
-test "parsePosixArgs bad -L rejected" {
-    const args = [_][:0]const u8{ "fx-tree", "-L", "x" };
-    try std.testing.expectError(error.BadMaxdepth, parsePosixArgs(&args, std.testing.allocator));
-}
-
-test "parsePosixArgs missing -L arg rejected" {
-    const args = [_][:0]const u8{"fx-tree", "-L"};
-    try std.testing.expectError(error.BadMaxdepth, parsePosixArgs(&args, std.testing.allocator));
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX analogue of the first is -x above.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/tree.dhall", "fx-core/schemas/tree.dhall" }) catch
+        @panic("cannot locate schemas/tree.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ roots = \"/tmp\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ maxdepth = Some \"2\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +709,9 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
     // beyond maxdepth (the child guard below is the real filter; find's
     // defensive top guard).
     if (ctx.opts.maxdepth) |md| {
-        if (depth + 1 > md) return;
+        // depth is usize (bounded by real recursion), md is the schema's
+        // Natural (u64) — @intCast cannot trip for any real directory depth.
+        if (depth + 1 > @as(usize, @intCast(md))) return;
     }
 
     const it = dl.fdopendir(dir_fd) orelse {
@@ -693,7 +738,7 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
         const is_dir = (st.st_mode & dl.S_IFMT) == dl.S_IFDIR;
         const child_depth = depth + 1;
         if (ctx.opts.maxdepth) |md| {
-            if (child_depth > md) continue;
+            if (child_depth > @as(usize, @intCast(md))) continue;
         }
 
         // Full child path (walked paths are root-prefixed; rows render and
@@ -1286,7 +1331,10 @@ pub fn main(init: std.process.Init) !void {
         // Dhall record literal in argv[1].
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        opts = try parsePosixArgs(args, opt_alloc);
+        // the GENERATED parser (schemas/tree.dhall -> src/generated/
+        // cli_tree.zig); equality with the record form above is pinned by
+        // the differential tests (expectPosixEqualsRecord)
+        opts = try cli_tree.parsePosix(args, opt_alloc);
     }
 
     var nodes = try computeNodes(gpa, opts);

@@ -1,11 +1,18 @@
 // fx-chown.zig — Dhall-typed chown coreutil over the global derivation log
 // (Option B; see concept.md).  Replaces the build.zig stub.
 //
-// Two arg forms:
-//   fx-chown '{ path = "/x", owner = "1000:1000" }'     Dhall record
-//   fx-chown OWNER FILE...                              POSIX fallback
+// Two arg forms, ONE source of truth (schemas/chown.dhall — the STEP-3
+// migration template):
+//   fx-chown '{ owner = "1000:1000", paths = [ "/x" ] }'  Dhall record (the
+//       grown schema surface; the legacy singular `{ path = "/x", ... }`
+//       spelling is rejected loudly — the strict annotated record)
+//   fx-chown OWNER FILE...                                POSIX (the
+//       GENERATED parser, src/generated/cli_chown.zig; the FIRST operand is
+//       OWNER, the rest FILE..., argv order; any "-..." token is
+//       error.UnknownOption)
 //
-// - OWNER is a numeric uid:gid string.  Components parsed with radix 10.  Forms:
+// - OWNER is a numeric uid:gid string, bound Text and validated at use time
+//   by parseOwner.  Components parsed with radix 10.  Forms:
 //     "uid"      -> set uid, leave gid unchanged
 //     "uid:gid"  -> set both
 //     ":gid"     -> leave uid unchanged, set gid
@@ -31,6 +38,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_chown = @import("cli-chown");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -64,19 +73,21 @@ extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 const ChownErr = error{ StatFailed, ChownFailed, BadPath, NoMem, BadOwner };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/chown.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered paths to chown.  Empty => error (missing operand).
-    paths: []const []const u8 = &.{},
-    // Numeric uid:gid owner string, as given (e.g. "1000:1000", "1000", ":gid").
-    owner: []const u8 = "",
-};
+const Options = cli_chown.Options;
+const parsePosixArgs = cli_chown.parsePosix; // the generated POSIX parser
+//
+// The schema spells `owner` as Text (the numeric uid:gid spec as given,
+// validated at use time by parseOwner) and `paths` as List Text.  The ""
+// default is a placeholder: owner is REQUIRED — the check stays in main()
+// (the ln/chown required-operand precedent; v1 has no required-field
+// vocabulary).
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
     owner: ?[]const u8 = null,
+    paths: ?[]const []const u8 = null,
 };
 
 /// A parsed owner spec: each component is null when left unchanged.
@@ -157,7 +168,20 @@ fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
     }
     return null;
 }
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseBool(s: []const u8, i: *usize) ?bool {
+    jsonSkipWs(s, i);
+    if (std.mem.startsWith(u8, s[i.*..], "true")) {
+        i.* += 4;
+        return true;
+    }
+    if (std.mem.startsWith(u8, s[i.*..], "false")) {
+        i.* += 5;
+        return false;
+    }
+    return null;
+}
+
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
@@ -170,12 +194,68 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
-            } else if (std.mem.eql(u8, key, "owner")) {
+            if (std.mem.eql(u8, key, "owner")) {
                 res.owner = val;
             }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: `paths` is read element-by-element (List Text);
+            // any other list is skipped balanced.  Elements point into the
+            // caller's scratch buf (the JSON carries no escaped quotes for
+            // our record surface); the element ARRAY is gpa-owned.
+            if (std.mem.eql(u8, key, "paths")) {
+                var items = std.ArrayList([]const u8).empty;
+                i += 1; // consume '['
+                jsonSkipWs(s, &i);
+                if (jsonExpect(s, &i, ']')) {
+                    res.paths = items.toOwnedSlice(gpa) catch return null;
+                } else {
+                    var ok = true;
+                    while (ok) {
+                        jsonSkipWs(s, &i);
+                        if (i < s.len and s[i] == '"') {
+                            const el = jsonParseString(s, &i, buf[off..]) orelse return null;
+                            items.append(gpa, el) catch return null;
+                            off += el.len;
+                        } else return null;
+                        jsonSkipWs(s, &i);
+                        if (jsonExpect(s, &i, ',')) continue;
+                        if (jsonExpect(s, &i, ']')) break;
+                        ok = false;
+                    }
+                    if (!ok) return null;
+                    res.paths = items.toOwnedSlice(gpa) catch return null;
+                }
+            } else {
+                var depth: usize = 0;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '[') depth += 1;
+                    if (s[i] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth != 0) return null;
+            }
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
+        } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
+            _ = jsonParseBool(s, &i) orelse return null;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4;
         } else {
@@ -192,9 +272,34 @@ const DhallArgs = struct {
     args_json: []const u8,
 };
 
-fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
+/// The runtime record evaluator in the harness shape: Options only (main()
+/// builds its args_json separately via evalDhallRecord; the differential
+/// runner needs exactly this signature).
+fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    const d = try evalDhallRecord(src, gpa);
+    return d.opts;
+}
+
+fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
+
+    // The record is checked against the schema's ty, spelled inline (single
+    // source of truth: schemas/chown.dhall; the differential test pins this
+    // copy to the schema — completeSrc re-checks the rendered record against
+    // the SCHEMA's ty).  The annotation is not decoration: the dhall subset
+    // cannot infer an EMPTY list literal (`paths = []`, the default the
+    // differential's rendered records always carry) without a surrounding
+    // type, and it makes the record form STRICTLY typed (the old singular
+    // `{ path = "/x", owner = ... }` spelling is rejected instead of being
+    // silently mapped onto paths[0]).
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ owner : Text, paths : List Text }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
 
     const loader = import_mod.import_loader_new();
     defer import_mod.import_loader_free(loader);
@@ -203,7 +308,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-chown: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -233,7 +338,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
 
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-chown: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
@@ -244,39 +349,77 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     // Validate the owner spec eagerly (reject non-numeric with a clear error).
     _ = try parseOwner(opts.owner.?);
 
+    // owner/paths elements are duped out of the JSON scratch buffer (the
+    // generated Options' Text/List-Text views are gpa-owned like argv dupes)
     var o = Options{ .owner = try gpa.dupe(u8, opts.owner.?) };
-    if (opts.path) |pathv| {
-        const dup = try gpa.dupe(u8, pathv);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.paths) |ps| {
+        const arr = try gpa.alloc([]const u8, ps.len);
+        for (ps, 0..) |item, idx| arr[idx] = try gpa.dupe(u8, item);
         o.paths = arr;
     }
     return .{ .opts = o, .args_json = args_json };
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var paths = std.ArrayList([]const u8).empty;
-    var owner: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-chown: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        if (owner == null) {
-            // Validate eagerly (reject non-numeric with a clear error).
-            _ = try parseOwner(a);
-            owner = try gpa.dupe(u8, a);
-            continue;
-        }
-        try paths.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (owner == null) {
-        std.debug.print("fx-chown: missing owner operand\n", .{});
-        return error.MissingOperand;
-    }
-    return Options{ .paths = try paths.toOwnedSlice(gpa), .owner = owner.? };
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a single-plus-many positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/chown.dhall
+// -> src/generated/cli_chown.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the shared runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.  chown's surface: NO flags, OWNER as the first
+// operand (Text, validated at use time), the rest FILE... (many).
+
+/// One differential vector for fx-chown — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_chown, &.{ "schemas/chown.dhall", "fx-core/schemas/chown.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // all four owner-spec forms, alone and with FILE operands
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000" }, "{ owner = \"1000\" }");
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000", "a" }, "{ owner = \"1000\", paths = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000:2000", "a", "b" }, "{ owner = \"1000:2000\", paths = [ \"a\", \"b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chown", ":2000", "x" }, "{ owner = \":2000\", paths = [ \"x\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000:", "x", "y", "z" }, "{ owner = \"1000:\", paths = [ \"x\", \"y\", \"z\" ] }");
+    // the '--' terminator and bare '-' are plain operands here (no flags)
+    try expectPosixEqualsRecord(&.{ "fx-chown", "--", "1000", "-x" }, "{ owner = \"1000\", paths = [ \"-x\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000", "-" }, "{ owner = \"1000\", paths = [ \"-\" ] }");
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000", "a b.txt" }, "{ owner = \"1000\", paths = [ \"a b.txt\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000", "say \"hi\".txt" }, "{ owner = \"1000\", paths = [ \"say \\\"hi\\\".txt\" ] }");
+    // duplicate operands bind twice (order-preserving List)
+    try expectPosixEqualsRecord(&.{ "fx-chown", "1000", "a", "a" }, "{ owner = \"1000\", paths = [ \"a\", \"a\" ] }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: NO flags — every "-..." token is error.UnknownOption (-R
+    // recursion is a documented scope cut)
+    try std.testing.expectError(error.UnknownOption, cli_chown.parsePosix(&.{ "fx-chown", "-R", "1000", "x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_chown.parsePosix(&.{ "fx-chown", "--bogus" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the SINGULAR legacy spelling (rejected loudly —
+    // it used to map silently onto paths[0])
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/chown.dhall", "fx-core/schemas/chown.dhall" }) catch
+        @panic("cannot locate schemas/chown.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ owner = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = \"/x\", owner = \"1000\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -384,36 +527,59 @@ test "parseOwner rejects non-numeric" {
 }
 
 test "parsePosixArgs OWNER and multiple files" {
+    // an arena: the generated parser does not free operand dupes bound before
+    // a failing token (a failed parse exits the process) — same discipline
+    // as the hand parser this replaced
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-chown", "1000:1000", "a", "b" };
-    const o = try parsePosixArgs(&args, aa);
+    const o = try parsePosixArgs(&.{ "fx-chown", "1000:1000", "a", "b" }, aa);
     try std.testing.expectEqualStrings("1000:1000", o.owner);
     try std.testing.expectEqual(@as(usize, 2), o.paths.len);
     try std.testing.expectEqualStrings("a", o.paths[0]);
     try std.testing.expectEqualStrings("b", o.paths[1]);
+    // the owner spec is bound verbatim; validation happens at use time
+    // (here: still valid — 1000:1000)
+    const own = try parseOwner(o.owner);
+    try std.testing.expectEqual(@as(u32, 1000), own.uid.?);
 }
 
-test "parsePosixArgs missing owner errors" {
-    const args = [_][:0]const u8{ "fx-chown" };
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&args, std.testing.allocator));
+test "parsePosixArgs missing owner leaves owner empty (main errors MissingOperand)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try parsePosixArgs(&.{"fx-chown"}, aa);
+    try std.testing.expectEqualStrings("", o.owner);
+    try std.testing.expectEqual(@as(usize, 0), o.paths.len);
 }
 
 test "parsePosixArgs unknown option errors" {
-    const args = [_][:0]const u8{ "fx-chown", "-R", "1000", "x" };
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-chown", "-R", "1000", "x" }, aa));
 }
 
-test "evalDhallArgs path and owner" {
+test "evalDhallArgs paths and owner" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const d = try evalDhallArgs("{ path = \"/x\", owner = \"1000:1000\" }", aa);
-    try std.testing.expectEqual(@as(usize, 1), d.opts.paths.len);
-    try std.testing.expectEqualStrings("/x", d.opts.paths[0]);
-    try std.testing.expectEqualStrings("1000:1000", d.opts.owner);
+    const o = try evalDhallArgs("{ owner = \"1000:1000\", paths = [ \"/x\" ] }", aa);
+    try std.testing.expectEqual(@as(usize, 1), o.paths.len);
+    try std.testing.expectEqualStrings("/x", o.paths[0]);
+    try std.testing.expectEqualStrings("1000:1000", o.owner);
+}
+
+test "evalDhallArgs legacy singular path spelling is rejected (strict record)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    // the old `{ path = "/x", owner = ... }` surface is NOT the schema's ty —
+    // the annotated record form rejects it loudly instead of silently mapping
+    // path onto paths[0]
+    try std.testing.expectError(error.DhallType, evalDhallArgs("{ path = \"/x\", owner = \"1000:1000\" }", aa));
 }
 
 test "evalDhallArgs missing owner errors" {
@@ -421,7 +587,9 @@ test "evalDhallArgs missing owner errors" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ path = \"/x\" }", aa));
+    // the annotation rejects the label set first (owner absent), so the
+    // error surfaces as DhallType — not the post-JSON DhallFields check
+    try std.testing.expectError(error.DhallType, evalDhallRecord("{ paths = [ \"/x\" ] }", aa));
 }
 
 test "evalDhallArgs non-numeric owner errors" {
@@ -429,7 +597,7 @@ test "evalDhallArgs non-numeric owner errors" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.BadOwner, evalDhallArgs("{ path = \"/x\", owner = \"root\" }", aa));
+    try std.testing.expectError(error.BadOwner, evalDhallArgs("{ owner = \"root\", paths = [ \"/x\" ] }", aa));
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {
@@ -533,10 +701,13 @@ pub fn main(init: std.process.Init) !void {
     var opts: Options = undefined;
     var args_json: []const u8 = undefined;
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
-        const d = try evalDhallArgs(args[1], aa);
+        const d = try evalDhallRecord(args[1], aa);
         opts = d.opts;
         args_json = d.args_json;
     } else {
+        // the GENERATED parser (schemas/chown.dhall ->
+        // src/generated/cli_chown.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
         args_json = posixArgsJson(aa, opts) catch {
             std.debug.print("fx-chown: internal error building args\n", .{});
@@ -553,6 +724,12 @@ pub fn main(init: std.process.Init) !void {
         return e;
     };
 
+    // owner is REQUIRED (the "" default is a placeholder — the check stays
+    // in main, the ln/chown required-operand precedent)
+    if (opts.owner.len == 0) {
+        std.debug.print("fx-chown: missing owner operand\n", .{});
+        std.process.exit(1);
+    }
     const own = try parseOwner(opts.owner);
 
     var effects = std.ArrayList(caslog.Effect).empty;

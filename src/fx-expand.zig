@@ -1,9 +1,10 @@
 // fx-expand.zig — GNU `expand` (pure, Dhall-typed).  Converts tabs to spaces.
 // No datalog / caslog dependency — pure libc + the dhall module for typed args.
 //
-// Two arg forms:
-//   fx-expand '{ input = "/f", tabstop = Some 4 }'        Dhall record
-//   fx-expand [-t N] [FILE...]                            POSIX fallback
+// Two arg forms (both derived from schemas/expand.dhall — the fx-tail
+// migration template applied to the value-flag command):
+//   fx-expand '{ files = [ "/f" ], tabstop = 4 }'     Dhall record
+//   fx-expand [-t N | --tabs=N] [FILE...]             POSIX
 //
 // Semantics (GNU-grounded, verified against host coreutils):
 //   - Convert each TAB to spaces up to the next multiple of N (default 8).
@@ -12,11 +13,16 @@
 //     to 0 after each newline.
 //   - Multiple FILE operands are processed in order; 0 operands => stdin.
 //
-// Honest cuts: single tab-stop N (no comma list), no -i (initial-only), no
-// --tabs.
+// The 0-clamps-to-1 of the hand parser is a RUNTIME clamp now (main()), not
+// parser vocabulary — the generated parser's Natural (u64) accepts any N.
+// Divergences (deliberate scope cuts): single tab-stop N (no comma list), no
+// -i (initial-only); the ATTACHED GNU form "-t4" is v1-unrepresentable (a
+// Value short never clusters) — use "-t 4" or "--tabs=4".
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_expand = @import("cli-expand");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -42,16 +48,14 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/expand.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    files: []const []const u8 = &.{},
-    tabstop: usize = 8,
-};
+const Options = cli_expand.Options;
+const parsePosixArgs = cli_expand.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    files: ?[]const []const u8 = null,
     tabstop: ?u64 = null,
 };
 
@@ -115,7 +119,7 @@ fn jsonParseNum(s: []const u8, i: *usize) ?u64 {
     }
     return if (any) v else null;
 }
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
@@ -128,8 +132,62 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) res.input = val;
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: `files` is read element-by-element (List Text);
+            // any other list is skipped balanced.  Elements point into the
+            // caller's scratch buf; the element ARRAY is gpa-owned.
+            if (std.mem.eql(u8, key, "files")) {
+                var items = std.ArrayList([]const u8).empty;
+                i += 1; // consume '['
+                jsonSkipWs(s, &i);
+                if (jsonExpect(s, &i, ']')) {
+                    res.files = items.toOwnedSlice(gpa) catch return null;
+                } else {
+                    var ok = true;
+                    while (ok) {
+                        jsonSkipWs(s, &i);
+                        if (i < s.len and s[i] == '"') {
+                            const el = jsonParseString(s, &i, buf[off..]) orelse return null;
+                            items.append(gpa, el) catch return null;
+                            off += el.len;
+                        } else return null;
+                        jsonSkipWs(s, &i);
+                        if (jsonExpect(s, &i, ',')) continue;
+                        if (jsonExpect(s, &i, ']')) break;
+                        ok = false;
+                    }
+                    if (!ok) return null;
+                    res.files = items.toOwnedSlice(gpa) catch return null;
+                }
+            } else {
+                var depth: usize = 0;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '[') depth += 1;
+                    if (s[i] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth != 0) return null;
+            }
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
         } else if (i < s.len and s[i] >= '0' and s[i] <= '9') {
             const n = jsonParseNum(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "tabstop")) res.tabstop = n;
@@ -145,6 +203,18 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 }
 
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // The record is annotated with the schema's ty, spelled inline (single
+    // source of truth: schemas/expand.dhall): the annotation makes the record
+    // form STRICTLY typed — the legacy `{ input = "/f" }` spelling is a type
+    // error, not a silently-mapped files[0].
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ files : List Text, tabstop : Natural }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -155,7 +225,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-expand: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -183,40 +253,20 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-expand: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
 
     var o = Options{};
-    if (opts.input) |v| o.files = try std.mem.Allocator.dupe(gpa, []const u8, &.{try gpa.dupe(u8, v)});
-    if (opts.tabstop) |ts| o.tabstop = @intCast(@max(@as(u64, 1), @min(ts, 4096)));
-    return o;
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-t")) {
-            if (i + 1 >= args.len) return error.BadArgs;
-            i += 1;
-            o.tabstop = @intCast(std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs);
-            if (o.tabstop == 0) o.tabstop = 1;
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and std.mem.eql(u8, a[1..2], "t")) {
-            o.tabstop = @intCast(std.fmt.parseInt(u64, a[2..], 10) catch return error.BadArgs);
-            if (o.tabstop == 0) o.tabstop = 1;
-            continue;
-        } else if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-expand: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
+    if (opts.files) |fs| {
+        // elements point into the JSON scratch buf; dupe them out (the
+        // generated Options' List-Text views are gpa-owned like argv dupes)
+        const arr = try gpa.alloc([]const u8, fs.len);
+        for (fs, 0..) |item, idx| arr[idx] = try gpa.dupe(u8, item);
+        o.files = arr;
     }
-    o.files = try files.toOwnedSlice(gpa);
+    if (opts.tabstop) |ts| o.tabstop = ts;
     return o;
 }
 
@@ -266,6 +316,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], aa);
     } else {
+        // the GENERATED parser (schemas/expand.dhall ->
+        // src/generated/cli_expand.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
     }
 
@@ -273,10 +326,14 @@ pub fn main(init: std.process.Init) !void {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(aa);
 
+    // The hand parser's 0-clamps-to-1 is a RUNTIME clamp (schemas/expand.dhall)
+    // — the generated parser's Natural accepts any N, so both forms clamp here.
+    const tabstop: usize = @intCast(@max(opts.tabstop, 1));
+
     if (opts.files.len == 0) {
         const data = try readFdAll(aa, 0);
         defer aa.free(data);
-        try expandBytes(data, opts.tabstop, &out, aa);
+        try expandBytes(data, tabstop, &out, aa);
     } else {
         for (opts.files) |f| {
             const z = std.posix.toPosixPath(f) catch return error.BadPath;
@@ -288,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
             defer _ = close(fd);
             const data = try readFdAll(aa, fd);
             defer aa.free(data);
-            try expandBytes(data, opts.tabstop, &out, aa);
+            try expandBytes(data, tabstop, &out, aa);
         }
     }
     _ = std.Io.File.writeStreamingAll(stdout_file, init.io, out.items) catch return error.WriteFailed;
@@ -329,19 +386,113 @@ test "expandBytes col reset on newline" {
     try std.testing.expectEqualStrings("x  y\n   z\n", out.items);
 }
 
-test "jsonParseOpts input + tabstop" {
+test "jsonParseOpts files + tabstop" {
     var buf: [2048]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/f\",\"tabstop\":4}", &buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/f", o.input.?);
+    const gpa = std.testing.allocator;
+    const o = jsonParseOpts("{\"files\":[\"/f\"],\"tabstop\":4}", &buf, gpa) orelse return error.TestUnexpectedResult;
+    defer gpa.free(o.files.?);
+    try std.testing.expectEqualStrings("/f", o.files.?[0]);
     try std.testing.expectEqual(@as(?u64, 4), o.tabstop);
 }
 
-test "parsePosixArgs -t and files" {
+test "parsePosixArgs -t and files (generated parser)" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-expand", "-t", "4", "a.txt", "b.txt" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqual(@as(usize, 4), o.tabstop);
+    const o = try parsePosixArgs(&.{ "fx-expand", "-t", "4", "a.txt", "b.txt" }, aa);
+    try std.testing.expectEqual(@as(u64, 4), o.tabstop);
     try std.testing.expectEqual(@as(usize, 2), o.files.len);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-tail template applied
+// to the value-flag command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/expand.dhall
+// -> src/generated/cli_expand.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the SHARED runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.
+
+/// One differential vector for fx-expand — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_expand, &.{ "schemas/expand.dhall", "fx-core/schemas/expand.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (files = [], tabstop = 8)
+    try expectPosixEqualsRecord(&.{"fx-expand"}, "{ }");
+
+    // the -t Value flag: next-token binding
+    try expectPosixEqualsRecord(&.{ "fx-expand", "-t", "4" }, "{ tabstop = 4 }");
+    try expectPosixEqualsRecord(&.{ "fx-expand", "-t", "1" }, "{ tabstop = 1 }");
+    // --tabs=VALUE: the long alias is INLINE-VALUE-ONLY
+    try expectPosixEqualsRecord(&.{ "fx-expand", "--tabs=7" }, "{ tabstop = 7 }");
+
+    // FILE operands, alone and composed with the flag; flags and operands
+    // interleave in either order
+    try expectPosixEqualsRecord(&.{ "fx-expand", "/f" }, "{ files = [ \"/f\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-expand", "-t", "3", "/f" }, "{ files = [ \"/f\" ], tabstop = 3 }");
+    try expectPosixEqualsRecord(&.{ "fx-expand", "/f", "-t", "3" }, "{ files = [ \"/f\" ], tabstop = 3 }");
+    try expectPosixEqualsRecord(&.{ "fx-expand", "/a", "/b" }, "{ files = [ \"/a\", \"/b\" ] }");
+
+    // '--' terminator: a flag-looking token after it is the operand
+    try expectPosixEqualsRecord(&.{ "fx-expand", "--", "-t" }, "{ files = [ \"-t\" ] }");
+
+    // exotic operand bytes: escaping parity between the raw POSIX operand and
+    // the rendered record
+    try expectPosixEqualsRecord(&.{ "fx-expand", "a b.txt" }, "{ files = [ \"a b.txt\" ] }");
+}
+
+test "DIFFERENTIAL: -t edge values and BadValue (generated parser)" {
+    // an arena over the testing allocator (the generated parser does not
+    // free operand dupes bound before a failing token — a failed parse
+    // exits the process; the arena reclaims them wholesale here)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // 0 is COERCIBLE at the parser (Natural); the 0-clamps-to-1 is a runtime
+    // clamp in main() now
+    const zero = try cli_expand.parsePosix(&.{ "fx-expand", "-t", "0" }, gpa);
+    try std.testing.expectEqual(@as(u64, 0), zero.tabstop);
+
+    // a negative / non-numeric / overflowing value is BadValue (Natural)
+    try std.testing.expectError(error.BadValue, cli_expand.parsePosix(&.{ "fx-expand", "-t", "-1" }, gpa));
+    try std.testing.expectError(error.BadValue, cli_expand.parsePosix(&.{ "fx-expand", "-t", "x" }, gpa));
+    try std.testing.expectError(error.BadValue, cli_expand.parsePosix(&.{ "fx-expand", "-t", "18446744073709551616" }, gpa));
+    try std.testing.expectError(error.BadValue, cli_expand.parsePosix(&.{ "fx-expand", "--tabs=notanumber" }, gpa));
+
+    // -t with NO value token: MissingValue
+    try std.testing.expectError(error.MissingValue, cli_expand.parsePosix(&.{ "fx-expand", "-t" }, gpa));
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator (same discipline as above)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; a Value short never clusters, so the ATTACHED GNU form
+    // -t4 is v1-unrepresentable (the hand parser accepted it — documented
+    // divergence, schemas/expand.dhall)
+    try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "-t4" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "--bogus" }, gpa));
+
+    // the bare --tabs spelling (no '='): a Value long binds inline ONLY
+    try std.testing.expectError(error.UnknownOption, cli_expand.parsePosix(&.{ "fx-expand", "--tabs", "7" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the LEGACY singular `input` spelling
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/expand.dhall", "fx-core/schemas/expand.dhall" }) catch
+        @panic("cannot locate schemas/expand.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ files = [ \"/f\" ], tabstop = -3 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = \"/f\" }"));
 }

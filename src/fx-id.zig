@@ -25,9 +25,21 @@
 //
 // Divergences (deliberate scope cuts): no -Z/-z (SELinux/AppArmor context);
 // no --context long options; -G only prints numeric ids (or names with -n).
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_id.zig,
+// emitted from schemas/id.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Deliberate
+// strengthening (the ls -S/-t precedent): the hand parser silently let
+// `-u -g` last-win into `select`; the generated parser rejects any -u/-g/-G
+// PAIR as error.Conflict (the schema's mutually_exclusive row).  The schema
+// models the independent-bool surface (uid/gid/all/names/real + user Text
+// with the "" placeholder default); evalDhallArgs derives the old `select`
+// enum from it exactly as the hand bool path did (last-true-wins).
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_id = @import("cli-id");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -47,18 +59,36 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/id.dhall)
 // ---------------------------------------------------------------------------
 
+const Select = enum { none, uid, gid, groups };
+
+/// The generated parser carries the schema's independent-bool surface (the
+/// hand runtime's Dhall type); main still dispatches on the collapsed
+/// `select`, derived once per arg form below (last-true-wins, as before).
 const Options = struct {
-    select: enum { none, uid, gid, groups } = .none,
+    select: Select = .none,
     names: bool = false,
     real: bool = false,
-    user: ?[]const u8 = null,
+    user: []const u8 = "", // "" = current process (the schema placeholder)
+
+    /// The bool surface both arg forms converge on (the generated
+    /// cli_id.Options field set).
+    fn fromSurface(s: cli_id.Options) Options {
+        var o = Options{ .names = s.names, .real = s.real, .user = s.user };
+        if (s.uid) o.select = .uid;
+        if (s.gid) o.select = .gid;
+        if (s.all) o.select = .groups;
+        return o;
+    }
 };
 
 const JsonOpts = struct {
     user: ?[]const u8 = null,
+    // The schema spells user plain Text with the "" placeholder default
+    // (schemas/id.dhall ty comment: a single positional must bind plain
+    // Text), so the record form omits the field to mean "current process".
     uid: ?bool = null,
     gid: ?bool = null,
     all: ?bool = null,
@@ -208,7 +238,9 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.user) |u| o.user = try gpa.dupe(u8, u);
+    if (opts.user) |u| {
+        if (u.len > 0) o.user = try gpa.dupe(u8, u);
+    }
     if (opts.names orelse false) o.names = true;
     if (opts.real orelse false) o.real = true;
     if (opts.uid orelse false) o.select = .uid;
@@ -217,46 +249,12 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 1 and a[0] == '-') {
-            var j: usize = 1;
-            while (j < a.len) : (j += 1) {
-                switch (a[j]) {
-                    'u' => o.select = .uid,
-                    'g' => o.select = .gid,
-                    'G' => o.select = .groups,
-                    'n' => o.names = true,
-                    'r' => o.real = true,
-                    else => {
-                        std.debug.print("fx-id: invalid option -- '{c}'\n", .{a[j]});
-                        return error.UnknownOption;
-                    },
-                }
-            }
-        } else if (std.mem.eql(u8, a, "--")) {
-            // everything after -- is a USER operand
-            i += 1;
-            if (i < args.len) {
-                if (o.user != null) {
-                    std.debug.print("fx-id: extra operand '{s}'\n", .{args[i]});
-                    return error.TooManyOperands;
-                }
-                o.user = try gpa.dupe(u8, args[i]);
-            }
-            return o;
-        } else {
-            if (o.user != null) {
-                std.debug.print("fx-id: extra operand '{s}'\n", .{a});
-                return error.TooManyOperands;
-            }
-            o.user = try gpa.dupe(u8, a);
-        }
-    }
-    return o;
+/// Bridge to the generated parser: parse the schema's bool surface, then
+/// derive the collapsed `select` view main dispatches on (last-true-wins —
+/// unreachable for the mutually exclusive u/g/G trio, which the parser
+/// rejects as error.Conflict).
+fn parsePosixArgs(args: []const []const u8, gpa: Allocator) !Options {
+    return Options.fromSurface(try cli_id.parsePosix(args, gpa));
 }
 
 test "jsonParseOpts user + flags" {
@@ -277,21 +275,108 @@ test "evalDhallArgs record select uid" {
 test "evalDhallArgs record with user" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ user = \"bob\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.user.?);
-    try std.testing.expectEqualStrings("bob", o.user.?);
+    defer std.testing.allocator.free(o.user);
+    try std.testing.expectEqualStrings("bob", o.user);
 }
 
-test "parsePosixArgs combined -un" {
-    const args = [_][:0]const u8{ "fx-id", "-un" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(Options{ .select = .uid, .names = true }, o);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent (schema
+// completion -> renderDhallRecord -> THIS file's record evaluator), encoded
+// by the shared field-complete encoder and compared as strings.  Both sides
+// carry the schema's independent-bool surface, so the comparison runs on
+// cli_id.Options; the POSIX side is bridged through the same fromSurface
+// derivation main uses, and the EMPTY-select default pins equality of the
+// collapsed view too ({} == {} in the encoder).
+
+/// evalFn adapter: encode the runtime Options of the RECORD form back onto
+/// the schema's bool surface, so both sides of the comparison carry the same
+/// type.  The derivation is total (names/real/user copy; uid/gid/all are
+/// mutually exclusive in the record form too — only one key is set).
+fn surfaceOfRuntime(o: Options) cli_id.Options {
+    return .{
+        .uid = o.select == .uid,
+        .gid = o.select == .gid,
+        .all = o.select == .groups,
+        .names = o.names,
+        .real = o.real,
+        .user = o.user,
+    };
 }
 
-test "parsePosixArgs user operand" {
-    const args = [_][:0]const u8{ "fx-id", "alice" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.user.?);
-    try std.testing.expectEqualStrings("alice", o.user.?);
+fn evalDhallSurface(src: [:0]const u8, gpa: Allocator) !cli_id.Options {
+    return surfaceOfRuntime(try evalDhallArgs(src, gpa));
+}
+
+/// One differential vector for fx-id — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_id, &.{ "schemas/id.dhall", "fx-core/schemas/id.dhall" }, evalDhallSurface, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: empty argv / empty record = bare id (no selector) ---
+    try expectPosixEqualsRecord(&.{"fx-id"}, "{ }");
+
+    // --- each selector alone, cluster and separate spellings ---
+    try expectPosixEqualsRecord(&.{ "fx-id", "-u" }, "{ uid = True }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-g" }, "{ gid = True }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-G" }, "{ all = True }");
+
+    // --- modifiers, alone and combined with a selector ---
+    try expectPosixEqualsRecord(&.{ "fx-id", "-n" }, "{ names = True }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-r" }, "{ real = True }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-un" }, "{ uid = True, names = True }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-nGr" }, "{ all = True, names = True, real = True }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-g", "-r", "-n" }, "{ gid = True, names = True, real = True }");
+
+    // --- the USER operand, with and without flags, after `--` too ---
+    try expectPosixEqualsRecord(&.{ "fx-id", "alice" }, "{ user = \"alice\" }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "-u", "-n", "bob" }, "{ uid = True, names = True, user = \"bob\" }");
+    try expectPosixEqualsRecord(&.{ "fx-id", "--", "-weird" }, "{ user = \"-weird\" }");
+
+    // --- repeat flags are idempotent ---
+    try expectPosixEqualsRecord(&.{ "fx-id", "-n", "-n", "-u" }, "{ uid = True, names = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed; the
+    // arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // THE schema-pinned strengthening (ls -S/-t precedent): the hand parser
+    // silently let `-u -g` last-win into select; the generated parser
+    // rejects every -u/-g/-G pair, in both orders and inside a cluster
+    try std.testing.expectError(error.Conflict, cli_id.parsePosix(&.{ "fx-id", "-u", "-g" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_id.parsePosix(&.{ "fx-id", "-g", "-u" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_id.parsePosix(&.{ "fx-id", "-u", "-G" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_id.parsePosix(&.{ "fx-id", "-G", "-g" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_id.parsePosix(&.{ "fx-id", "-ug" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_id.parsePosix(&.{ "fx-id", "-Gu" }, gpa));
+
+    // unknown option: short, cluster letter, long
+    try std.testing.expectError(error.UnknownOption, cli_id.parsePosix(&.{ "fx-id", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_id.parsePosix(&.{ "fx-id", "-uZ" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_id.parsePosix(&.{ "fx-id", "--bogus" }, gpa));
+
+    // a second operand overflows the single USER slot (the hand
+    // TooManyOperands)
+    try std.testing.expectError(error.UnexpectedOperand, cli_id.parsePosix(&.{ "fx-id", "a", "b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX form has no spelling that could reach
+    // either (its analogue is -x above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/id.dhall", "fx-core/schemas/id.dhall" }) catch
+        @panic("cannot locate schemas/id.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ uid = 5 }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -482,8 +567,8 @@ pub fn main(init: std.process.Init) !void {
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
-    const ids = resolveIds(opts.user) orelse {
-        std.debug.print("fx-id: '{s}': no such user\n", .{if (opts.user) |u| u else "<self>"});
+    const ids = resolveIds(if (opts.user.len > 0) opts.user else null) orelse {
+        std.debug.print("fx-id: '{s}': no such user\n", .{if (opts.user.len > 0) opts.user else "<self>"});
         std.process.exit(1);
     };
 

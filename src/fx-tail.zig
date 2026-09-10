@@ -11,8 +11,8 @@
 //   fx-tail '{ n = 20, input = "/tmp/f" }'      Dhall record
 //   fx-tail [-n N] [FILE]                        POSIX fallback
 //
-// - Dhall `{ n : Natural, input : Optional Text }`: n defaults to 10; `input`
-//   Some path = tail that file, None = read stdin.
+// - Dhall `{ n : Natural, input : Text }`: n defaults to 10; `input` Some
+//   path = tail that file, "" (or omission) = read stdin.
 // - POSIX: `fx-tail [-n N] [FILE]`; no FILE operand => stdin.  Single input
 //   only (GNU supports multiple files with `==> name <==` headers; those
 //   per-file headers and multi-file support are deliberately omitted).
@@ -27,6 +27,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_tail = @import("cli-tail");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -49,15 +51,17 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/tail.dhall)
 // ---------------------------------------------------------------------------
+//
+// `input` is a plain Text with the "" placeholder default (a positional must
+// bind a plain Text field): "" = stdin — the struct's old semantic None
+// (no FILE operand => read stdin) converges onto the placeholder.  The hand
+// record form's `{ input = None Text }` spelling is ill-typed against the
+// schema's Text — omit the field instead.
 
-const Options = struct {
-    // Number of trailing lines to emit.  Default 10.
-    n: usize = 10,
-    // Single input path; null => stdin.
-    input: ?[]const u8 = null,
-};
+const Options = cli_tail.Options;
+const parsePosixArgs = cli_tail.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     n: ?usize = null,
@@ -227,34 +231,108 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 1 and a[0] == '-') {
-            if (std.mem.eql(u8, a, "-n")) {
-                i += 1;
-                if (i >= args.len) {
-                    std.debug.print("fx-tail: -n requires an argument\n", .{});
-                    return error.MissingArg;
-                }
-                o.n = std.fmt.parseInt(usize, args[i], 10) catch {
-                    std.debug.print("fx-tail: invalid -n value '{s}'\n", .{args[i]});
-                    return error.InvalidN;
-                };
-            } else {
-                std.debug.print("fx-tail: unknown option '{s}'\n", .{a});
-                return error.UnknownOption;
-            }
-        } else if (o.input == null) {
-            o.input = try gpa.dupe(u8, a);
-        } else {
-            std.debug.print("fx-tail: multiple file operands not supported\n", .{});
-            return error.TooManyFiles;
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent ((dflt //
+// user) : ty via fx-cli.completeSrc, rendered back to a record literal and
+// evaluated by THIS file's evalDhallArgs — the exact runtime path
+// `fx-tail '{ ... }'` takes).  Both sides are re-encoded to the canonical
+// term_to_json wire shape (the SHARED comptime-reflection encoder
+// fx-cli.encodeOptionsWire) and compared as strings, so the assertion is
+// exact and FIELD-COMPLETE by construction.
+
+/// One differential vector for fx-tail — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_tail, &.{ "schemas/tail.dhall", "fx-core/schemas/tail.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: n = 10 (the GNU tail default), input = "" (stdin) ---
+    try expectPosixEqualsRecord(&.{ "fx-tail" }, "{ }");
+
+    // --- the -n Value flag: next-token binding, 0 and a larger count ---
+    try expectPosixEqualsRecord(&.{ "fx-tail", "-n", "0" }, "{ n = 0 }");
+    try expectPosixEqualsRecord(&.{ "fx-tail", "-n", "20" }, "{ n = 20 }");
+
+    // --- --lines=VALUE: the long alias is INLINE-VALUE-ONLY (the generated
+    // parser accepts --long=value for Value longs; a bare `--lines 7` is an
+    // unknown option — asserted in the rejection matrix below) ---
+    try expectPosixEqualsRecord(&.{ "fx-tail", "--lines=7" }, "{ n = 7 }");
+
+    // --- positional FILE, alone and composed with the flag; flags and
+    // operands interleave in either order ---
+    try expectPosixEqualsRecord(&.{ "fx-tail", "/tmp/f" }, "{ input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-tail", "-n", "3", "/tmp/f" }, "{ n = 3, input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-tail", "/tmp/f", "-n", "3" }, "{ n = 3, input = \"/tmp/f\" }");
+
+    // --- '--' terminator: a flag-looking token after it is the operand ---
+    try expectPosixEqualsRecord(&.{ "fx-tail", "--", "-n" }, "{ input = \"-n\" }");
+
+    // --- exotic operand bytes: escaping parity between the raw POSIX
+    // operand and the rendered record ---
+    try expectPosixEqualsRecord(&.{ "fx-tail", "a b.txt" }, "{ input = \"a b.txt\" }");
+}
+
+test "DIFFERENTIAL: -n edge values and BadValue (generated parser)" {
+    // an arena over the testing allocator (the generated parser does not
+    // free operand dupes bound before a failing token — a failed parse
+    // exits the process; the arena reclaims them wholesale here)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // n = 0 is VALID (drains the input, emits nothing)
+    const zero = try cli_tail.parsePosix(&.{ "fx-tail", "-n", "0" }, gpa);
+    try std.testing.expectEqual(@as(u64, 0), zero.n);
+    // the u64 max is coercible
+    const big = try cli_tail.parsePosix(&.{ "fx-tail", "-n", "18446744073709551615" }, gpa);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), big.n);
+
+    // a negative / non-numeric / overflowing value is BadValue (the schema
+    // type is Natural)
+    try std.testing.expectError(error.BadValue, cli_tail.parsePosix(&.{ "fx-tail", "-n", "-1" }, gpa));
+    try std.testing.expectError(error.BadValue, cli_tail.parsePosix(&.{ "fx-tail", "-n", "x" }, gpa));
+    try std.testing.expectError(error.BadValue, cli_tail.parsePosix(&.{ "fx-tail", "-n", "18446744073709551616" }, gpa));
+    // the inline long form carries the same coercion
+    try std.testing.expectError(error.BadValue, cli_tail.parsePosix(&.{ "fx-tail", "--lines=notanumber" }, gpa));
+
+    // -n with NO value token: MissingValue
+    try std.testing.expectError(error.MissingValue, cli_tail.parsePosix(&.{ "fx-tail", "-n" }, gpa));
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator (same discipline as above)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; a Value short never clusters, so -n3 is unknown too
+    // (the attached GNU form -n3 is v1-unrepresentable, schemas/tail.dhall)
+    try std.testing.expectError(error.UnknownOption, cli_tail.parsePosix(&.{ "fx-tail", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_tail.parsePosix(&.{ "fx-tail", "-n3" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_tail.parsePosix(&.{ "fx-tail", "--bogus" }, gpa));
+
+    // a SECOND operand: TooManyFiles by the old hand spelling, now
+    // UnexpectedOperand (GNU's multi-file `==> name <==` surface is a
+    // documented scope cut; the record form cannot express it at all)
+    try std.testing.expectError(error.UnexpectedOperand, cli_tail.parsePosix(&.{ "fx-tail", "a", "b" }, gpa));
+
+    // the bare --lines spelling (no '='): a Value long binds inline ONLY
+    try std.testing.expectError(error.UnknownOption, cli_tail.parsePosix(&.{ "fx-tail", "--lines", "7" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type; `{ input = None Text }` is ill-typed against the
+    // schema's Text placeholder (omit the field instead)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/tail.dhall", "fx-core/schemas/tail.dhall" }) catch
+        @panic("cannot locate schemas/tail.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ n = -3 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = None Text }"));
 }
 
 test "jsonParseOpts n and input string" {
@@ -276,31 +354,40 @@ test "jsonParseOpts n null default" {
 test "evalDhallArgs record with n and input" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ n = 20, input = \"/tmp/f\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expectEqual(@as(usize, 20), o.n);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    defer std.testing.allocator.free(o.input);
+    try std.testing.expectEqual(@as(u64, 20), o.n);
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
-test "evalDhallArgs record default n (10) and None input (stdin)" {
+test "evalDhallArgs record default n (10), omission = stdin" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 10), o.n);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    // the field is omitted: (dflt // user) fills input = "" == stdin (the
+    // old `{ input = None Text }` spelling is ill-typed against the schema's
+    // Text — asserted in the differential rejection matrix below)
+    const o = try evalDhallArgs("{ }", std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 10), o.n);
+    try std.testing.expectEqualStrings("", o.input);
 }
 
-test "parsePosixArgs default n and file" {
-    const args = [_][:0]const u8{ "fx-tail", "/tmp/a" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expectEqual(@as(usize, 10), o.n);
-    try std.testing.expectEqualStrings("/tmp/a", o.input.?);
+test "parsePosixArgs default n and file (generated)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-tail", "/tmp/a" };
+    const o = try parsePosixArgs(&args, aa);
+    try std.testing.expectEqual(@as(u64, 10), o.n);
+    try std.testing.expectEqualStrings("/tmp/a", o.input);
 }
 
-test "parsePosixArgs -n 0 and stdin" {
-    const args = [_][:0]const u8{ "fx-tail", "-n", "0" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), o.n);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+test "parsePosixArgs -n 0 and stdin (generated)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-tail", "-n", "0" };
+    const o = try parsePosixArgs(&args, aa);
+    try std.testing.expectEqual(@as(u64, 0), o.n);
+    // no FILE operand: input stays at the "" placeholder == stdin
+    try std.testing.expectEqualStrings("", o.input);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,12 +577,17 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/tail.dhall -> src/generated/cli_tail.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
     const stdout_file = std.Io.File.stdout();
     var fd: c_int = 0; // 0 = stdin
-    if (opts.input) |path| {
+    // input "" = stdin (the schema's Text placeholder for "no FILE operand")
+    if (opts.input.len > 0) {
+        const path = opts.input;
         const z = std.posix.toPosixPath(path) catch return error.BadPath;
         fd = open(&z, O_RDONLY, 0);
         if (fd < 0) {
@@ -507,6 +599,6 @@ pub fn main(init: std.process.Init) !void {
         if (fd != 0) _ = close(fd);
     }
 
-    try tailFd(opt_alloc, fd, opts.n, stdout_file, init.io);
+    try tailFd(opt_alloc, fd, @intCast(opts.n), stdout_file, init.io);
 }
 

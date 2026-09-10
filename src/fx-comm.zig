@@ -4,16 +4,22 @@
 // in FILE1, lines only in FILE2, and lines common to both.  Pure libc + the
 // dhall module for typed args — no datalog / journal dependency.
 //
-// Two arg forms:
-//   fx-comm '{ a = "/tmp/f1", b = "/tmp/f2", one = false, two = false, three = false }'
-//       Dhall record
-//   fx-comm [-1] [-2] [-3] [FILE1 FILE2]           POSIX fallback
+// Two arg forms (both derived from schemas/comm.dhall — the fx-ls migration
+// template applied to the two-positional command):
+//   fx-comm '{ a = "/tmp/f1", b = "/tmp/f2", one = True }'  Dhall record
+//   fx-comm [-1] [-2] [-3] [FILE1 FILE2]                    POSIX
 //
-// - Dhall `a`/`b : Optional Text` = the two input files (a "-" means stdin);
-//   `one`/`two`/`three` = suppress column 1/2/3.  If a or b is None, stdin is
-//   used for that side.
-// - POSIX: `-1`/`-2`/`-3` suppress columns; FILE1 FILE2 operands (a single "-"
-//   means stdin).  Exactly two file operands are required.
+// - Dhall `a`/`b : Text` = the two input files ("" = unbound => stdin;
+//   a "-" also means stdin); `one`/`two`/`three : Bool` = suppress column
+//   1/2/3 (and its tab prefix).  The legacy `{ a = None Text }` spelling is
+//   REJECTED (strict typed record) — omit the field instead ((dflt // user)
+//   fills "").
+// - POSIX: `-1`/`-2`/`-3` (longs `--suppress-N`) suppress columns; FILE1
+//   FILE2 operands (a single "-" means stdin).  Parsed by the GENERATED
+//   parser (src/generated/cli_comm.zig, emitted from schemas/comm.dhall by
+//   src/tools/fx-clijson.zig — pure Zig, no dhall at runtime); exactly-two-
+//   operands is the runtime's check (main), and equality with the record
+//   form is pinned by the differential tests below.
 //
 // Behavior (GNU-grounded, verified against host coreutils): the two files are
 // assumed SORTED and merged with std.mem.order(u8).  Column 1 (only f1) has a 0
@@ -30,6 +36,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_comm = @import("cli-comm");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -49,17 +57,11 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/comm.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Slices into the args arena: the two input file operands (may be "-").
-    a: ?[]const u8 = null,
-    b: ?[]const u8 = null,
-    one: bool = false,
-    two: bool = false,
-    three: bool = false,
-};
+const Options = cli_comm.Options;
+const parsePosixArgs = cli_comm.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     a: ?[]const u8 = null,
@@ -150,6 +152,34 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
                 res.b = val;
             }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: skipped balanced (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '[') depth += 1;
+                if (s[i] == ']') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             const b = jsonParseBool(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "one")) res.one = b;
@@ -167,6 +197,19 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 }
 
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // The record is annotated with the schema's ty, spelled inline (single
+    // source of truth: schemas/comm.dhall): the annotation makes the record
+    // form STRICTLY typed — the legacy `{ a = None Text }` spelling is a type
+    // error (Text field), not a silently-None stdin side; omit the field for
+    // stdin instead.
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ a : Text, b : Text, one : Bool, three : Bool, two : Bool }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -177,7 +220,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-comm: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -219,43 +262,6 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var files = std.ArrayList([]const u8).empty;
-    defer files.deinit(gpa);
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 1 and a[0] == '-') {
-            var j: usize = 1;
-            while (j < a.len) : (j += 1) {
-                switch (a[j]) {
-                    '1' => o.one = true,
-                    '2' => o.two = true,
-                    '3' => o.three = true,
-                    else => {
-                        std.debug.print("fx-comm: invalid option -- '{c}'\n", .{a[j]});
-                        return error.UnknownOption;
-                    },
-                }
-            }
-        } else {
-            try files.append(gpa, try gpa.dupe(u8, a));
-        }
-    }
-    if (files.items.len < 2) {
-        std.debug.print("fx-comm: missing operand\n", .{});
-        return error.MissingFile;
-    }
-    if (files.items.len > 2) {
-        std.debug.print("fx-comm: extra operand '{s}'\n", .{files.items[2]});
-        return error.TooManyFiles;
-    }
-    o.a = files.items[0];
-    o.b = files.items[1];
-    return o;
-}
-
 test "jsonParseOpts a b flags" {
     var buf: [1024]u8 = undefined;
     const o = jsonParseOpts("{\"a\":\"/f1\",\"b\":\"/f2\",\"three\":true}", &buf) orelse
@@ -267,22 +273,92 @@ test "jsonParseOpts a b flags" {
 
 test "evalDhallArgs record" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ a = \"/f1\", b = \"/f2\", one = True }", std.testing.allocator);
-    defer std.testing.allocator.free(o.a.?);
-    defer std.testing.allocator.free(o.b.?);
-    try std.testing.expectEqualStrings("/f1", o.a.?);
-    try std.testing.expectEqualStrings("/f2", o.b.?);
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try evalDhallArgs("{ a = \"/f1\", b = \"/f2\", one = True, three = False, two = False }", aa);
+    try std.testing.expectEqualStrings("/f1", o.a);
+    try std.testing.expectEqualStrings("/f2", o.b);
     try std.testing.expect(o.one);
 }
 
-test "parsePosixArgs -12 files" {
-    const args = [_][:0]const u8{ "fx-comm", "-12", "/f1", "/f2" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.a.?);
-    defer std.testing.allocator.free(o.b.?);
-    try std.testing.expect(o.one and o.two and !o.three);
-    try std.testing.expectEqualStrings("/f1", o.a.?);
-    try std.testing.expectEqualStrings("/f2", o.b.?);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/fx-chown template
+// applied to the two-positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/comm.dhall
+// -> src/generated/cli_comm.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the SHARED runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.
+
+/// One differential vector for fx-comm — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_comm, &.{ "schemas/comm.dhall", "fx-core/schemas/comm.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (a = b = "" — unbound; main
+    // treats that as the missing-operand error, so this vector pins the
+    // PARSER default only)
+    try expectPosixEqualsRecord(&.{"fx-comm"}, "{ }");
+
+    // the two positional slots bind in argv order
+    try expectPosixEqualsRecord(&.{ "fx-comm", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\" }");
+
+    // the column-suppress flags: short alone, long alias, and combined
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-1", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", one = True }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-2", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", two = True }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-3", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", three = True }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "--suppress-1", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", one = True }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-12", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", one = True, two = True }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-21", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", one = True, two = True }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-123", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\", one = True, three = True, two = True }");
+
+    // flags and operands interleave in either order
+    try expectPosixEqualsRecord(&.{ "fx-comm", "/f1", "/f2", "-3" }, "{ a = \"/f1\", b = \"/f2\", three = True }");
+
+    // a bare '-' operand is stdin; '--' ends flag parsing (a file named -1
+    // is spellable)
+    try expectPosixEqualsRecord(&.{ "fx-comm", "-", "/f2" }, "{ a = \"-\", b = \"/f2\" }");
+    try expectPosixEqualsRecord(&.{ "fx-comm", "--", "-1", "/f2" }, "{ a = \"-1\", b = \"/f2\" }");
+
+    // duplicate operand binds the same slot twice (idempotent)
+    try expectPosixEqualsRecord(&.{ "fx-comm", "/f1", "/f1" }, "{ a = \"/f1\", b = \"/f1\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_comm.parsePosix(&.{ "fx-comm", "-1A", "/f1", "/f2" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_comm.parsePosix(&.{ "fx-comm", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_comm.parsePosix(&.{ "fx-comm", "--bogus" }, gpa));
+
+    // a THIRD operand: UnexpectedOperand by the generated spelling (the hand
+    // parser errored TooManyFiles; the record form cannot express a third
+    // positional at all)
+    try std.testing.expectError(error.UnexpectedOperand, cli_comm.parsePosix(&.{ "fx-comm", "/f1", "/f2", "/f3" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the legacy `{ a = None Text }` spelling (a type
+    // error against Text — omit the field for the unbound slot instead)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/comm.dhall", "fx-core/schemas/comm.dhall" }) catch
+        @panic("cannot locate schemas/comm.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ a = 5, b = \"/f2\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ a = None Text, b = \"/f2\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -396,11 +472,20 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/comm.dhall -> src/generated/cli_comm.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
-    // Default missing sides to stdin ("-").
-    const a = opts.a orelse "-";
-    const b = opts.b orelse "-";
+    // Exactly-two-operands is the runtime's check (the generated parser just
+    // fills the slots; schemas/comm.dhall known limits).  "" (unbound) is the
+    // missing-operand case; a spelled "-" operand IS stdin (readFile).
+    if (opts.a.len == 0 or opts.b.len == 0) {
+        std.debug.print("fx-comm: missing operand\n", .{});
+        std.process.exit(1);
+    }
+    const a = opts.a;
+    const b = opts.b;
 
     var ra = std.ArrayList(u8).empty;
     defer ra.deinit(opt_alloc);

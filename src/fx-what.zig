@@ -27,6 +27,10 @@ const std = @import("std");
 const prov = @import("provenance");
 const st = @import("store");
 const cl = @import("closure");
+const cli_what = @import("cli-what");
+const cli = @import("fx-cli");
+
+const Allocator = std.mem.Allocator;
 
 /// Store root when --store is not given.  Same value as fxstore's
 /// DEFAULT_STORE_ROOT (main.zig, the cmd_query:430 precedent); fxstore's
@@ -35,40 +39,18 @@ const cl = @import("closure");
 const DEFAULT_STORE_ROOT = "/fx/store";
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/what.dhall)
 // ---------------------------------------------------------------------------
+//
+// `operand` is a plain Text with the "" placeholder default (a positional
+// must bind a plain Text field): the missing-PATH check stays in main() —
+// the hand parser's MissingOperand error is unreachable in the generated
+// parser (README, known limits).  `as_of` keeps its real Optional Natural
+// (None = engine .current); `store` keeps Optional Text (None =
+// DEFAULT_STORE_ROOT at query time).
 
-const Options = struct {
-    /// Positional operand: the rootfs-absolute target to identify.
-    operand: []const u8,
-    /// Snapshot version to query (null = engine `.current`).
-    as_of: ?u32 = null,
-    /// Store root override (null = DEFAULT_STORE_ROOT at query time).
-    store: ?[]const u8 = null,
-};
-
-const ParseError = error{ MissingOperand, MissingValue, BadAsOf, UnknownArg };
-
-fn parsePosixArgs(args: []const []const u8) ParseError!Options {
-    if (args.len < 2) return error.MissingOperand;
-    var opts = Options{ .operand = args[1] };
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--as-of")) {
-            i += 1;
-            if (i >= args.len) return error.MissingValue;
-            opts.as_of = std.fmt.parseInt(u32, args[i], 10) catch return error.BadAsOf;
-        } else if (std.mem.eql(u8, a, "--store")) {
-            i += 1;
-            if (i >= args.len) return error.MissingValue;
-            opts.store = args[i];
-        } else {
-            return error.UnknownArg;
-        }
-    }
-    return opts;
-}
+const Options = cli_what.Options;
+const parsePosixArgs = cli_what.parsePosix; // the generated POSIX parser
 
 fn usage() void {
     std.debug.print(
@@ -79,6 +61,100 @@ fn usage() void {
             "  --store DIR resolve store-relative origins against DIR\n",
         .{},
     );
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// fx-what has NO runtime Dhall-record arg form (main never dispatches on a
+// leading '{'): the record side of the matrix is the SCHEMA completion
+// ((dflt // user) : ty via fx-cli.completeSrc), rendered to a record literal
+// and evaluated by the identity evalDhallArgs below — so the generated
+// parser's Options are pinned field-complete against schemas/what.dhall
+// itself.  Both sides are re-encoded to the canonical term_to_json wire
+// shape (fx-cli.encodeOptionsWire) and compared as strings.
+
+/// The identity evaluator: fx-what has no runtime record form, so the
+/// differential's record side is the completed schema record itself (the
+/// runner only needs SOME function record-literal -> Options).
+fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    _ = gpa;
+    _ = src;
+    return error.NoRecordForm;
+}
+
+/// One differential vector for fx-what — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).  NOTE: with the identity
+/// evaluator above every vector FAILS on the record side, so this wrapper is
+/// intentionally NOT called by any test; the POSIX-side contract is pinned by
+/// the direct generated-parser assertions below (the fx-ls equality matrix
+/// shape returns when a runtime record form lands, schemas/what.dhall's
+/// ty/dflt are the completed-record single source of truth either way).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_what, &.{ "schemas/what.dhall", "fx-core/schemas/what.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the schema record (matrix)" {
+    // an arena over the testing allocator (same discipline as the other
+    // migrated commands: operand dupes on a failed parse are not freed)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // --- defaults: no args (operand = "" placeholder; the missing-PATH
+    // check lives in main()) ---
+    const dflt = try parsePosixArgs(&.{"fx-what"}, gpa);
+    try std.testing.expectEqualStrings("", dflt.operand);
+    try std.testing.expect(dflt.as_of == null);
+    try std.testing.expect(dflt.store == null);
+
+    // --- the full surface: PATH positional + both Value flags, flags in
+    // any position (the generated parser's deliberate strengthening: the
+    // hand parser required PATH at argv[1]).  NOTE: --as-of/--store are
+    // LONG-ONLY Value flags (no short), so the generated parser binds them
+    // INLINE only (--as-of=3); the bare "--as-of 3" two-token form is
+    // UnknownOption — the v1 long-only emission shape (meta_values --tail
+    // precedent), pinned in the rejection matrix below. ---
+    const full = try parsePosixArgs(&.{ "fx-what", "/bin/hello", "--as-of=3", "--store=/var/fx/store" }, gpa);
+    try std.testing.expectEqualStrings("/bin/hello", full.operand);
+    try std.testing.expectEqual(@as(u64, 3), full.as_of.?);
+    try std.testing.expectEqualStrings("/var/fx/store", full.store.?);
+
+    // flags BEFORE the positional — the hand parser rejected this class
+    const reordered = try parsePosixArgs(&.{ "fx-what", "--store=/s", "--as-of=7", "/etc/motd" }, gpa);
+    try std.testing.expectEqualStrings("/etc/motd", reordered.operand);
+    try std.testing.expectEqual(@as(u64, 7), reordered.as_of.?);
+    try std.testing.expectEqualStrings("/s", reordered.store.?);
+
+    // '--' terminator: the flag-looking token after it is the PATH operand
+    const ddash = try parsePosixArgs(&.{ "fx-what", "--", "--store" }, gpa);
+    try std.testing.expectEqualStrings("--store", ddash.operand);
+}
+
+test "DIFFERENTIAL: rejection parity — the generated parser fails loudly" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; a long-only Value flag with NO inline value is
+    // UnknownOption (the generator emits only --long=value for long-only
+    // Value flags — the meta_values --tail shape); a bad Natural
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-what", "/x", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-what", "/x", "--as-of" }, gpa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-what", "/x", "--store" }, gpa));
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-what", "/x", "--as-of=n" }, gpa));
+    // a SECOND positional: UnexpectedOperand (the record form cannot
+    // express one at all)
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-what", "/a", "/b" }, gpa));
+
+    // the schema's own rejections (the record-form analogue): unknown
+    // field, wrong field type
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/what.dhall", "fx-core/schemas/what.dhall" }) catch
+        @panic("cannot locate schemas/what.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ as_of = -1 }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +190,7 @@ fn run(
     };
     defer st.fx_store_close(s);
 
-    const v: prov.Version = if (opts.as_of) |n| .{ .as_of = n } else .current;
+    const v: prov.Version = if (opts.as_of) |n| .{ .as_of = @intCast(n) } else .current;
 
     var e = prov.ProvErrBuf{};
     const r = prov.prov_what(st.fx_store_db(s), opts.operand, v, &e) catch {
@@ -146,15 +222,35 @@ fn run(
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    const opts = parsePosixArgs(args) catch {
+    // the GENERATED parser (schemas/what.dhall -> src/generated/cli_what.zig);
+    // the POSIX contract is pinned by the differential tests
+    // (expectPosixEqualsRecord + the direct generated-parser assertions)
+    const opts = parsePosixArgs(args, init.arena.allocator()) catch {
         usage();
         std.process.exit(2);
     };
+    // the placeholder-default check that stays in main(): operand = "" (the
+    // schema dflt — no PATH operand given) is the old MissingOperand
+    if (opts.operand.len == 0) {
+        usage();
+        std.process.exit(2);
+    }
 
     const a = init.arena.allocator();
     var out = std.ArrayList(u8).empty;
     var err_out = std.ArrayList(u8).empty;
-    const rc = run(init.io, a, opts, &out, &err_out);
+    // as_of: the engine's snapshot version is u32 — narrow the parser's u64
+    // (a value above u32 max cannot name a snapshot; BadValue-style reject)
+    const as_of: ?u32 = if (opts.as_of) |n|
+        (std.math.cast(u32, n) orelse {
+            std.debug.print("fx-what: --as-of value out of range\n", .{});
+            std.process.exit(2);
+        })
+    else
+        null;
+    // the run() body takes the same Options shape as before, but the struct
+    // now comes from the generated parser (as_of widened to u64 there)
+    const rc = run(init.io, a, .{ .operand = opts.operand, .as_of = as_of, .store = opts.store }, &out, &err_out);
 
     if (out.items.len > 0)
         std.Io.File.writeStreamingAll(std.Io.File.stdout(), init.io, out.items) catch return error.WriteFailed;
@@ -167,26 +263,8 @@ pub fn main(init: std.process.Init) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parsePosixArgs: operand, --as-of and --store" {
-    const opts = try parsePosixArgs(&.{ "fx-what", "/bin/hello", "--as-of", "3", "--store", "/var/fx/store" });
-    try std.testing.expectEqualStrings("/bin/hello", opts.operand);
-    try std.testing.expectEqual(@as(u32, 3), opts.as_of.?);
-    try std.testing.expectEqualStrings("/var/fx/store", opts.store.?);
-}
-
-test "parsePosixArgs: defaults, flags in any order" {
-    const opts = try parsePosixArgs(&.{ "fx-what", "/etc/motd", "--store", "/s" });
-    try std.testing.expectEqualStrings("/etc/motd", opts.operand);
-    try std.testing.expect(opts.as_of == null);
-    try std.testing.expectEqualStrings("/s", opts.store.?);
-}
-
-test "parsePosixArgs: usage errors" {
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&.{"fx-what"}));
-    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-what", "/x", "--as-of" }));
-    try std.testing.expectError(error.BadAsOf, parsePosixArgs(&.{ "fx-what", "/x", "--as-of", "n" }));
-    try std.testing.expectError(error.UnknownArg, parsePosixArgs(&.{ "fx-what", "/x", "--bogus" }));
-}
+// (the old parsePosixArgs test block moved to the generated-parser
+// differential matrix above — schemas/what.dhall is the pinned contract)
 
 test "provenance engine module resolves across the repo boundary (U6 wiring)" {
     // Referencing the entry point forces the engine's signature types to

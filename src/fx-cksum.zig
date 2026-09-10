@@ -5,13 +5,23 @@
 // coreutils cksum output.  Pure: no datalog / journal dependency — just libc
 // file I/O plus the dhall module for typed arguments.
 //
-// Two arg forms:
-//   fx-cksum '{ input = "/tmp/f" }'       Dhall record
-//   fx-cksum [FILE...]                    POSIX fallback
+// Two arg forms, ONE source of truth (schemas/cksum.dhall — the fx-ls
+// migration template):
+//   fx-cksum '{ files = [ "/f" ] }'       Dhall record
+//   fx-cksum [FILE...]                    POSIX
 //
-// - Dhall `input : Optional Text` = the file to checksum (None => stdin).
+// - Dhall `files : List Text` = the files to checksum ([] => stdin) — the
+//   schema spells the struct's real field; the OLD singular-`input` record
+//   form is gone (stdin is the empty record).
 // - POSIX: 0 FILE operands => checksum stdin; one or more FILE operands are
 //   each checksummed in argument order.
+//
+// The POSIX form is parsed by the GENERATED parser
+// (src/generated/cli_cksum.zig, emitted from schemas/cksum.dhall by
+// src/tools/fx-clijson.zig — pure Zig, no dhall at runtime; `zig build
+// gen-cli-check` gates the regen).  The generated parser keeps the hand
+// parser's no-flags posture (any "-..." token is error.UnknownOption) and
+// adds a `--` end-of-options terminator (tokens after it are FILE operands).
 //
 // Algorithm (byte-exact, GNU-grounded): the cksum CRC is the MSB-first CRC-32
 // with polynomial 0x04c11db7 and initial value 0 (the POSIX "cksum" variant).
@@ -33,12 +43,14 @@
 //
 // Divergences (deliberate scope cuts): no --check/-c verify mode; no
 // `-a/--algorithm` variants (crc only, this is the POSIX cksum); a missing
-// file is a hard error on stderr.  As in the other checksum tools, a single
-// `-` operand is NOT treated as stdin and there is no `--` end-of-options
-// terminator (scope omissions vs GNU).
+// file is a hard error on stderr.  A single `-` operand is NOT treated as
+// stdin (scope omission vs GNU; the `--` end-of-options terminator IS
+// honored by the generated parser — tokens after it are FILE operands).
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_cksum = @import("cli-cksum");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -81,16 +93,19 @@ inline fn crcStep(crc: u32, byte: u8) u32 {
 }
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/cksum.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered file paths to checksum.  Empty => stdin.
-    files: []const []const u8 = &.{},
-};
+const Options = cli_cksum.Options;
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    // Fixed-capacity file list decoded from the JSON array (the fx-rm idiom:
+    // term_to_json encodes Dhall `List Text` as a JSON array, which the
+    // minimal string/bool parser does not handle).  64 covers every
+    // differential and realistic invocation; a record with more elements
+    // than the capacity fails the decode (error.DhallFields).
+    files: [64][]const u8 = undefined,
+    files_n: usize = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +174,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
     while (true) {
@@ -166,12 +182,35 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
-            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "files")) {
+                        if (list_n >= res.files.len) return null; // over capacity
+                        res.files[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
             }
-            off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             _ = jsonParseBool(s, &i) orelse return null;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
@@ -182,10 +221,60 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.files_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
+/// Bare `[]` (no type annotation) cannot be typed by the dhall-c typechecker
+/// this repo links ("cannot infer type of empty list (needs annotation)").
+/// The differential runner's record side renders completed schema values
+/// from fx-cli.renderDhallRecord, whose List arm emits the bare form, so the
+/// empty-default `files` would die at INFER time in evalDhallArgs on every
+/// all-defaults vector.  Repair the spelling at this command's single
+/// record-form entry point: an empty list whose neighbors are not
+/// identifier-ish gets the schema's `List Text` payload; a non-empty list is
+/// untouched (its elements carry the type).  A Text value can never legally
+/// place a bare `[]` between non-identifier bytes (the wrapping quotes are
+/// identifier-ish on the inside), so the rewrite is unambiguous.
+fn repairBareList(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "[]") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 2 == src.len or !isIdentByte(src[i + 2])))
+        {
+            const rep = "[] : List Text";
+            @memcpy(buf[n .. n + rep.len], rep);
+            n += rep.len;
+            i += 2;
+        } else {
+            buf[n] = src[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
+}
+
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // Repair a bare `[]` before the C parser sees it (see repairBareList —
+    // the differential runner's rendered records carry the untypeable
+    // spelling).  parse_source wants a C string, so the repaired copy is
+    // dupeZ'd; the unrepaired fast path passes `src` straight through.
+    var nb: [512]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareList(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -196,7 +285,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, zsrc, null, &err);
     if (t == null) {
         std.debug.print("fx-cksum: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -230,76 +319,113 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.files_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.files_n);
+        for (opts.files[0..opts.files_n], 0..) |fv, ei| arr[ei] = try gpa.dupe(u8, fv);
         o.files = arr;
     }
     return o;
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-cksum: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .files = try files.toOwnedSlice(gpa) };
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "jsonParseOpts input string" {
+test "jsonParseOpts files array" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/tmp/f\"}", &buf) orelse
+    const o = jsonParseOpts("{\"files\":[\"/tmp/a\",\"/tmp/b\"]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    try std.testing.expectEqual(@as(usize, 2), o.files_n);
+    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
+    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
 }
 
-test "jsonParseOpts input null" {
+test "jsonParseOpts empty files array" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":null}", &buf) orelse
+    const o = jsonParseOpts("{\"files\":[]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqual(@as(usize, 0), o.files_n);
 }
 
-test "evalDhallArgs record with input" {
+test "repairBareList rewrites only a bare empty list" {
+    var nb: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{ files = [] : List Text }",
+        repairBareList(&nb, "{ files = [] }"),
+    );
+    // a non-empty list and list-adjacent bytes inside a Text literal pass through
+    const src2 = "{ files = [ \"][]\" ] }";
+    try std.testing.expectEqualStrings(src2, repairBareList(&nb, src2));
+}
+
+test "evalDhallArgs record with files" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = \"/tmp/f\" }", std.testing.allocator);
+    const o = try evalDhallArgs("{ files = [ \"/tmp/f\" ] }", std.testing.allocator);
     defer std.testing.allocator.free(o.files);
     defer std.testing.allocator.free(o.files[0]);
     try std.testing.expectEqual(@as(usize, 1), o.files.len);
     try std.testing.expectEqualStrings("/tmp/f", o.files[0]);
 }
 
-test "evalDhallArgs record None input (stdin)" {
+test "evalDhallArgs empty record (stdin)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
+    const o = try evalDhallArgs("{ }", std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), o.files.len);
 }
 
-test "parsePosixArgs zero files (stdin)" {
-    const o = try parsePosixArgs(&.{}, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), o.files.len);
+/// Locate schemas/cksum.dhall (tests run from varying CWDs).  Caller frees.
+fn cksumSchemaSrc() [:0]u8 {
+    return cli.readSchemaFile(std.testing.allocator, &.{ "schemas/cksum.dhall", "fx-core/schemas/cksum.dhall" }) catch
+        @panic("cannot locate schemas/cksum.dhall (run tests from the fx-core root)");
 }
 
-test "parsePosixArgs multiple files" {
-    const args = [_][:0]const u8{ "fx-cksum", "/tmp/a", "/tmp/b" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
-    defer std.testing.allocator.free(o.files[1]);
-    try std.testing.expectEqual(@as(usize, 2), o.files.len);
-    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
-    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
+/// One differential vector for fx-cksum — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the fx-ls/fx-rm template
+/// each migration copies): the generated parser, the schema candidates, and
+/// this file's real runtime record evaluator are the whole per-command
+/// surface.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_cksum, &.{ "schemas/cksum.dhall", "fx-core/schemas/cksum.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (files = [] — a legal
+    // checksum-stdin run)
+    try expectPosixEqualsRecord(&.{"fx-cksum"}, "{ }");
+    // operands in argv order
+    try expectPosixEqualsRecord(&.{ "fx-cksum", "a" }, "{ files = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-cksum", "a", "b", "c" }, "{ files = [ \"a\", \"b\", \"c\" ] }");
+    // a bare '-' is an operand, not a flag
+    try expectPosixEqualsRecord(&.{ "fx-cksum", "-" }, "{ files = [ \"-\" ] }");
+    // `--` ends flag parsing: what follows is a FILE operand
+    try expectPosixEqualsRecord(&.{ "fx-cksum", "--", "a" }, "{ files = [ \"a\" ] }");
+    // exotic operand bytes (the fx-ls SHOULD-FIX 3a vector class)
+    try expectPosixEqualsRecord(&.{ "fx-cksum", "a b.txt" }, "{ files = [ \"a b.txt\" ] }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (a
+    // failed parse exits the process); the arena reclaims them wholesale
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // cksum accepts NO flags at all: every "-..." token is an unknown option
+    // (the hand parser's posture, kept).  A bare "-" is an operand (above).
+    try std.testing.expectError(error.UnknownOption, cli_cksum.parsePosix(&.{ "fx-cksum", "-c" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_cksum.parsePosix(&.{ "fx-cksum", "--check" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_cksum.parsePosix(&.{ "fx-cksum", "-Zz" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field
+    // (the singular `input` key the OLD hand form read is gone from the
+    // schema), wrong field type.  The POSIX analogue of the first is -c
+    // above.
+    const schema_src = cksumSchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = \"/f\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ files = 5 }"));
 }
 
 // Known-answer tests: cksum('hi\n') = 1479881546, cksum('') = 4294967295.
@@ -345,7 +471,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        opts = try parsePosixArgs(args, opt_alloc);
+        // the GENERATED parser (schemas/cksum.dhall -> src/generated/cli_cksum.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
+        opts = try cli_cksum.parsePosix(args, opt_alloc);
     }
 
     const stdout_file = std.Io.File.stdout();

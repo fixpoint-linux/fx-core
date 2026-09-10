@@ -4,17 +4,23 @@
 // final (last) pathname component.  Pure libc + the dhall module for typed
 // args — no datalog / journal dependency.
 //
-// Two arg forms:
+// Two arg forms, ONE source of truth (schemas/basename.dhall — the STEP-3
+// migration template; the schema pins the SINGLE-NAME mode):
 //   fx-basename '{ input = "/a/b/c.txt", suffix = ".txt" }'   Dhall record
-//   fx-basename [-a] NAME [SUFFIX]                            POSIX fallback
-//   fx-basename -a NAME...                                    POSIX (all)
+//   fx-basename NAME [SUFFIX]                                 POSIX (the
+//       GENERATED parser, src/generated/cli_basename.zig; a third operand
+//       is error.UnexpectedOperand)
 //
-// - Dhall `input : Optional Text` = the path to strip; `suffix : Optional Text`
-//   = an optional SUFFIX to remove from the final component (single-name mode).
-// - POSIX single mode: NAME with an optional SUFFIX.  A suffix is only removed
-//   when the command has a single NAME operand (never with -a).
-// - POSIX `-a` mode: every operand is a NAME whose final component is printed
-//   (one per line); no suffix is applied.
+// - Dhall `input` = the path to strip; `suffix` = the optional SUFFIX removed
+//   from the final component (single-name mode).  The old `None Text`
+//   spellings are ill-typed against the schema's Text — omit the field.
+// - POSIX single mode: NAME with an optional SUFFIX.  A suffix is only
+//   removed when the command has a single NAME operand.
+// - POSIX `-a` mode: REMOVED from the record surface — the schema cannot
+//   express -a's mode-dependent operand routing (every operand a NAME, no
+//   suffix), so `all = True` in a record is rejected loudly at runtime; the
+//   POSIX -a spelling still parses (the flag field exists) and main()
+//   rejects it rather than silently mis-binding operands.
 //
 // Behavior (GNU-grounded, verified against host coreutils): trailing slashes
 // are stripped; the final path component is printed; `basename /a/b/c.txt .txt`
@@ -27,6 +33,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_basename = @import("cli-basename");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -40,17 +48,11 @@ const import_mod = dh.import_mod;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/basename.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // -a mode: every operand is a NAME whose final component is printed.
-    names: []const []const u8 = &.{},
-    all: bool = false,
-    // Single-name mode: the NAME and optional SUFFIX (suffix stripped only here).
-    name: ?[]const u8 = null,
-    suffix: ?[]const u8 = null,
-};
+const Options = cli_basename.Options;
+const parsePosixArgs = cli_basename.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     input: ?[]const u8 = null,
@@ -141,7 +143,36 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             _ = jsonParseBool(s, &i) orelse return null;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
-            i += 4;
+            i += 4; // None (Optional absent)
+        } else if (i < s.len and s[i] == '[') {
+            // a list value (e.g. the -a arm's `names`, which single mode
+            // never reads): skip the balanced brackets, elements and all
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '[') depth += 1;
+                if (s[i] == ']') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value (unread by single mode): skip it
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
         } else {
             return null;
         }
@@ -155,6 +186,23 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
+    // The record is checked against the schema's ty, spelled inline (single
+    // source of truth: schemas/basename.dhall; the differential test pins
+    // this copy to the schema — completeSrc re-checks the rendered record
+    // against the SCHEMA's ty).  The annotation is not decoration: the
+    // dhall subset cannot infer an EMPTY list literal (`names = []`, the
+    // default the differential's rendered records always carry) without a
+    // surrounding type (dhall-c typecheck ERR "cannot infer type of empty
+    // list").  It also makes the record form STRICTLY typed — unknown or
+    // ill-typed fields are rejected instead of silently ignored.
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ all : Bool, input : Text, names : List Text, suffix : Text }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
+
     const loader = import_mod.import_loader_new();
     defer import_mod.import_loader_free(loader);
 
@@ -162,7 +210,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-basename: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -196,42 +244,76 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| o.name = try gpa.dupe(u8, inp);
+    // single mode: input "" = missing NAME (main() errors), suffix "" = none
+    if (opts.input) |inp| o.input = try gpa.dupe(u8, inp);
     if (opts.suffix) |sf| o.suffix = try gpa.dupe(u8, sf);
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var names = std.ArrayList([]const u8).empty;
-    var all = false;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-a")) {
-            all = true;
-            continue;
-        }
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-basename: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try names.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (all) {
-        // -a mode: every operand is a NAME; no suffix.
-        return Options{ .names = try names.toOwnedSlice(gpa), .all = true };
-    }
-    // Single mode: NAME [SUFFIX] (at most two operands).  Take ownership of the
-    // already-duplicated operands and release the pointer array.
-    if (names.items.len > 2) {
-        std.debug.print("fx-basename: extra operand '{s}'\n", .{names.items[2]});
-        return error.TooManyOperands;
-    }
-    var o = Options{};
-    if (names.items.len >= 1) o.name = names.items[0];
-    if (names.items.len >= 2) o.suffix = names.items[1];
-    names.deinit(gpa);
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a two-positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/
+// basename.dhall -> src/generated/cli_basename.zig) must produce the SAME
+// Options as the Dhall record form of the same user intent, driven through
+// the shared runner (fx-cli.expectPosixEqualsRecord): schema completion,
+// renderDhallRecord, THIS file's evalDhallArgs, then a field-complete
+// encodeOptionsWire comparison of both sides.
+//
+// The schema pins the SINGLE-NAME mode (NAME [SUFFIX] positionals + the -a
+// flag field); the -a OPERAND-ROUTING arm (every operand a NAME, no suffix)
+// is a flag-shape misfit the v1 vocabulary cannot express (the schema note)
+// — so no equality vector carries -a, and the record form rejects all=True.
+
+/// One differential vector for fx-basename — a one-line wrapper over the
+/// SHARED generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3
+/// template each migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_basename, &.{ "schemas/basename.dhall", "fx-core/schemas/basename.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // single mode: NAME alone, NAME SUFFIX, and the -- terminator form
+    try expectPosixEqualsRecord(&.{ "fx-basename", "/a/b/c.txt" }, "{ input = \"/a/b/c.txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-basename", "/a/b/c.txt", ".txt" }, "{ input = \"/a/b/c.txt\", suffix = \".txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-basename", "--", "-a" }, "{ input = \"-a\" }");
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    try expectPosixEqualsRecord(&.{ "fx-basename", "a b.txt" }, "{ input = \"a b.txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-basename", "say \"hi\".txt", ".txt" }, "{ input = \"say \\\"hi\\\".txt\", suffix = \".txt\" }");
+    // a suffix that equals the whole name stays the default "" on the record
+    // side only when absent — never exercised here (GNU keeps the name when
+    // the suffix would empty it; that runtime rule is basenameOne's, tested
+    // above, and is orthogonal to the binding surface both forms share)
+    try expectPosixEqualsRecord(&.{ "fx-basename", "/a/b/c" }, "{ input = \"/a/b/c\", suffix = \"\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX single mode takes at most NAME SUFFIX — a third operand is
+    // error.UnexpectedOperand (the hand parser's error.TooManyOperands);
+    // unknown options are error.UnknownOption
+    try std.testing.expectError(error.UnknownOption, cli_basename.parsePosix(&.{ "fx-basename", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_basename.parsePosix(&.{ "fx-basename", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_basename.parsePosix(&.{ "fx-basename", "a", "b", "c" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the -a arm the schema cannot express (the
+    // runtime record evaluator rejects all=True / names below, in main's
+    // eyes; at the schema level the FIELDS exist, so pin their types)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/basename.dhall", "fx-core/schemas/basename.dhall" }) catch
+        @panic("cannot locate schemas/basename.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = 5 }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -310,26 +392,34 @@ test "jsonParseOpts input null suffix null" {
 }
 
 test "parsePosixArgs single name" {
-    const args = [_][:0]const u8{ "fx-basename", "/a/b/c.txt", ".txt" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.name.?);
-    defer std.testing.allocator.free(o.suffix.?);
-    try std.testing.expectEqualStrings("/a/b/c.txt", o.name.?);
-    try std.testing.expectEqualStrings(".txt", o.suffix.?);
+    // an arena: the generated parser does not free operand dupes bound before
+    // a failing token (a failed parse exits the process) — same discipline
+    // as the hand parser this replaced
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const o = try parsePosixArgs(&.{ "fx-basename", "/a/b/c.txt", ".txt" }, gpa);
+    try std.testing.expectEqualStrings("/a/b/c.txt", o.input);
+    try std.testing.expectEqualStrings(".txt", o.suffix);
     try std.testing.expect(!o.all);
 }
 
-test "parsePosixArgs -a all names" {
-    const args = [_][:0]const u8{ "fx-basename", "-a", "/a", "/b", "/c" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.names);
-    defer std.testing.allocator.free(o.names[0]);
-    defer std.testing.allocator.free(o.names[1]);
-    defer std.testing.allocator.free(o.names[2]);
+test "parsePosixArgs -a operand routing is NOT expressible (schema pins single mode)" {
+    // The generated parser binds the FIRST operand to `input` and a second
+    // to `suffix` REGARDLESS of -a, and rejects a third operand — the hand
+    // parser's operand-routing arm (with -a every operand is a NAME) is a
+    // documented flag-shape misfit (the schemas/basename.dhall note), so
+    // -a cannot carry NAME operands through the generated parser at all.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const o = try parsePosixArgs(&.{ "fx-basename", "-a", "/a", "/b" }, gpa);
     try std.testing.expect(o.all);
-    try std.testing.expectEqual(@as(usize, 3), o.names.len);
-    try std.testing.expectEqualStrings("/a", o.names[0]);
-    try std.testing.expectEqualStrings("/c", o.names[2]);
+    try std.testing.expectEqualStrings("/a", o.input);
+    try std.testing.expectEqualStrings("/b", o.suffix);
+    try std.testing.expectEqual(@as(usize, 0), o.names.len);
+    // and the multi-NAME form the hand parser served errors loudly:
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-basename", "-a", "/a", "/b", "/c" }, gpa));
 }
 
 // ---------------------------------------------------------------------------
@@ -344,27 +434,30 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/basename.dhall ->
+        // src/generated/cli_basename.zig); equality with the record form
+        // above is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
-    const stdout_file = std.Io.File.stdout();
-    if (opts.all) {
-        if (opts.names.len == 0) {
-            std.debug.print("fx-basename: missing operand\n", .{});
-            std.process.exit(1);
-        }
-        for (opts.names) |n| {
-            const r = finalComponent(n);
-            _ = std.Io.File.writeStreamingAll(stdout_file, init.io, r) catch return error.WriteFailed;
-            _ = std.Io.File.writeStreamingAll(stdout_file, init.io, "\n") catch return error.WriteFailed;
-        }
-        return;
+    // The schema pins SINGLE-NAME mode: the -a operand-routing arm is not
+    // expressible in the v1 schema vocabulary (schemas/basename.dhall note),
+    // so a record that sets all/names is rejected loudly instead of silently
+    // ignored (the same no-silent-noop rule fx-chmod/fx-chown apply to their
+    // grown record surfaces).
+    if (opts.all or opts.names.len > 0) {
+        std.debug.print("fx-basename: the Dhall record form does not support -a/all (single-name mode only)\n", .{});
+        std.process.exit(1);
     }
-    const name = opts.name orelse {
+
+    const stdout_file = std.Io.File.stdout();
+    const name = opts.input;
+    if (name.len == 0) {
         std.debug.print("fx-basename: missing operand\n", .{});
         std.process.exit(1);
-    };
-    const r = basenameOne(name, opts.suffix);
+    }
+    const suffix: ?[]const u8 = if (opts.suffix.len > 0) opts.suffix else null;
+    const r = basenameOne(name, suffix);
     _ = std.Io.File.writeStreamingAll(stdout_file, init.io, r) catch return error.WriteFailed;
     _ = std.Io.File.writeStreamingAll(stdout_file, init.io, "\n") catch return error.WriteFailed;
 }

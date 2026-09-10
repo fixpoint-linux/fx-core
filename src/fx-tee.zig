@@ -21,9 +21,19 @@
 // Divergences (deliberate scope cuts): no -i (ignore SIGINT), -p (diagnose
 // write errors on pipes), -e (exit on write error); Dhall single-file only,
 // multi-file via POSIX.  Files are created with mode 0644.
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_tee.zig,
+// emitted from schemas/tee.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Against the
+// hand parser it replaced: -a also has the --append long alias, short
+// clusters (-a) and -- are accepted, and operands collect into `files` in
+// argv order (the schema spells the struct's real `files : List Text` where
+// the old record form carried a single `path`).
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_tee = @import("cli-tee");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -48,16 +58,19 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/tee.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    files: []const []const u8 = &.{},
-    append: bool = false,
-};
+const Options = cli_tee.Options;
+const parsePosixArgs = cli_tee.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
+    // The schema renamed the record key to the struct's real `files : List
+    // Text` (schemas/tee.dhall ty comment; the old singular `path` spelled
+    // the one-file record-form limitation).  term_to_json renders the list
+    // as a JSON array of strings; the legacy singular string is still
+    // accepted so old one-file invocations keep working.
+    files: []const []const u8 = &.{},
     append: ?bool = null,
 };
 
@@ -123,10 +136,14 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
     return null;
 }
 
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
+    // file strings land here first (per-key scratch), then the WHOLE set is
+    // duped into the JsonOpts slice once parsing succeeded
+    var legacy: [64][]const u8 = undefined;
+    var files_n: usize = 0;
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
     while (true) {
@@ -135,11 +152,43 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
+            // legacy singular spelling (`path` in the pre-migration record
+            // form): a bare Text means files[0]
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
+            if (files_n == 0) {
+                if (off + val.len >= buf.len) return null;
+                legacy[0] = val;
+                files_n = 1;
             }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // `files : List Text` -> a JSON array of strings (term_to_json);
+            // elements are copied into `buf` at non-overlapping offsets
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (jsonExpect(s, &i, ']')) {
+                // empty list: files stays at its default
+            } else {
+                while (true) {
+                    if (files_n >= legacy.len) return null;
+                    if (i < s.len and s[i] == '"') {
+                        const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                        if (off + val.len >= buf.len) return null;
+                        legacy[files_n] = val;
+                        files_n += 1;
+                        off += val.len;
+                    } else {
+                        return null;
+                    }
+                    jsonSkipWs(s, &i);
+                    if (jsonExpect(s, &i, ',')) {
+                        jsonSkipWs(s, &i);
+                        continue;
+                    }
+                    if (jsonExpect(s, &i, ']')) break;
+                    return null;
+                }
+            }
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             const b = jsonParseBool(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "append")) res.append = b;
@@ -151,10 +200,61 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    if (files_n > 0) {
+        const dup = gpa.alloc([]const u8, files_n) catch return null;
+        for (legacy[0..files_n], 0..) |f, k| dup[k] = gpa.dupe(u8, f) catch return null;
+        res.files = dup;
+    }
     return res;
 }
 
+/// Bare `[]` (no element type) has the same problem as a bare `None`: the
+/// dhall-c grammar cannot infer the empty-list type from a record literal
+/// context, and fx-cli.renderDhallRecord emits the bare form for an empty
+/// List field (`{ files = [], ... }` from the schema default).  Repair the
+/// spelling at this command's record-form entry point: `[]` becomes
+/// `[] : List Text` (the schema's element type ascription; a bare `[ Text ]`
+/// would be a list CONTAINING the type, which term_to_json rejects).  The
+/// guard skips brackets inside string literals (a bracket adjacent to `"` or
+/// preceded by an ident char is content, not syntax).
+fn repairBareEmptyList(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "[]") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 2 <= src.len and src[i] == '[' and src[i + 1] == ']' and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 2 == src.len or !isIdentByte(src[i + 2])))
+        {
+            @memcpy(buf[n .. n + 14], "[] : List Text");
+            n += 14;
+            i += 2;
+        } else {
+            buf[n] = src[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
+}
+
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // Repair unparseable rendered-record spellings before the C parser sees
+    // them (see repairBareEmptyList / the du repairBareNone precedent).
+    // parse_source wants a C string, so the repaired copy is bufPrintZ'd;
+    // the unrepaired fast path passes `src` straight through.
+    var nb: [512]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareEmptyList(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -165,7 +265,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, zsrc, null, &err);
     if (t == null) {
         std.debug.print("fx-tee: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -193,65 +293,131 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-tee: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
 
     var o = Options{};
     if (opts.append orelse false) o.append = true;
-    if (opts.path) |path_val| {
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = try gpa.dupe(u8, path_val);
-        o.files = arr;
+    if (opts.files.len > 0) {
+        // jsonParseOpts already gpa-duped the strings and the slice
+        o.files = opts.files;
     }
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-a")) {
-            o.append = true;
-        } else if (a.len > 1 and a[0] == '-') {
-            std.debug.print("fx-tee: invalid option -- '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            try files.append(gpa, try gpa.dupe(u8, a));
-        }
-    }
-    o.files = try files.toOwnedSlice(gpa);
-    return o;
-}
-
-test "jsonParseOpts path + append" {
+test "jsonParseOpts files array + append" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"path\":\"/tmp/o\",\"append\":true}", &buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/tmp/o", o.path.?);
+    const o = jsonParseOpts("{\"files\":[\"/tmp/a\",\"/tmp/b\"],\"append\":true}", &buf, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer {
+        for (o.files) |f| std.testing.allocator.free(f);
+        std.testing.allocator.free(o.files);
+    }
+    try std.testing.expectEqual(@as(usize, 2), o.files.len);
+    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
+    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
     try std.testing.expectEqual(true, o.append.?);
 }
 
-test "evalDhallArgs record" {
+test "jsonParseOpts empty files list" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"files\":[],\"append\":false}", &buf, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), o.files.len);
+}
+
+test "evalDhallArgs record: files list + legacy path" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ path = \"/tmp/o\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
-    try std.testing.expectEqualStrings("/tmp/o", o.files[0]);
+    const o = try evalDhallArgs("{ files = [ \"/tmp/a\", \"/tmp/b\" ], append = True }", std.testing.allocator);
+    defer {
+        for (o.files) |f| std.testing.allocator.free(f);
+        std.testing.allocator.free(o.files);
+    }
+    try std.testing.expectEqual(@as(usize, 2), o.files.len);
+    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
+    try std.testing.expect(o.append);
+    // the legacy singular Text spelling still binds files[0]
+    const legacy = try evalDhallArgs("{ files = \"/tmp/o\" }", std.testing.allocator);
+    defer std.testing.allocator.free(legacy.files);
+    defer std.testing.allocator.free(legacy.files[0]);
+    try std.testing.expectEqualStrings("/tmp/o", legacy.files[0]);
+    try std.testing.expect(!legacy.append);
+}
+
+test "evalDhallArgs empty record keeps the stdout-only default" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ }", std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), o.files.len);
     try std.testing.expect(!o.append);
 }
 
-test "parsePosixArgs -a and files" {
-    const args = [_][:0]const u8{ "fx-tee", "-a", "/tmp/a", "/tmp/b" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
-    defer std.testing.allocator.free(o.files[1]);
-    try std.testing.expect(o.append);
-    try std.testing.expectEqual(@as(usize, 2), o.files.len);
-    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent (schema
+// completion -> renderDhallRecord -> THIS file's record evaluator), encoded
+// by the shared field-complete encoder and compared as strings.
+
+/// One differential vector for fx-tee — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_tee, &.{ "schemas/tee.dhall", "fx-core/schemas/tee.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: no flags, no files (stdout-only run) ---
+    try expectPosixEqualsRecord(&.{"fx-tee"}, "{ }");
+
+    // --- the flag, short / long / clustered, alone and with operands ---
+    try expectPosixEqualsRecord(&.{ "fx-tee", "-a" }, "{ append = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "--append" }, "{ append = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "-a", "/tmp/a" }, "{ files = [ \"/tmp/a\" ], append = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "/tmp/a", "-a" }, "{ files = [ \"/tmp/a\" ], append = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "-a", "/tmp/a", "/tmp/b" }, "{ files = [ \"/tmp/a\", \"/tmp/b\" ], append = True }");
+
+    // --- operands collect in argv order, flags interleave freely ---
+    try expectPosixEqualsRecord(&.{ "fx-tee", "/tmp/a", "/tmp/b" }, "{ files = [ \"/tmp/a\", \"/tmp/b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "/tmp/a", "-a", "/tmp/b" }, "{ files = [ \"/tmp/a\", \"/tmp/b\" ], append = True }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "-a", "-a", "/tmp/a" }, "{ files = [ \"/tmp/a\" ], append = True }"); // repeat idempotent
+
+    // --- `--` terminator: a later -a is a FILE operand ---
+    try expectPosixEqualsRecord(&.{ "fx-tee", "--", "-a" }, "{ files = [ \"-a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "-", "-a" }, "{ files = [ \"-\" ], append = True }"); // bare '-' operand
+
+    // --- exotic operand bytes: encoder-vs-escape parity both sides ---
+    try expectPosixEqualsRecord(&.{ "fx-tee", "a b.txt" }, "{ files = [ \"a b.txt\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-tee", "say \"hi\".txt" }, "{ files = [ \"say \\\"hi\\\".txt\" ] }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed; the
+    // arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option, short and long; a cluster with an unknown letter is an
+    // unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_tee.parsePosix(&.{ "fx-tee", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_tee.parsePosix(&.{ "fx-tee", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_tee.parsePosix(&.{ "fx-tee", "-aZ", "f" }, gpa));
+
+    // --long=value on a Flag-kind long (--append) is unknown — the = suffix
+    // does not split on Flag longs (schemas/README.md)
+    try std.testing.expectError(error.UnknownOption, cli_tee.parsePosix(&.{ "fx-tee", "--append=true" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, non-Text list element.  The POSIX form has no
+    // spelling that could reach any of these (its analogue is -x above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/tee.dhall", "fx-core/schemas/tee.dhall" }) catch
+        @panic("cannot locate schemas/tee.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ append = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ files = [ 1, 2 ] }"));
 }
 
 // ---------------------------------------------------------------------------

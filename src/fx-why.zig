@@ -23,11 +23,24 @@
 // stdout.  An unknown package — including a snapshot that predates the
 // install/provides relations, which read absent-as-empty — is a clean
 // miss with an fx-what hint, never a stack trace.
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_why.zig,
+// emitted from schemas/why.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Unlike the
+// other migrated commands, fx-why has NO Dhall-record arg form (no
+// evalDhallArgs): the hand parser was POSIX-only, so the migration swaps in
+// the generated parser and pins it with direct rejection/behavior tests
+// instead of the differential matrix.  Deliberate changes against the hand
+// parser: flags are long-only INLINE-VALUE (--as-of=N / --store=DIR; the
+// hand separate-token spelling is gone), a missing PKG is a runtime
+//BadArgs in main (the schema's "." placeholder default), and `--`-escaping
+// a leading-dash PKG is accepted.
 
 const std = @import("std");
 const prov = @import("provenance");
 const st = @import("store");
 const cl = @import("closure");
+const cli_why = @import("cli-why");
 
 /// Store root when --store is not given.  Same value as fxstore's
 /// DEFAULT_STORE_ROOT (main.zig, the cmd_query:430 precedent); fxstore's
@@ -36,48 +49,22 @@ const cl = @import("closure");
 const DEFAULT_STORE_ROOT = "/fx/store";
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/why.dhall).
+// NO Dhall-record arg form: fx-why was POSIX-only, so there is no
+// evalDhallArgs; the differential-matrix step of the standard migration does
+// not apply (the rejection/behavior pins below take its place).
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    /// Positional operand: the package name to explain.
-    operand: []const u8,
-    /// Snapshot version to query (null = engine `.current`).
-    as_of: ?u32 = null,
-    /// Store root override (null = DEFAULT_STORE_ROOT at query time).
-    store: ?[]const u8 = null,
-};
-
-const ParseError = error{ MissingOperand, MissingValue, BadAsOf, UnknownArg };
-
-fn parsePosixArgs(args: []const []const u8) ParseError!Options {
-    if (args.len < 2) return error.MissingOperand;
-    var opts = Options{ .operand = args[1] };
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--as-of")) {
-            i += 1;
-            if (i >= args.len) return error.MissingValue;
-            opts.as_of = std.fmt.parseInt(u32, args[i], 10) catch return error.BadAsOf;
-        } else if (std.mem.eql(u8, a, "--store")) {
-            i += 1;
-            if (i >= args.len) return error.MissingValue;
-            opts.store = args[i];
-        } else {
-            return error.UnknownArg;
-        }
-    }
-    return opts;
-}
+const Options = cli_why.Options;
+const parsePosixArgs = cli_why.parsePosix; // the generated POSIX parser
 
 fn usage() void {
     std.debug.print(
         "usage: fx-why PKG [--as-of N] [--store DIR]\n" ++
             "\n" ++
-            "  PKG         package name to explain\n" ++
-            "  --as-of N   query snapshot version N (default: newest published)\n" ++
-            "  --store DIR resolve store-relative origins against DIR\n",
+            "  PKG            package name to explain\n" ++
+            "  --as-of=N      query snapshot version N (default: newest published)\n" ++
+            "  --store=DIR    resolve store-relative origins against DIR\n",
         .{},
     );
 }
@@ -107,6 +94,10 @@ fn run(
     out: *std.ArrayList(u8),
     err_out: *std.ArrayList(u8),
 ) u8 {
+    if (opts.operand.len == 0) {
+        emitf(a, err_out, "fx-why: a package name is required\n", .{}) catch {};
+        return 1;
+    }
     const store_root = opts.store orelse DEFAULT_STORE_ROOT;
 
     var serr = st.ErrBuf{};
@@ -116,7 +107,7 @@ fn run(
     };
     defer st.fx_store_close(s);
 
-    const v: prov.Version = if (opts.as_of) |n| .{ .as_of = n } else .current;
+    const v: prov.Version = if (opts.as_of) |n| .{ .as_of = @intCast(n) } else .current;
 
     var e = prov.ProvErrBuf{};
     const r = prov.prov_why(st.fx_store_db(s), opts.operand, v, &e) catch {
@@ -147,13 +138,12 @@ fn run(
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const a = init.arena.allocator();
 
-    const opts = parsePosixArgs(args) catch {
+    const opts = parsePosixArgs(args, a) catch {
         usage();
         std.process.exit(2);
     };
-
-    const a = init.arena.allocator();
     var out = std.ArrayList(u8).empty;
     var err_out = std.ArrayList(u8).empty;
     const rc = run(init.io, a, opts, &out, &err_out);
@@ -169,25 +159,68 @@ pub fn main(init: std.process.Init) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parsePosixArgs: operand, --as-of and --store" {
-    const opts = try parsePosixArgs(&.{ "fx-why", "hello", "--as-of", "3", "--store", "/var/fx/store" });
-    try std.testing.expectEqualStrings("hello", opts.operand);
-    try std.testing.expectEqual(@as(u32, 3), opts.as_of.?);
-    try std.testing.expectEqualStrings("/var/fx/store", opts.store.?);
+// ---------------------------------------------------------------------------
+// PARSER PINS — fx-why has NO Dhall-record arg form (no evalDhallArgs), so
+// the standard differential matrix does not apply; the generated parser is
+// pinned directly instead (same rejection classes the other migrations pin).
+// ---------------------------------------------------------------------------
+
+test "parsePosix: operand + inline --as-of/--store, flags before operand" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+
+    const o = try parsePosixArgs(&.{ "fx-why", "hello", "--as-of=3", "--store=/var/fx/store" }, aa);
+    try std.testing.expectEqualStrings("hello", o.operand);
+    try std.testing.expectEqual(@as(u64, 3), o.as_of.?);
+    try std.testing.expectEqualStrings("/var/fx/store", o.store.?);
+
+    // flags may precede the operand; defaults stay null when absent
+    const p = try parsePosixArgs(&.{ "fx-why", "--store=/s", "world" }, aa);
+    try std.testing.expectEqualStrings("world", p.operand);
+    try std.testing.expect(p.as_of == null);
+    try std.testing.expectEqualStrings("/s", p.store.?);
+
+    // the schema's "." placeholder default: a bare invocation PARSES and the
+    // required-operand check happens at runtime (run(), tested below)
+    const d = try parsePosixArgs(&.{"fx-why"}, aa);
+    try std.testing.expectEqualStrings(".", d.operand);
+
+    // `--` ends flag parsing: a leading-dash PKG is accepted
+    const e = try parsePosixArgs(&.{ "fx-why", "--", "-weird" }, aa);
+    try std.testing.expectEqualStrings("-weird", e.operand);
 }
 
-test "parsePosixArgs: defaults, flags in any order" {
-    const opts = try parsePosixArgs(&.{ "fx-why", "world", "--store", "/s" });
-    try std.testing.expectEqualStrings("world", opts.operand);
-    try std.testing.expect(opts.as_of == null);
-    try std.testing.expectEqualStrings("/s", opts.store.?);
+test "parsePosix: rejections" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+
+    // unknown options: short, long, and the separate-token flag spelling the
+    // hand parser accepted (--as-of N is now --as-of=N only)
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "-x" }, aa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "--bogus" }, aa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "--as-of", "3" }, aa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-why", "hello", "--store", "/s" }, aa));
+
+    // a second operand overflows the single PKG slot (the hand parser took
+    // operand from args[1] and rejected the REST as UnknownArg)
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-why", "a", "b" }, aa));
+
+    // bad Natural in the inline value (the hand BadAsOf class)
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-why", "hello", "--as-of=x" }, aa));
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-why", "hello", "--as-of=-1" }, aa));
 }
 
-test "parsePosixArgs: usage errors" {
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&.{"fx-why"}));
-    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-why", "hello", "--store" }));
-    try std.testing.expectError(error.BadAsOf, parsePosixArgs(&.{ "fx-why", "hello", "--as-of", "-1" }));
-    try std.testing.expectError(error.UnknownArg, parsePosixArgs(&.{ "fx-why", "hello", "--bogus" }));
+test "run: empty operand is a clean runtime error (the placeholder default)" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var err_out = std.ArrayList(u8).empty;
+    defer err_out.deinit(std.testing.allocator);
+    const rc = run(std.testing.io, std.testing.allocator, .{ .operand = "" }, &out, &err_out);
+    try std.testing.expectEqual(@as(u8, 1), rc);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.items, "package name is required") != null);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "provenance engine module resolves across the repo boundary (U6 wiring)" {

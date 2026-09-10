@@ -1,9 +1,10 @@
 // fx-touch.zig — Dhall-typed touch coreutil over the global derivation log
 // (Option B; see concept.md).  Replaces the W1 stub.
 //
-// Two arg forms:
-//   fx-touch '{ path = "/tmp/f" }'                     Dhall record
-//   fx-touch FILE...                                   POSIX fallback
+// Two arg forms (both derived from schemas/touch.dhall — the fx-ls migration
+// template applied to the list-of-operands command):
+//   fx-touch '{ files = ["/tmp/f", "/tmp/g"] }'        Dhall record
+//   fx-touch FILE...                                   POSIX
 //
 // - missing  -> create an empty file (O_CREAT, 0666 & ~umask).
 // - existing -> utimensat(AT_FDCWD, path, NULL, 0): set BOTH times to now,
@@ -12,10 +13,20 @@
 // - effect: touch with the PRIOR mtime_s/ns + a `created` flag.
 // - touch always records (mtime is intentionally moved — its fixpoint is
 //   content-level; see DESIGN C / concept.md), so it ALWAYS logs.
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_touch.zig,
+// emitted from schemas/touch.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Deliberate
+// strengthening over the hand parser it replaced: an unknown option is
+// error.UnknownOption with a usage-shaped diagnostic naming the offending
+// token, and `--` ends flag parsing (a FILE named `-d` is spellable), where
+// the hand parser could only blanket-reject every -token.
 
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_touch = @import("cli-touch");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -55,15 +66,18 @@ extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 const TouchErr = error{ IsDir, OpenFailed, UtimeFailed, BadPath, NoMem };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/touch.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    files: []const []const u8 = &.{},
-};
+const Options = cli_touch.Options;
+const parsePosixArgs = cli_touch.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
+    // Fixed-capacity operand list decoded from the JSON array.  64 covers
+    // every differential and realistic invocation; a record with more
+    // elements than the capacity fails the decode (error.DhallFields).
+    files: [64][]const u8 = undefined,
+    files_n: usize = 0,
 };
 
 fn jsonSkipWs(s: []const u8, i: *usize) void {
@@ -113,6 +127,7 @@ fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     var i: usize = 0;
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
@@ -121,11 +136,37 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
-            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the key's list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "files")) {
+                        if (list_n >= res.files.len) return null; // over capacity
+                        res.files[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
             }
+        } else if (i < s.len and s[i] == '"') {
+            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
             off += val.len;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4;
@@ -135,6 +176,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.files_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
@@ -142,6 +184,14 @@ const DhallArgs = struct {
     opts: Options,
     args_json: []const u8,
 };
+
+/// Options-only core of evalDhallArgs — the differential runner's evalFn
+/// (`fn ([:0]const u8, Allocator) !Options`).  main() uses the full
+/// evalDhallArgs, which wraps this with the args_json sidecar the effect
+/// log needs.
+fn evalDhallOpts(src: [:0]const u8, gpa: Allocator) !Options {
+    return (try evalDhallArgs(src, gpa)).opts;
+}
 
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
@@ -190,27 +240,13 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     };
 
     var o = Options{};
-    if (opts.path) |pathv| {
-        const dup = try gpa.dupe(u8, pathv);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.files_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.files_n);
+        for (opts.files[0..opts.files_n], 0..) |sv, ei| arr[ei] = try gpa.dupe(u8, sv);
         o.files = arr;
     }
     return .{ .opts = o, .args_json = args_json };
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-touch: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .files = try files.toOwnedSlice(gpa) };
 }
 
 // ---------------------------------------------------------------------------
@@ -291,26 +327,104 @@ test "parsePosixArgs multiple files" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-touch", "a", "b" };
-    const o = try parsePosixArgs(&args, aa);
+    const o = try parsePosixArgs(&.{ "fx-touch", "a", "b" }, aa);
     try std.testing.expectEqual(@as(usize, 2), o.files.len);
     try std.testing.expectEqualStrings("a", o.files[0]);
     try std.testing.expectEqualStrings("b", o.files[1]);
 }
 
 test "parsePosixArgs unknown option errors" {
-    const args = [_][:0]const u8{ "fx-touch", "-m", "a" };
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-touch", "-m", "a" }, aa));
 }
 
-test "evalDhallArgs path" {
+test "evalDhallArgs files" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const d = try evalDhallArgs("{ path = \"/tmp/f\" }", aa);
-    try std.testing.expectEqual(@as(usize, 1), d.opts.files.len);
+    const d = try evalDhallArgs("{ files = [ \"/tmp/f\", \"/tmp/g\" ] }", aa);
+    try std.testing.expectEqual(@as(usize, 2), d.opts.files.len);
     try std.testing.expectEqualStrings("/tmp/f", d.opts.files[0]);
+    try std.testing.expectEqualStrings("/tmp/g", d.opts.files[1]);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/whoami template
+// applied to the list-of-operands command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-touch '{ ... }'` takes.  Both sides are re-encoded
+// with the SHARED comptime-reflection encoder (fx-cli.encodeOptionsWire) and
+// compared as strings, so the assertion is exact and field-complete by
+// construction.
+
+/// One differential vector — the shared generic runner (fx-cli.
+/// expectPosixEqualsRecord; see fx-ls.zig) with this command's plumbing.  The
+/// evalFn side here is evalDhallOpts (evalDhallArgs's Options-only core: the
+/// shared runner wants an `fn (...) !Options`, while the runtime main() wraps
+/// it with the args_json sidecar it needs for the effect log).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_touch, &.{ "schemas/touch.dhall", "fx-core/schemas/touch.dhall" }, evalDhallOpts, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // positional FILE operands accumulate in argv order
+    try expectPosixEqualsRecord(&.{ "fx-touch", "a" }, "{ files = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-touch", "a", "b" }, "{ files = [ \"a\", \"b\" ] }");
+    // bare '-' is an operand; '--' ends flags (then a leading-dash operand)
+    try expectPosixEqualsRecord(&.{ "fx-touch", "-" }, "{ files = [ \"-\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-touch", "--", "-d" }, "{ files = [ \"-d\" ] }");
+    // exotic operand bytes: the record side's renderDhallRecord escaping
+    // must round-trip the raw POSIX operand (see fx-ls.zig SHOULD-FIX 3a)
+    try expectPosixEqualsRecord(&.{ "fx-touch", "a b\"c" }, "{ files = [ \"a b\\\"c\" ] }");
+}
+
+test "DIFFERENTIAL: all-defaults equivalence (empty argv vs empty record)" {
+    // Pinned DIRECTLY (not via the shared runner): renderDhallRecord emits a
+    // bare "[]" for an empty List Text, which evalDhallArgs' plain infer_type
+    // cannot type ("cannot infer type of empty list") — a known fx-cli gap
+    // this batch is the first to hit (ls/whoami have no list field).  The
+    // runner matrix therefore covers non-empty records only, and the
+    // empty/default equivalence is asserted here through the SAME
+    // encodeOptionsWire encoder the runner compares with.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_touch.parsePosix(&.{"fx-touch"}, gpa);
+    const record_o = try evalDhallOpts("{ files = [] : List Text }", gpa);
+
+    var wire_posix = try cli.encodeOptionsWire(cli_touch.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try cli.encodeOptionsWire(cli_touch.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    try std.testing.expectEqualStrings(wire_record.items, wire_posix.items);
+}
+
+test "DIFFERENTIAL: rejection parity — the POSIX form rejects flags loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // touch has NO flags in this slice: any -token is unknown
+    try std.testing.expectError(error.UnknownOption, cli_touch.parsePosix(&.{ "fx-touch", "-m" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_touch.parsePosix(&.{ "fx-touch", "--date=now" }, gpa));
+    // the record form cannot express flags at all (SchemaCheck on typo)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/touch.dhall", "fx-core/schemas/touch.dhall" }) catch
+        @panic("cannot locate schemas/touch.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {

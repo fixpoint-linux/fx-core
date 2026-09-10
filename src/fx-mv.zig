@@ -2,9 +2,22 @@
 // (Option B; see concept.md "Option B — the global content-addressed derivation
 // log").  Replaces the W1 stub.
 //
-// Two arg forms:
+// Two arg forms, ONE source of truth (schemas/mv.dhall):
 //   fx-mv '{ src = "/a", dst = "/b" }'                    Dhall record
 //   fx-mv SRC DST                                         POSIX fallback
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_mv.zig,
+// emitted from schemas/mv.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  mv has NO
+// flags in v1 (no -f/-i/-n, documented scope cut; EXDEV is a clear error with
+// NO copy-fallback), so every "-..." token is error.UnknownOption.  src/dst
+// are Text with "" placeholder defaults (a single positional must bind a
+// plain Text field): the generated parser fills the two slots in order and
+// leaves the exactly-two count to the runtime check in main() below (the
+// ln/chown precedent) — one operand now PARSES (dst stays "") where the hand
+// parser errored BadArgs on any count != 2.  Equality of the two arg forms is
+// pinned field-for-field by the differential test below (the fx-ls/fx-ln
+// template).
 //
 // - src missing       -> no-op (divergence; GNU errors).
 // - src == dst string-equal -> no-op.
@@ -19,6 +32,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_mv = @import("cli-mv");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -54,13 +69,11 @@ extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 const MoveErr = error{ RenameFailed, BadPath, NoMem, OpenFailed, ReadFailed, NotEmpty };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/mv.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    src: ?[]const u8 = null,
-    dst: ?[]const u8 = null,
-};
+const Options = cli_mv.Options; // src/dst : Text, "" placeholder defaults
+const parsePosixArgs = cli_mv.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     src: ?[]const u8 = null,
@@ -202,22 +215,10 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     return .{ .opts = o, .args_json = args_json };
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var operands = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-mv: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try operands.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (operands.items.len != 2) {
-        std.debug.print("fx-mv: exactly SRC and DST required (got {d})\n", .{operands.items.len});
-        return error.BadArgs;
-    }
-    return Options{ .src = operands.items[0], .dst = operands.items[1] };
+/// evalFn adapter for the shared differential runner: main unwraps DhallArgs
+/// for args_json; the differential compares only the Options.
+fn evalDhallOpts(src: [:0]const u8, gpa: Allocator) !Options {
+    return (try evalDhallArgs(src, gpa)).opts;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,9 +319,9 @@ fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     out.append(gpa, '{') catch return error.NoMem;
     out.appendSlice(gpa, "\"src\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.src orelse "");
+    try caslog.jsonEscape(gpa, &out, o.src);
     out.appendSlice(gpa, ",\"dst\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.dst orelse "");
+    try caslog.jsonEscape(gpa, &out, o.dst);
     out.append(gpa, '}') catch return error.NoMem;
     return out.toOwnedSlice(gpa) catch return error.NoMem;
 }
@@ -335,24 +336,73 @@ fn getCwd(gpa: Allocator) []const u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parsePosixArgs SRC DST" {
-    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_i.deinit();
-    const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-mv", "/a", "/b" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqualStrings("/a", o.src.?);
-    try std.testing.expectEqualStrings("/b", o.dst.?);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/fx-ln template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent (schema
+// completion -> renderDhallRecord -> THIS file's record evaluator), encoded
+// by the shared field-complete encoder (fx-cli.encodeOptionsWire) and
+// compared as strings.
+
+/// One differential vector for fx-mv — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_mv, &.{ "schemas/mv.dhall", "fx-core/schemas/mv.dhall" }, evalDhallOpts, argv, user_record);
 }
 
-test "parsePosixArgs wrong operand count errors" {
-    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_i.deinit();
-    const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-mv", "/a" };
-    try std.testing.expectError(error.BadArgs, parsePosixArgs(&args, aa));
-    const three = [_][:0]const u8{ "fx-mv", "/a", "/b", "/c" };
-    try std.testing.expectError(error.BadArgs, parsePosixArgs(&three, aa));
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- the two positionals, in order and with a later flag-shaped
+    // operand (mv has no flags, so a "-..." token AFTER `--` is a plain
+    // operand) ---
+    try expectPosixEqualsRecord(&.{ "fx-mv", "/a", "/b" }, "{ src = \"/a\", dst = \"/b\" }");
+    try expectPosixEqualsRecord(&.{ "fx-mv", "--", "-f", "/b" }, "{ src = \"-f\", dst = \"/b\" }");
+
+    // --- empty argv: both stay at the schema's "" placeholder defaults
+    // (the exactly-two count is runtime, in main) ---
+    try expectPosixEqualsRecord(&.{"fx-mv"}, "{ }");
+
+    // --- exotic operand bytes: the record side's renderDhallRecord Dhall
+    // escaping must match the raw POSIX operands through the shared encoder
+    try expectPosixEqualsRecord(&.{ "fx-mv", "a b.txt", "say \"hi\".txt" }, "{ src = \"a b.txt\", dst = \"say \\\"hi\\\".txt\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed; the
+    // arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // mv has NO flags (schemas/mv.dhall flags = []): any option-ish token
+    // is UnknownOption — including the -f/-i spellings GNU resolves with
+    // (the deliberate v1 scope cut)
+    try std.testing.expectError(error.UnknownOption, cli_mv.parsePosix(&.{ "fx-mv", "-f", "/a", "/b" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_mv.parsePosix(&.{ "fx-mv", "-Zz", "/a", "/b" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_mv.parsePosix(&.{ "fx-mv", "--bogus" }, gpa));
+
+    // a THIRD operand overflows the two positional slots: UnexpectedOperand
+    // (the hand parser rejected any count != 2 as BadArgs; the generated
+    // parser fills both slots first and rejects only the overflow)
+    try std.testing.expectError(error.UnexpectedOperand, cli_mv.parsePosix(&.{ "fx-mv", "/a", "/b", "/c" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the OLD `src = None Text` spelling the hand
+    // layer accepted (against Text it is ill-typed — omit the field to
+    // keep the "" default).  The POSIX form has no spelling that could
+    // reach any of these (its analogue is -Zz above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/mv.dhall", "fx-core/schemas/mv.dhall" }) catch
+        @panic("cannot locate schemas/mv.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ src = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ src = None Text }"));
+
+    // MissingValue / BadValue: mv has NO Value flag and no numeric field,
+    // so both classes are unreachable on this command (the generator's
+    // behavior for them is pinned by schemas/meta_values.dhall).
 }
 
 test "evalDhallArgs src dst" {
@@ -361,8 +411,8 @@ test "evalDhallArgs src dst" {
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const d = try evalDhallArgs("{ src = \"/a\", dst = \"/b\" }", aa);
-    try std.testing.expectEqualStrings("/a", d.opts.src.?);
-    try std.testing.expectEqualStrings("/b", d.opts.dst.?);
+    try std.testing.expectEqualStrings("/a", d.opts.src);
+    try std.testing.expectEqualStrings("/b", d.opts.dst);
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {
@@ -548,14 +598,15 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    const src = opts.src orelse {
-        std.debug.print("fx-mv: missing SRC operand\n", .{});
+    // The schema pins src/dst as plain Text with "" placeholder defaults, so
+    // "missing operand" is the empty string (the exactly-two count is
+    // enforced here at runtime — the generated parser fills the slots).
+    if (opts.src.len == 0 or opts.dst.len == 0) {
+        std.debug.print("fx-mv: exactly SRC and DST required\n", .{});
         return error.BadArgs;
-    };
-    const dst = opts.dst orelse {
-        std.debug.print("fx-mv: missing DST operand\n", .{});
-        return error.BadArgs;
-    };
+    }
+    const src = opts.src;
+    const dst = opts.dst;
 
     const state_dir = caslog.resolveStateDir(aa) catch |e| {
         std.debug.print("fx-mv: cannot resolve state dir: {s}\n", .{@errorName(e)});

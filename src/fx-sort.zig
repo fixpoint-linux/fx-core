@@ -27,16 +27,28 @@
 //
 // Two arg forms:
 //   fx-sort '{ numeric = True, reverse = True, unique = True, input = "/tmp/f" }'  Dhall
-//   fx-sort [-n] [-r] [-u] [FILE]                                                   POSIX fallback
+//   fx-sort [-n] [-r] [-u] [FILE]                                                   POSIX
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_sort.zig,
+// emitted from schemas/sort.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Deliberate
+// strengthening over the hand parser it replaced: short clusters (-nr) and
+// the GNU long aliases --numeric-sort/--reverse/--unique are accepted, and a
+// second FILE operand is error.UnexpectedOperand (the hand parser silently
+// let the last one win).
 //
 // Dhall record: { numeric : Bool, reverse : Bool, unique : Bool,
-//                 input : Optional Text } with defaults all False / None.
+//                 input : Text } with defaults all False / "".
 // Input: stdin by default, or the single file `input` / FILE operand (read via
 // the raw extern read() loop on fd 0 / the opened fd — the proven fx-diff
-// idiom; there is no invented std.Io stdin wrapper).
+// idiom; there is no invented std.Io stdin wrapper).  "" (or the record form's
+// omitted field) = stdin: the old `?[]const u8 = null` None converges onto the
+// schema's "" placeholder default.
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_sort = @import("cli-sort");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -70,15 +82,11 @@ extern fn rmdir(path: [*:0]const u8) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/sort.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    numeric: bool = false,
-    reverse: bool = false,
-    unique: bool = false,
-    input: ?[]const u8 = null, // None => stdin
-};
+const Options = cli_sort.Options;
+const parsePosixArgs = cli_sort.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     numeric: bool = false,
@@ -86,6 +94,12 @@ const JsonOpts = struct {
     unique: bool = false,
     input: ?[]const u8 = null,
 };
+
+/// "" = stdin (the schema's placeholder default for the old `?[]const u8`
+/// None); anything else is the FILE path.
+fn stdinIfEmpty(input: []const u8) ?[]const u8 {
+    return if (input.len == 0) null else input;
+}
 
 // ---------------------------------------------------------------------------
 // Line splitting (copied verbatim from fx-diff's proven shape)
@@ -351,6 +365,96 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
+// The POSIX form is parsed by the GENERATED parser (cli_sort.parsePosix,
+// aliased to parsePosixArgs above; schemas/sort.dhall ->
+// src/generated/cli_sort.zig): clusters (-nr/-ru/...) and the GNU long
+// aliases bind, and a second FILE operand is error.UnexpectedOperand where
+// the hand parser silently kept the last one.
+
+// ---------------------------------------------------------------------------
+// The differential test — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion and evaluated by THIS file's evalDhallArgs (the exact
+// runtime path `fx-sort '{ ... }'` takes), via the SHARED runner
+// (fx-cli.expectPosixEqualsRecord).  stdin is "" on BOTH sides (the schema's
+// placeholder for the old Optional None), so the empty-argv and empty-record
+// vectors pin the convergence.
+
+/// One differential vector (the shared generic runner; see fx-ls.zig).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_sort, &.{ "schemas/sort.dhall", "fx-core/schemas/sort.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (stdin, no -n/-r/-u)
+    try expectPosixEqualsRecord(&.{"fx-sort"}, "{ }");
+    // each flag alone, short + GNU long alias
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-n" }, "{ numeric = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "--numeric-sort" }, "{ numeric = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-r" }, "{ reverse = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "--reverse" }, "{ reverse = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-u" }, "{ unique = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "--unique" }, "{ unique = True }");
+    // pairs and the full triple, mixed spellings
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-n", "-r" }, "{ numeric = True, reverse = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "--unique", "-r" }, "{ reverse = True, unique = True }");
+    // short clusters: every order of -n -r -u
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-nr" }, "{ numeric = True, reverse = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-rn" }, "{ numeric = True, reverse = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-nru" }, "{ numeric = True, reverse = True, unique = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-unr" }, "{ numeric = True, reverse = True, unique = True }");
+    // the old parsePosixArgs smoke: -n -r -u FILE
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-n", "-r", "-u", "/tmp/f" }, "{ input = \"/tmp/f\", numeric = True, reverse = True, unique = True }");
+    // single FILE operand (stdin convergence spelled explicitly both ways)
+    try expectPosixEqualsRecord(&.{ "fx-sort", "f.txt" }, "{ input = \"f.txt\" }");
+    try expectPosixEqualsRecord(&.{"fx-sort"}, "{ input = \"\" }");
+    // `--` ends flag parsing: a FILE that spells a flag; a '-' operand is a
+    // real FILE name, not stdin
+    try expectPosixEqualsRecord(&.{ "fx-sort", "--", "-n" }, "{ input = \"-n\" }");
+    try expectPosixEqualsRecord(&.{ "fx-sort", "-" }, "{ input = \"-\" }");
+    // operand-before-flag interleave (the generated parser accepts flags
+    // anywhere)
+    try expectPosixEqualsRecord(&.{ "fx-sort", "f.txt", "-n" }, "{ input = \"f.txt\", numeric = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; a cluster with an unknown letter (the hand parser
+    // rejected -x as unknown too — same class, now pre-cluster)
+    try std.testing.expectError(error.UnknownOption, cli_sort.parsePosix(&.{ "fx-sort", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_sort.parsePosix(&.{ "fx-sort", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_sort.parsePosix(&.{ "fx-sort", "-nA" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_sort.parsePosix(&.{ "fx-sort", "--bogus" }, gpa));
+    // a second FILE operand: the deliberate strengthening (the hand parser
+    // silently kept the LAST one; the generated parser rejects — the
+    // sort.dhall note verbatim).  The record form cannot express a second
+    // input at all.
+    try std.testing.expectError(error.UnexpectedOperand, cli_sort.parsePosix(&.{ "fx-sort", "a", "b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX analogue of the first is -Zz above.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/sort.dhall", "fx-core/schemas/sort.dhall" }) catch
+        @panic("cannot locate schemas/sort.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ numeric = 5 }"));
+}
+
+test "stdinIfEmpty: the placeholder converges onto the old None" {
+    try std.testing.expect(stdinIfEmpty("") == null);
+    try std.testing.expectEqualStrings("f.txt", stdinIfEmpty("f.txt").?);
+}
+
 test "jsonParseOpts full record all fields" {
     var buf: [1024]u8 = undefined;
     const o = jsonParseOpts("{\"numeric\":true,\"reverse\":true,\"unique\":true,\"input\":\"/tmp/f\"}", &buf) orelse
@@ -377,73 +481,33 @@ test "evalDhallArgs record with all three flags" {
     try std.testing.expect(o.numeric);
     try std.testing.expect(o.reverse);
     try std.testing.expect(o.unique);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqualStrings("", o.input); // stdin placeholder
 }
 
 test "evalDhallArgs record with input" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ input = \"/tmp/f\", numeric = True }", std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
+    defer std.testing.allocator.free(o.input);
     try std.testing.expect(o.numeric);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
-test "evalDhallArgs None input (stdin)" {
+test "evalDhallArgs input omitted (stdin placeholder)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    const o = try evalDhallArgs("{ numeric = True }", std.testing.allocator);
+    try std.testing.expectEqualStrings("", o.input);
+}
+
+test "evalDhallArgs empty input string (stdin)" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    // The OLD Optional spelling (`input = None Text`) is ill-typed against the
+    // schema's plain Text (the sort.dhall divergence note verbatim); the
+    // placeholder "" is the stdin spelling now.
+    const o = try evalDhallArgs("{ input = \"\" }", std.testing.allocator);
+    try std.testing.expectEqualStrings("", o.input);
     try std.testing.expect(!o.numeric);
     try std.testing.expect(!o.reverse);
     try std.testing.expect(!o.unique);
-}
-
-// ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
-// ---------------------------------------------------------------------------
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-n")) {
-            o.numeric = true;
-        } else if (std.mem.eql(u8, a, "-r")) {
-            o.reverse = true;
-        } else if (std.mem.eql(u8, a, "-u")) {
-            o.unique = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-sort: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            // Single FILE operand (last one wins, like fx-ls's path).
-            o.input = try gpa.dupe(u8, a);
-        }
-    }
-    return o;
-}
-
-test "parsePosixArgs defaults" {
-    const o = try parsePosixArgs(&.{"fx-sort"}, std.testing.allocator);
-    try std.testing.expect(!o.numeric);
-    try std.testing.expect(!o.reverse);
-    try std.testing.expect(!o.unique);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
-}
-
-test "parsePosixArgs n r u file" {
-    const args = [_][:0]const u8{ "fx-sort", "-n", "-r", "-u", "/tmp/f" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expect(o.numeric);
-    try std.testing.expect(o.reverse);
-    try std.testing.expect(o.unique);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
-}
-
-test "parsePosixArgs unknown option rejected" {
-    const args = [_][:0]const u8{"fx-sort", "-x"};
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
 }
 
 // ---------------------------------------------------------------------------
@@ -770,10 +834,13 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/sort.dhall -> src/generated/cli_sort.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
-    const content = try readInput(gpa, opts.input);
+    const content = try readInput(gpa, stdinIfEmpty(opts.input));
     defer gpa.free(content);
 
     var rows = try sortContent(gpa, opts, content);

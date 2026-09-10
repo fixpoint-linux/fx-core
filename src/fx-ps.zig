@@ -45,10 +45,19 @@
 // '{ pid : Natural, state : Text, ppid : Natural, cpu : Natural,
 //    rss_kb : Natural, comm : Text }' — one canonical JSON object per line,
 // LF-terminated, keys in DECLARED order.
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_ps.zig,
+// emitted from schemas/ps.dhall; `zig build gen-cli-check` gates the regen).
+// Deliberate strengthening over the hand parser it replaced: -c and -m
+// together are error.Conflict in any spelling (the hand parser silently let
+// the last flag win), short clusters are accepted, and an operand is
+// error.UnexpectedOperand even after `--`.
 
 const std = @import("std");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
+const cli_ps = @import("cli-ps");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -81,15 +90,12 @@ const SC_PAGESIZE: c_int = 30;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/ps.dhall)
 // ---------------------------------------------------------------------------
 
-const SortTag = enum { Pid, Cpu, Mem }; // Dhall < Pid | Cpu | Mem >
-
-const Options = struct {
-    sort: SortTag = .Pid,
-    rows: bool = false, // --rows: canonical wire rows instead of display text
-};
+const SortTag = cli_ps.sort; // Dhall < Pid | Cpu | Mem >
+const Options = cli_ps.Options;
+const parsePosixArgs = cli_ps.parsePosix; // the generated POSIX parser
 
 /// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
 /// registry's builtin("ps") output type — the declared order pins the
@@ -795,48 +801,100 @@ test "evalDhallArgs unknown sort alt rejected" {
 }
 
 // ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
 // ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent ((dflt //
+// user) : ty via fx-cli.completeSrc, rendered back to a record literal and
+// evaluated by THIS file's evalDhallArgs — the exact runtime path
+// `fx-ps '{ ... }'` takes).  Both sides are re-encoded to the canonical
+// term_to_json wire shape (the SHARED comptime-reflection encoder
+// fx-cli.encodeOptionsWire) and compared as strings, so the assertion is
+// exact and FIELD-COMPLETE by construction.
+//
+// The comparison target is the DHALL-RECORD semantics, never the deleted hand
+// parser's behavior where they differ: the generated parser is deliberately
+// stricter on -c -m (error.Conflict — the ls -S/-t precedent, schemas/ps.dhall
+// mutually_exclusive), so no equality vector carries that combination.
 
-fn parsePosixArgs(args: []const [:0]const u8) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-c")) {
-            o.sort = .Cpu;
-        } else if (std.mem.eql(u8, a, "-m")) {
-            o.sort = .Mem;
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-ps: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            // ps takes no operands (bare = all processes).
-            std.debug.print("fx-ps: unexpected operand '{s}'\n", .{a});
-            return error.UnexpectedOperand;
-        }
-    }
-    return o;
+/// One differential vector for fx-ps — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_ps, &.{ "schemas/ps.dhall", "fx-core/schemas/ps.dhall" }, evalDhallArgs, argv, user_record);
 }
 
-test "parsePosixArgs defaults + sorts + rows" {
-    const o = try parsePosixArgs(&.{"fx-ps"});
-    try std.testing.expectEqual(@as(SortTag, .Pid), o.sort);
-    try std.testing.expect(!o.rows);
-    const c = try parsePosixArgs(&.{ "fx-ps", "-c" });
-    try std.testing.expectEqual(@as(SortTag, .Cpu), c.sort);
-    const m = try parsePosixArgs(&.{ "fx-ps", "-m" });
-    try std.testing.expectEqual(@as(SortTag, .Mem), m.sort);
-    const r = try parsePosixArgs(&.{ "fx-ps", "--rows", "-m" });
-    try std.testing.expect(r.rows);
-    try std.testing.expectEqual(@as(SortTag, .Mem), r.sort);
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: Pid order, no rows (the empty record) ---
+    try expectPosixEqualsRecord(&.{ "fx-ps" }, "{ }");
+
+    // --- the sort union-selector flags: every alternative round-trips.
+    // Pid is the DEFAULT — it has no POSIX spelling, so it is pinned by the
+    // empty-argv vector and the explicit-record vector below. ---
+    try expectPosixEqualsRecord(&.{ "fx-ps", "-c" }, "{ sort = < Pid | Cpu | Mem >.Cpu }");
+    try expectPosixEqualsRecord(&.{ "fx-ps", "-m" }, "{ sort = < Pid | Cpu | Mem >.Mem }");
+    try expectPosixEqualsRecord(&.{ "fx-ps" }, "{ sort = < Pid | Cpu | Mem >.Pid }");
+
+    // --- --rows (the Lens-3 dispatch flag) alone and composed ---
+    try expectPosixEqualsRecord(&.{ "fx-ps", "--rows" }, "{ rows = True }");
+    try expectPosixEqualsRecord(&.{ "fx-ps", "--rows", "-m" }, "{ sort = < Pid | Cpu | Mem >.Mem, rows = True }");
+
+    // --- short-flag clustering: -cm is the only 2-flag cluster and it is
+    // the -c -m Conflict (asserted below); a same-flag cluster re-selects ---
+    try expectPosixEqualsRecord(&.{ "fx-ps", "-cc" }, "{ sort = < Pid | Cpu | Mem >.Cpu }");
+
+    // --- duplicate-flag idempotence: a repeated flag re-binds the same
+    // value (NOT a Conflict; only the -c -m pair is) ---
+    try expectPosixEqualsRecord(&.{ "fx-ps", "-m", "-m" }, "{ sort = < Pid | Cpu | Mem >.Mem }");
 }
 
-test "parsePosixArgs rejects unknown flags and operands" {
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-ps", "-x" }));
-    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-ps", "1234" }));
+test "DIFFERENTIAL: -c with -m is error.Conflict in BOTH orders (not last-wins)" {
+    // The deliberate, schema-pinned strengthening (schemas/ps.dhall
+    // mutually_exclusive = [["-c","-m"]]): the hand parser silently let the
+    // last flag win; the generated parser rejects the combination.  The
+    // Dhall-record form cannot express the conflict at all (it names `sort`
+    // exactly once) — which is why the equality matrix above contains no
+    // such vector, and the assertion here runs against the generated parser
+    // directly.
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.Conflict, cli_ps.parsePosix(&.{ "fx-ps", "-c", "-m" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_ps.parsePosix(&.{ "fx-ps", "-m", "-c" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_ps.parsePosix(&.{ "fx-ps", "-cm" }, gpa));
+    try std.testing.expectError(error.Conflict, cli_ps.parsePosix(&.{ "fx-ps", "-mc" }, gpa));
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option (POSIX) ~ unknown field (record form, below)
+    try std.testing.expectError(error.UnknownOption, cli_ps.parsePosix(&.{ "fx-ps", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_ps.parsePosix(&.{ "fx-ps", "--bogus" }, gpa));
+
+    // --rows takes no value: the = suffix does not split on a Flag kind
+    try std.testing.expectError(error.UnknownOption, cli_ps.parsePosix(&.{ "fx-ps", "--rows=true" }, gpa));
+
+    // ps takes NO operands (bare = all processes): any operand, before or
+    // after --, is UnexpectedOperand (the record form cannot express one)
+    try std.testing.expectError(error.UnexpectedOperand, cli_ps.parsePosix(&.{ "fx-ps", "1234" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_ps.parsePosix(&.{ "fx-ps", "--", "1234" }, gpa));
+
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_ps.parsePosix(&.{ "fx-ps", "-cZ" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, bogus union constructor
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/ps.dhall", "fx-core/schemas/ps.dhall" }) catch
+        @panic("cannot locate schemas/ps.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ rows = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ sort = < Pid | Cpu | Mem >.Foo }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -851,7 +909,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], init.arena.allocator());
     } else {
-        opts = try parsePosixArgs(args);
+        // the GENERATED parser (schemas/ps.dhall -> src/generated/cli_ps.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
+        opts = try parsePosixArgs(args, init.arena.allocator());
     }
 
     // Unique transient db dir (mkdtemp, mirrors fx-ls/fx-find — getpid is

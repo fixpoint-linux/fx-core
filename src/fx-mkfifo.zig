@@ -2,15 +2,29 @@
 // concept.md).  Creates FIFOs via mkfifo(2), recording a `.mkfifo` effect whose
 // fx-undo inverse UNLINKS the created fifo.
 //
-// Two arg forms:
-//   fx-mkfifo '{ path = "/p", mode = Some "600" }'     Dhall record
-//   fx-mkfifo [-m MODE] NAME...                        POSIX fallback
+// Two arg forms (both derived from schemas/mkfifo.dhall — the fx-ls migration
+// template applied to the flagged-operand command):
+//   fx-mkfifo '{ paths = ["/p"], mode = Some "600" }'  Dhall record
+//   fx-mkfifo [-m MODE | --mode=MODE] NAME...          POSIX
 //
 // Semantics (GNU-grounded):
 //   - default mode 0666 & ~umask (the kernel applies umask to the 0666 we pass).
 //   - `-m MODE` : octal mode bits passed straight to mkfifo(2) (umask still
-//     applies, matching GNU's chmod-style interpretation).
+//     applies, matching GNU's chmod-style interpretation).  The mode travels
+//     as its OCTAL TEXT in both arg forms (the schema deliberately carries
+//     Optional Text so "0666" is never misread as decimal 666) and is
+//     radix-8-parsed by parseMode once, in main(), after the arg forms
+//     converge.
 //   - multi-NAME via POSIX only (each NAME becomes one FIFO).
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_mkfifo.zig,
+// emitted from schemas/mkfifo.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Accepted-
+// spelling delta (deliberate, documented in the schema): `-m MODE` and
+// `--mode=MODE` are accepted; `-m600` (attached short) was hand-parser-only
+// and is NOT representable in the v1 flag vocabulary (a Value short never
+// clusters).  Also strengthened: `--` ends flag parsing (a NAME spelled
+// `-weird` is reachable).
 //
 // effect {op=.mkfifo, path, kind=.file, mode=<requested mode bits>}.  Undo
 // (fx-undo .mkfifo) unlinks the fifo.
@@ -24,6 +38,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_mkfifo = @import("cli-mkfifo");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -62,18 +78,21 @@ const MkfifoErr = error{
 };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/mkfifo.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Parsed octal mode.  `null` => default 0666 (kernel applies umask).
-    mode: ?u32 = null,
-    paths: []const []const u8 = &.{},
-};
+const Options = cli_mkfifo.Options;
+const parsePosixArgs = cli_mkfifo.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
+    // The mode travels as its octal TEXT (schema Optional Text — see the
+    // file header); main() radix-8-parses it via parseMode.
     mode: ?[]const u8 = null,
+    // Fixed-capacity operand list decoded from the JSON array.  64 covers
+    // every differential and realistic invocation; a record with more
+    // elements than the capacity fails the decode (error.DhallFields).
+    paths: [64][]const u8 = undefined,
+    paths_n: usize = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -128,6 +147,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
+    var list_n: usize = 0; // index into res.paths for a JSON string array
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
     while (true) {
@@ -135,12 +155,43 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the key's list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "paths")) {
+                        if (list_n >= res.paths.len) return null; // over capacity
+                        res.paths[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
+            }
+        } else if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
-            } else if (std.mem.eql(u8, key, "mode")) {
+            if (std.mem.eql(u8, key, "mode")) {
                 res.mode = val;
+            } else if (std.mem.eql(u8, key, "path")) {
+                // canonical singular alias rendered by renderDhallRecord for
+                // the many positional's first element (see evalDhallArgs)
+                if (res.paths_n == 0) res.paths[0] = val;
             }
             off += val.len;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
@@ -151,6 +202,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.paths_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
@@ -199,47 +251,15 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.path) |v| o.paths = try std.mem.Allocator.dupe(gpa, []const u8, &.{try gpa.dupe(u8, v)});
-    if (opts.mode) |m| {
-        o.mode = parseMode(m) orelse {
-            std.debug.print("fx-mkfifo: invalid mode '{s}'\n", .{m});
-            return error.BadMode;
-        };
+    if (opts.paths_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.paths_n);
+        for (opts.paths[0..opts.paths_n], 0..) |sv, ei| arr[ei] = try gpa.dupe(u8, sv);
+        o.paths = arr;
     }
-    return o;
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var paths = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-m")) {
-            if (i + 1 >= args.len) return error.BadMode;
-            i += 1;
-            o.mode = parseMode(args[i]) orelse {
-                std.debug.print("fx-mkfifo: invalid mode '{s}'\n", .{args[i]});
-                return error.BadMode;
-            };
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and std.mem.eql(u8, a[1..2], "m")) {
-            o.mode = parseMode(a[2..]) orelse {
-                std.debug.print("fx-mkfifo: invalid mode '{s}'\n", .{a[2..]});
-                return error.BadMode;
-            };
-            continue;
-        } else if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-mkfifo: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try paths.append(gpa, try gpa.dupe(u8, a));
-    }
-    o.paths = try paths.toOwnedSlice(gpa);
-    if (o.paths.len == 0) {
-        std.debug.print("fx-mkfifo: missing operand\n", .{});
-        return error.MissingOperand;
-    }
+    // octal TEXT, dupe the bytes (decoded slices point into the freed scratch buf);
+    // main() validates via parseMode
+    o.mode = if (opts.mode) |mv| try gpa.dupe(u8, mv) else null;
     return o;
 }
 
@@ -277,13 +297,13 @@ fn mkfifoOne(gpa: Allocator, path: []const u8, mode: ?u32, effects: *std.ArrayLi
     }) catch return error.NoMem;
 }
 
-fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
+fn posixArgsJson(gpa: Allocator, o: Options, mode_bits: ?u32) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     out.append(gpa, '{') catch return error.NoMem;
     out.appendSlice(gpa, "\"path\":") catch return error.NoMem;
     try caslog.jsonEscape(gpa, &out, if (o.paths.len > 0) o.paths[0] else "");
     out.appendSlice(gpa, ",\"mode\":") catch return error.NoMem;
-    if (o.mode) |m| {
+    if (mode_bits) |m| {
         const s = std.fmt.allocPrint(gpa, "{o}", .{m}) catch return error.NoMem;
         defer gpa.free(s);
         try caslog.jsonEscape(gpa, &out, s);
@@ -313,36 +333,154 @@ test "parseMode octal" {
     try std.testing.expect(parseMode("6a0") == null);
 }
 
-test "parsePosixArgs single + multi NAME, -m mode" {
+test "parsePosixArgs -m/--mode bind octal text" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-mkfifo", "-m", "600", "a", "b" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqual(@as(?u32, 0o600), o.mode);
+    const o = try parsePosixArgs(&.{ "fx-mkfifo", "-m", "600", "a", "b" }, aa);
+    try std.testing.expectEqualStrings("600", o.mode.?);
     try std.testing.expectEqual(@as(usize, 2), o.paths.len);
     try std.testing.expectEqualStrings("b", o.paths[1]);
+    const o2 = try parsePosixArgs(&.{ "fx-mkfifo", "--mode=0755", "c" }, aa);
+    try std.testing.expectEqualStrings("0755", o2.mode.?);
+    try std.testing.expectEqualStrings("c", o2.paths[0]);
 }
 
-test "parsePosixArgs missing operand errors" {
+test "parsePosixArgs missing operand + bad mode text" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{"fx-mkfifo"};
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&args, aa));
-    const badmode = [_][:0]const u8{ "fx-mkfifo", "-m", "9", "a" };
-    try std.testing.expectError(error.BadMode, parsePosixArgs(&badmode, aa));
+    // the generated parser no longer requires an operand (the schema dflt
+    // stands); the missing-operand check moved to main() alongside the
+    // BadMode check (both forms converge on octal text)
+    const o = try parsePosixArgs(&.{"fx-mkfifo"}, aa);
+    try std.testing.expectEqual(@as(usize, 0), o.paths.len);
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-mkfifo", "-m" }, aa));
+    try std.testing.expect(parseMode("9") == null); // the BadMode class
 }
 
-test "evalDhallArgs path + mode" {
+test "evalDhallArgs paths + mode text" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ path = \"/p\", mode = Some \"644\" }", aa);
+    const o = try evalDhallArgs("{ paths = [ \"/p\" ], mode = Some \"644\" }", aa);
     try std.testing.expectEqual(@as(usize, 1), o.paths.len);
     try std.testing.expectEqualStrings("/p", o.paths[0]);
-    try std.testing.expectEqual(@as(?u32, 0o644), o.mode);
+    try std.testing.expectEqualStrings("644", o.mode.?);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/whoami template
+// applied to the flagged-operand command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-mkfifo '{ ... }'` takes.  Both sides are re-encoded
+// with the SHARED comptime-reflection encoder (fx-cli.encodeOptionsWire) and
+// compared as strings, so the assertion is exact and field-complete by
+// construction.  NOTE the mode is pinned in its OCTAL-TEXT form (schema
+// Optional Text) — the "0666 means octal" hazard is what the differential
+// pins, before main() radix-8-parses it.
+
+/// One differential vector — the shared generic runner (fx-cli.
+/// expectPosixEqualsRecord; see fx-ls.zig) with this command's plumbing.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_mkfifo, &.{ "schemas/mkfifo.dhall", "fx-core/schemas/mkfifo.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // Canonical ty field order (mode, paths); mode is pinned in its OCTAL-TEXT
+    // form (schema Optional Text) — the "0666 means octal" hazard is what the
+    // differential pins, before main() radix-8-parses it.  Every record is
+    // fully specified: renderDhallRecord emits bare None for an unset mode,
+    // which evalDhallArgs' plain infer_type cannot type (a known fx-cli gap
+    // this batch is the first to hit) — the unset-mode vectors live in the
+    // direct all-defaults equivalence test below.
+    // the -m flag: separate-token form (a Value short never clusters)
+    // NOTE: vectors below always give NON-EMPTY paths — the shared runner
+    // round-trips through renderDhallRecord, which emits a bare "[]" for an
+    // empty List Text that evalDhallArgs' infer_type cannot type (known
+    // fx-cli gap).  The empty/default case is pinned directly in the
+    // all-defaults anchor test below (the fx-touch/fx-sum precedent).
+    try expectPosixEqualsRecord(&.{ "fx-mkfifo", "-m", "600", "/p" }, "{ mode = Some \"600\", paths = [ \"/p\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-mkfifo", "-m", "600", "/p1", "/p2" }, "{ mode = Some \"600\", paths = [ \"/p1\", \"/p2\" ] }");
+    // the long spelling: --mode=MODE
+    try expectPosixEqualsRecord(&.{ "fx-mkfifo", "--mode=644", "/p" }, "{ mode = Some \"644\", paths = [ \"/p\" ] }");
+    // '--' ends flags (then a leading-dash operand)
+    try expectPosixEqualsRecord(&.{ "fx-mkfifo", "-m", "600", "--", "-p" }, "{ mode = Some \"600\", paths = [ \"-p\" ] }");
+    // exotic operand bytes: the record side's renderDhallRecord escaping
+    // must round-trip the raw POSIX operand (see fx-ls.zig SHOULD-FIX 3a)
+    try expectPosixEqualsRecord(&.{ "fx-mkfifo", "--mode=0755", "a b\"c" }, "{ mode = Some \"0755\", paths = [ \"a b\\\"c\" ] }");
+}
+
+test "DIFFERENTIAL: all-defaults equivalence + unset-mode (empty argv vs empty record)" {
+    // Pinned DIRECTLY (not via the shared runner): renderDhallRecord emits a
+    // bare "[]" / bare None for empty List Text / None Text, which
+    // evalDhallArgs' plain infer_type cannot type ("cannot infer type of
+    // empty list" / untyped None) — a known fx-cli gap this batch is the
+    // first to hit (ls/whoami have no list/Optional field).  The runner
+    // matrix therefore covers Some-mode records only, and the
+    // empty/default (and None-mode) equivalence is asserted here through the
+    // SAME encodeOptionsWire encoder the runner compares with.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // all defaults: empty argv vs the annotated empty record
+    const posix_o = try cli_mkfifo.parsePosix(&.{"fx-mkfifo"}, gpa);
+    const record_o = try evalDhallArgs("{ mode = None Text, paths = [] : List Text }", gpa);
+
+    var wire_posix = try cli.encodeOptionsWire(cli_mkfifo.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try cli.encodeOptionsWire(cli_mkfifo.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    try std.testing.expectEqualStrings(wire_record.items, wire_posix.items);
+
+    // a mode WITHOUT operands on the POSIX side equals the record
+    // mode-Some-empty-paths (both bind mode, paths stays at the dflt)
+    const posix_m = try cli_mkfifo.parsePosix(&.{ "fx-mkfifo", "-m", "600" }, gpa);
+    const record_m = try evalDhallArgs("{ mode = Some \"600\", paths = [] : List Text }", gpa);
+    var wire_posix_m = try cli.encodeOptionsWire(cli_mkfifo.Options, gpa, posix_m);
+    defer wire_posix_m.deinit(gpa);
+    var wire_record_m = try cli.encodeOptionsWire(cli_mkfifo.Options, gpa, record_m);
+    defer wire_record_m.deinit(gpa);
+    try std.testing.expectEqualStrings(wire_record_m.items, wire_posix_m.items);
+}
+
+test "DIFFERENTIAL: rejection parity — flag/value errors fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option, in both spellings
+    try std.testing.expectError(error.UnknownOption, cli_mkfifo.parsePosix(&.{ "fx-mkfifo", "-Z" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_mkfifo.parsePosix(&.{ "fx-mkfifo", "--bogus=1" }, gpa));
+    // -m without a value
+    try std.testing.expectError(error.MissingValue, cli_mkfifo.parsePosix(&.{ "fx-mkfifo", "-m" }, gpa));
+    // the attached-short spelling the hand parser accepted is GONE by
+    // design (a Value short never clusters, schemas/mkfifo.dhall): -m600
+    // is now an unknown option
+    try std.testing.expectError(error.UnknownOption, cli_mkfifo.parsePosix(&.{ "fx-mkfifo", "-m600", "/p" }, gpa));
+    // a bad mode is NOT a parse error any more (the parser carries the
+    // octal text verbatim); main() rejects it via parseMode — BadMode is
+    // the convergence-point check now
+    const ok = try cli_mkfifo.parsePosix(&.{ "fx-mkfifo", "-m", "9", "/p" }, gpa);
+    try std.testing.expectEqualStrings("9", ok.mode.?);
+    try std.testing.expect(parseMode(ok.mode.?) == null);
+    // the record form's own rejections: unknown field, non-text mode
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/mkfifo.dhall", "fx-core/schemas/mkfifo.dhall" }) catch
+        @panic("cannot locate schemas/mkfifo.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ mode = Some 600, paths = [] : List Text }"));
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {
@@ -429,7 +567,7 @@ test "mkfifo + logAppend round-trip (skipped if sandbox forbids creation)" {
         error.MkfifoFailed => return, // sandbox forbids; skip
         else => return e,
     };
-    const args_json = try posixArgsJson(aa, .{ .mode = 0o600, .paths = &.{f} });
+    const args_json = try posixArgsJson(aa, .{ .paths = &.{f} }, 0o600);
     _ = try caslog.logAppend(aa, state, tmp, "fx-mkfifo", args_json, effects.items);
 
     const entries = try caslog.logReadAll(aa, state);
@@ -453,14 +591,26 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], aa);
     } else {
+        // the GENERATED parser (schemas/mkfifo.dhall ->
+        // src/generated/cli_mkfifo.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
     }
+    // The mode travels as octal TEXT in both arg forms (schema Optional
+    // Text); radix-8-parse it once, here, after they converge.
+    const mode_bits: ?u32 = if (opts.mode) |m|
+        parseMode(m) orelse {
+            std.debug.print("fx-mkfifo: invalid mode '{s}'\n", .{m});
+            return error.BadMode;
+        }
+    else
+        null;
     if (opts.paths.len == 0) {
         std.debug.print("fx-mkfifo: missing operand\n", .{});
         return error.MissingOperand;
     }
 
-    const args_json = posixArgsJson(aa, opts) catch {
+    const args_json = posixArgsJson(aa, opts, mode_bits) catch {
         std.debug.print("fx-mkfifo: internal error building args\n", .{});
         return error.BadArgs;
     };
@@ -477,7 +627,7 @@ pub fn main(init: std.process.Init) !void {
     var effects = std.ArrayList(caslog.Effect).empty;
     var failed: ?anyerror = null;
     for (opts.paths) |path| {
-        mkfifoOne(aa, path, opts.mode, &effects) catch |e| {
+        mkfifoOne(aa, path, mode_bits, &effects) catch |e| {
             switch (e) {
                 error.Exists => std.debug.print("fx-mkfifo: cannot create fifo '{s}': File exists\n", .{path}),
                 else => std.debug.print("fx-mkfifo: cannot create fifo '{s}': Operation not permitted\n", .{path}),

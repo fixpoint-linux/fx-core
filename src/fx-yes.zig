@@ -5,13 +5,22 @@
 // -1`).  Pure libc + the dhall module for typed args — no datalog / journal
 // dependency.
 //
-// Two arg forms:
-//   fx-yes '{ input = "foo" }'   Dhall record
-//   fx-yes [STRING]...           POSIX fallback
+// Two arg forms (both derived from schemas/yes.dhall — the fx-ls migration
+// template applied to the list-of-operands command):
+//   fx-yes '{ strings = ["foo", "bar"] }'   Dhall record
+//   fx-yes [STRING]...                      POSIX
 //
-// - Dhall `input : Optional Text` = the single line to repeat (None => "y").
-// - POSIX: operands are joined with spaces + a newline and repeated.  No
-//   operands => "y".
+// - Dhall `strings : List Text` = the operands to join with spaces and repeat
+//   (None => "y").
+// - POSIX: the STRING operands are joined with spaces + a newline and
+//   repeated.  No operands => "y".  The POSIX form is parsed by the GENERATED
+//   parser (src/generated/cli_yes.zig, emitted from schemas/yes.dhall by
+//   src/tools/fx-clijson.zig — pure Zig, no dhall at runtime; `zig build
+//   gen-cli-check` gates the regen).  Deliberate strengthening over the hand
+//   parser it replaced: an unknown option is error.UnknownOption (with a
+//   usage-shaped diagnostic naming the offending token) and `--` ends flag
+//   parsing (`fx-yes -- -n` repeats the string `-n`), where the hand parser
+//   could only treat every token as an operand.
 //
 // Behavior (GNU-grounded): `yes` -> "y" repeatedly; `yes foo` -> "foo";
 // `yes foo bar` -> "foo bar" (space-joined + newline, looped).  The loop stops
@@ -24,6 +33,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_yes = @import("cli-yes");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -39,15 +50,18 @@ const Allocator = std.mem.Allocator;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/yes.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    strings: []const []const u8 = &.{},
-};
+const Options = cli_yes.Options;
+const parsePosixArgs = cli_yes.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    // Fixed-capacity operand list decoded from the JSON array.  64 covers
+    // every differential and realistic invocation; a record with more
+    // elements than the capacity fails the decode (error.DhallFields).
+    strings: [64][]const u8 = undefined,
+    strings_n: usize = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +129,7 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     var i: usize = 0;
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
@@ -123,11 +138,37 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
-            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the key's list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "strings")) {
+                        if (list_n >= res.strings.len) return null; // over capacity
+                        res.strings[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
             }
+        } else if (i < s.len and s[i] == '"') {
+            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
             off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             _ = jsonParseBool(s, &i) orelse return null;
@@ -139,6 +180,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.strings_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
@@ -187,22 +229,13 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.strings_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.strings_n);
+        for (opts.strings[0..opts.strings_n], 0..) |sv, ei| arr[ei] = try gpa.dupe(u8, sv);
         o.strings = arr;
     }
     return o;
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var strings = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        try strings.append(gpa, try gpa.dupe(u8, args[i]));
-    }
-    return Options{ .strings = try strings.toOwnedSlice(gpa) };
 }
 
 // ---------------------------------------------------------------------------
@@ -237,22 +270,97 @@ test "buildLine joins operands with spaces" {
     try std.testing.expectEqualStrings("foo bar\n", out.items);
 }
 
-test "jsonParseOpts input string" {
+test "jsonParseOpts strings array" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"foo\"}", &buf) orelse
+    const o = jsonParseOpts("{\"strings\":[\"foo\",\"bar\"]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("foo", o.input.?);
+    try std.testing.expectEqual(@as(usize, 2), o.strings_n);
+    try std.testing.expectEqualStrings("foo", o.strings[0]);
+    try std.testing.expectEqualStrings("bar", o.strings[1]);
 }
 
-test "parsePosixArgs multiple strings" {
-    const args = [_][:0]const u8{ "fx-yes", "foo", "bar" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.strings);
-    defer std.testing.allocator.free(o.strings[0]);
-    defer std.testing.allocator.free(o.strings[1]);
+test "evalDhallArgs strings list" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ strings = [ \"foo\", \"bar\" ] }", std.testing.allocator);
+    defer std.testing.allocator.free(o.strings); // declared first -> runs last (LIFO)
+    defer for (o.strings) |e| std.testing.allocator.free(e);
     try std.testing.expectEqual(@as(usize, 2), o.strings.len);
     try std.testing.expectEqualStrings("foo", o.strings[0]);
     try std.testing.expectEqualStrings("bar", o.strings[1]);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/whoami template
+// applied to the list-of-operands command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-yes '{ ... }'` takes.  Both sides are re-encoded
+// with the SHARED comptime-reflection encoder (fx-cli.encodeOptionsWire) and
+// compared as strings, so the assertion is exact and field-complete by
+// construction.
+
+/// One differential vector — the shared generic runner (fx-cli.
+/// expectPosixEqualsRecord; see fx-ls.zig) with this command's plumbing.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_yes, &.{ "schemas/yes.dhall", "fx-core/schemas/yes.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // positional STRING operands accumulate in argv order
+    try expectPosixEqualsRecord(&.{ "fx-yes", "foo" }, "{ strings = [ \"foo\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-yes", "foo", "bar" }, "{ strings = [ \"foo\", \"bar\" ] }");
+    // bare '-' is an operand; '--' ends flags (then a leading-dash operand)
+    try expectPosixEqualsRecord(&.{ "fx-yes", "-" }, "{ strings = [ \"-\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-yes", "--", "-n" }, "{ strings = [ \"-n\" ] }");
+    // exotic operand bytes: the record side's renderDhallRecord escaping
+    // must round-trip the raw POSIX operand (see fx-ls.zig SHOULD-FIX 3a)
+    try expectPosixEqualsRecord(&.{ "fx-yes", "a b\"c" }, "{ strings = [ \"a b\\\"c\" ] }");
+}
+
+test "DIFFERENTIAL: all-defaults equivalence (empty argv vs empty record)" {
+    // Pinned DIRECTLY (not via the shared runner): renderDhallRecord emits a
+    // bare "[]" for an empty List Text, which evalDhallArgs' plain infer_type
+    // cannot type ("cannot infer type of empty list") — a known fx-cli gap
+    // this batch is the first to hit (ls/whoami have no list field).  The
+    // runner matrix therefore covers non-empty records only, and the
+    // empty/default equivalence (empty argv => the repeated "y\n" default) is
+    // asserted here through the SAME encodeOptionsWire encoder the runner
+    // compares with.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_yes.parsePosix(&.{"fx-yes"}, gpa);
+    const record_o = try evalDhallArgs("{ strings = [] : List Text }", gpa);
+
+    var wire_posix = try cli.encodeOptionsWire(cli_yes.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try cli.encodeOptionsWire(cli_yes.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    try std.testing.expectEqualStrings(wire_record.items, wire_posix.items);
+}
+
+test "DIFFERENTIAL: rejection parity — the POSIX form rejects flags loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // yes has NO flags in this slice (GNU yes has none): any -token is unknown
+    try std.testing.expectError(error.UnknownOption, cli_yes.parsePosix(&.{ "fx-yes", "-n" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_yes.parsePosix(&.{ "fx-yes", "--version" }, gpa));
+    // the record form cannot express flags at all (SchemaCheck on typo)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/yes.dhall", "fx-core/schemas/yes.dhall" }) catch
+        @panic("cannot locate schemas/yes.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
 }
 
 // ---------------------------------------------------------------------------

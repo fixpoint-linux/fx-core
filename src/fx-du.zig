@@ -23,6 +23,14 @@
 //   fx-du '{ path = ".", maxdepth = Some 2, summary = True }'   Dhall record
 //   fx-du [-d N] [-s] [PATH]                                    POSIX fallback
 //
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_du.zig,
+// emitted from schemas/du.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Against the
+// hand parser it replaced: -s clusters (-ds does NOT cluster — -d is a Value
+// short), --max-depth=N is the inline-value long alias, a second bare operand
+// is error.UnexpectedOperand (the hand one silently took the last), and a bad
+// or missing -d value is error.BadValue/MissingValue (the hand BadMaxdepth).
+//
 // Dhall record: { path : Text, maxdepth : Optional Natural, summary : Bool }
 // with defaults path=".", maxdepth=None, summary=False.  POSIX: -d N is GNU
 // --max-depth=N (print totals at most N levels below the root), -s is
@@ -55,6 +63,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
+const cli_du = @import("cli-du");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -92,15 +102,11 @@ extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/du.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    path: []const u8 = ".",
-    maxdepth: ?usize = null, // print totals at most this many levels below root
-    summary: bool = false, // root row only (GNU -s / --summarize)
-    rows: bool = false, // --rows: canonical wire rows instead of display text
-};
+const Options = cli_du.Options;
+const parsePosixArgs = cli_du.parsePosix; // the generated POSIX parser
 
 /// The rows-mode wire record type.  MUST stay identical to the fx-pipeline
 /// registry's builtin("du") output type ("{ path : Text, bytes : Natural }")
@@ -142,7 +148,7 @@ fn relativeDepth(root: []const u8, path: []const u8) usize {
 /// Whether a du row for `row_path` passes the output filters.
 fn rowPasses(root: []const u8, row_path: []const u8, opts: Options) bool {
     if (opts.summary) return std.mem.eql(u8, row_path, root);
-    if (opts.maxdepth) |md| return relativeDepth(root, row_path) <= md;
+    if (opts.maxdepth) |md| return relativeDepth(root, row_path) <= @as(usize, @intCast(md));
     return true;
 }
 
@@ -312,7 +318,66 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     return res;
 }
 
+/// Bare `None` (no type annotation) does not parse in the dhall-c grammar
+/// this repo links — it is only accepted as an argument of `Some` or after
+/// an explicit `None Natural`-style annotation.  The differential runner's
+/// record side renders completed schema values from fx-cli.renderDhallRecord,
+/// whose Optional arm emits the bare form (fx-cli.zig renderValue .none_ is
+/// type-blind), so `fx-du '{ maxdepth = None }'` (and every None-default
+/// matrix vector) would die at PARSE time before the schema annotation could
+/// fix the type.  Repair the spelling at this command's single record-form
+/// entry point: `None` NOT followed by an identifier is given the schema's
+/// Optional payload type; an already-annotated `None Natural` is untouched.
+/// A real record literal can never legally contain a bare `None`, so the
+/// rewrite is unambiguous.
+fn repairBareNone(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "None") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 4 <= src.len and std.mem.eql(u8, src[i .. i + 4], "None") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 4 == src.len or !isIdentByte(src[i + 4])))
+        {
+            // already annotated ("None Natural", "None Text", ...)?  The
+            // next non-space char of an annotated form is a letter.
+            var j = i + 4;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+            if (j < src.len and std.ascii.isAlphabetic(src[j])) {
+                @memcpy(buf[n .. n + 4], "None");
+                n += 4;
+                i += 4;
+                continue;
+            }
+            @memcpy(buf[n .. n + 12], "None Natural");
+            n += 12;
+            i += 4;
+        } else {
+            buf[n] = src[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
+}
+
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // Repair a bare `None` before the C parser sees it (see repairBareNone —
+    // the differential runner's rendered records carry the unparseable
+    // spelling).  parse_source wants a C string, so the repaired copy is
+    // dupeZ'd; the unrepaired fast path passes `src` straight through.
+    var nb: [512:0]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareNone(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -323,7 +388,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, zsrc, null, &err);
     if (t == null) {
         std.debug.print("fx-du: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -369,7 +434,7 @@ test "jsonParseOpts full record" {
     const o = jsonParseOpts("{\"path\":\"/tmp\",\"maxdepth\":2,\"summary\":true}", &buf) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("/tmp", o.path.?);
-    try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
     try std.testing.expect(o.summary);
 }
 
@@ -395,7 +460,7 @@ test "evalDhallArgs record with maxdepth Some" {
     const o = try evalDhallArgs("{ path = \"/tmp\", maxdepth = Some 2, summary = True }", std.testing.allocator);
     defer std.testing.allocator.free(o.path);
     try std.testing.expectEqualStrings("/tmp", o.path);
-    try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
     try std.testing.expect(o.summary);
 }
 
@@ -417,81 +482,93 @@ test "evalDhallArgs type error rejected" {
 }
 
 // ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
+// datalog: the stratified du program
 // ---------------------------------------------------------------------------
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-d")) {
-            if (i + 1 >= args.len) {
-                std.debug.print("fx-du: -d requires an argument\n", .{});
-                return error.BadMaxdepth;
-            }
-            i += 1;
-            o.maxdepth = std.fmt.parseInt(usize, args[i], 10) catch {
-                std.debug.print("fx-du: bad -d '{s}'\n", .{args[i]});
-                return error.BadMaxdepth;
-            };
-        } else if (std.mem.eql(u8, a, "-s")) {
-            o.summary = true;
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-du: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            o.path = try gpa.dupe(u8, a);
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent (schema
+// completion -> renderDhallRecord -> THIS file's record evaluator), encoded
+// by the shared field-complete encoder and compared as strings.
+
+/// One differential vector for fx-du — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_du, &.{ "schemas/du.dhall", "fx-core/schemas/du.dhall" }, evalDhallArgs, argv, user_record);
 }
 
-test "parsePosixArgs defaults" {
-    const o = try parsePosixArgs(&.{"fx-du"}, std.testing.allocator);
-    try std.testing.expectEqualStrings(".", o.path);
-    try std.testing.expect(o.maxdepth == null);
-    try std.testing.expect(!o.summary);
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: empty argv keeps path=".", maxdepth=None ---
+    try expectPosixEqualsRecord(&.{"fx-du"}, "{ }");
+
+    // --- each flag alone, short and long spellings ---
+    try expectPosixEqualsRecord(&.{ "fx-du", "-s" }, "{ summary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "--summarize" }, "{ summary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "--rows" }, "{ rows = True }");
+
+    // --- the Value flag: separate-token short and inline-value long ---
+    try expectPosixEqualsRecord(&.{ "fx-du", "-d", "2" }, "{ maxdepth = Some 2 }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "--max-depth=2" }, "{ maxdepth = Some 2 }");
+
+    // --- combinations, all orders ---
+    try expectPosixEqualsRecord(&.{ "fx-du", "-d", "1", "-s", "/tmp" }, "{ path = \"/tmp\", maxdepth = Some 1, summary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "-s", "/tmp", "-d", "0" }, "{ path = \"/tmp\", maxdepth = Some 0, summary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "--rows", "-s", "/tmp" }, "{ path = \"/tmp\", summary = True, rows = True }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "-s", "-d", "3", "-s" }, "{ maxdepth = Some 3, summary = True }"); // repeat idempotent
+
+    // --- the positional PATH, incl. before-flag interleave and -- ---
+    try expectPosixEqualsRecord(&.{ "fx-du", "/tmp" }, "{ path = \"/tmp\" }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "/tmp", "-s" }, "{ path = \"/tmp\", summary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "--", "-s" }, "{ path = \"-s\" }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "-" }, "{ path = \"-\" }");
+
+    // --- exotic operand bytes: encoder-vs-escape parity both sides ---
+    try expectPosixEqualsRecord(&.{ "fx-du", "a b" }, "{ path = \"a b\" }");
+    try expectPosixEqualsRecord(&.{ "fx-du", "say \"hi\"" }, "{ path = \"say \\\"hi\\\"\" }");
 }
 
-test "parsePosixArgs d s path" {
-    const args = [_][:0]const u8{ "fx-du", "-d", "1", "-s", "/tmp" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.path);
-    try std.testing.expectEqual(@as(?usize, 1), o.maxdepth);
-    try std.testing.expect(o.summary);
-    try std.testing.expectEqualStrings("/tmp", o.path);
-}
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed; the
+    // arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
 
-test "parsePosixArgs d0" {
-    const args = [_][:0]const u8{ "fx-du", "-d", "0" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(@as(?usize, 0), o.maxdepth);
-}
+    // unknown option, short and long; a cluster with an unknown letter is an
+    // unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_du.parsePosix(&.{ "fx-du", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_du.parsePosix(&.{ "fx-du", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_du.parsePosix(&.{ "fx-du", "-sZ" }, gpa));
 
-test "parsePosixArgs unknown option rejected" {
-    const args = [_][:0]const u8{"fx-du", "-x"};
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
-}
+    // a SECOND bare operand overflows the single PATH slot (the hand parser
+    // silently took the last — the schema pins this strengthening)
+    try std.testing.expectError(error.UnexpectedOperand, cli_du.parsePosix(&.{ "fx-du", "a", "b" }, gpa));
 
-test "parsePosixArgs bad -d rejected" {
-    const args = [_][:0]const u8{ "fx-du", "-d", "x" };
-    try std.testing.expectError(error.BadMaxdepth, parsePosixArgs(&args, std.testing.allocator));
-}
+    // -d with no value / with a non-Natural value
+    try std.testing.expectError(error.MissingValue, cli_du.parsePosix(&.{"fx-du", "-d"}, gpa));
+    try std.testing.expectError(error.BadValue, cli_du.parsePosix(&.{ "fx-du", "-d", "x" }, gpa));
 
-test "parsePosixArgs missing -d arg rejected" {
-    const args = [_][:0]const u8{"fx-du", "-d"};
-    try std.testing.expectError(error.BadMaxdepth, parsePosixArgs(&args, std.testing.allocator));
-}
+    // a Value short never clusters: -ds is unknown (the 'd' letter fails the
+    // cluster scan; the whole token is then rejected as unknown)
+    try std.testing.expectError(error.UnknownOption, cli_du.parsePosix(&.{ "fx-du", "-ds" }, gpa));
 
-test "parsePosixArgs --rows" {
-    const args = [_][:0]const u8{ "fx-du", "--rows", "/tmp" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.path);
-    try std.testing.expect(o.rows);
-    try std.testing.expectEqualStrings("/tmp", o.path);
+    // --long=value on a Flag-kind long (--summarize) is unknown — the =
+    // suffix does not split on Flag longs (schemas/README.md)
+    try std.testing.expectError(error.UnknownOption, cli_du.parsePosix(&.{ "fx-du", "--summarize=true" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, ill-typed Natural.  The POSIX form has no spelling
+    // that could reach any of these (its analogue is -x above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/du.dhall", "fx-core/schemas/du.dhall" }) catch
+        @panic("cannot locate schemas/du.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ summary = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ maxdepth = Some (-2) }"));
 }
 
 test "evalDhallArgs rows flag" {

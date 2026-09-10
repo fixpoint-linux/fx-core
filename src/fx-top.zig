@@ -11,6 +11,13 @@
 //                                                   count=15 sort=Cpu
 //   fx-top [-n N] [-m]                              POSIX fallback
 //
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_top.zig,
+// emitted from schemas/top.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Against the
+// hand parser it replaced: -m clusters, --rows is long-only, ANY operand is
+// error.UnexpectedOperand (the hand one folded it into UnknownOption), and a
+// bad/missing -n value is error.BadValue/MissingValue (the hand BadCount).
+//
 // Fixed-arity relations (fx-ls ent/entt story; conventions PINNED SHARED with
 // fx-ps by the l1views plan — do not drift):
 //   procc(cpu, rss, pidc, ppid, state)  5-ary, cpu-major
@@ -48,6 +55,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
+const cli_top = @import("cli-top");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -81,16 +90,12 @@ const Allocator = std.mem.Allocator;
 const proc_root = "/proc"; // snapshot source (walk root, injectable for tests)
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/top.dhall)
 // ---------------------------------------------------------------------------
 
-const SortTag = enum { Cpu, Mem }; // Dhall < Cpu | Mem >
-
-const Options = struct {
-    count: u32 = 15,
-    sort: SortTag = .Cpu,
-    rows: bool = false, // --rows: canonical wire rows instead of display text
-};
+const SortTag = cli_top.sort; // Dhall < Cpu | Mem >
+const Options = cli_top.Options;
+const parsePosixArgs = cli_top.parsePosix; // the generated POSIX parser
 
 /// The rows-mode wire record type.  MUST stay identical to fx-ps's
 /// (fx-pipeline registry type for both) — the declared order pins the
@@ -103,7 +108,7 @@ const top_rows_src = "{ pid : Natural, state : Text, ppid : Natural, cpu : Natur
 // ---------------------------------------------------------------------------
 
 const JsonOpts = struct {
-    count: ?u32 = null,
+    count: ?u64 = null,
     sort: ?SortTag = null,
     rows: bool = false,
 };
@@ -277,38 +282,6 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (opts.count) |c| o.count = c; // default (absent) stays 15
     if (opts.sort) |st| o.sort = st; // default (absent) stays .Cpu
     o.rows = opts.rows;
-    return o;
-}
-
-// ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
-// ---------------------------------------------------------------------------
-
-fn parsePosixArgs(args: []const [:0]const u8) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-n")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("fx-top: -n requires a value\n", .{});
-                return error.MissingValue;
-            }
-            o.count = std.fmt.parseInt(u32, args[i], 10) catch {
-                std.debug.print("fx-top: bad count '{s}'\n", .{args[i]});
-                return error.BadCount;
-            };
-        } else if (std.mem.eql(u8, a, "-m")) {
-            o.sort = .Mem;
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else {
-            // fx-top takes no positional operands.
-            std.debug.print("fx-top: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-    }
     return o;
 }
 
@@ -504,13 +477,14 @@ fn collectRanked(gpa: Allocator, db: *dl.dl_db, rel: [*c]const u8, cpu_major: bo
 }
 
 /// Reverse the ascending enumeration into ranked order (heaviest first) and
-/// keep only the top `count` rows.
-fn rankAndLimit(gpa: Allocator, rows: *std.ArrayList(Row), count: u32) void {
+/// keep only the top `count` rows (u64: the generated Natural field type).
+fn rankAndLimit(gpa: Allocator, rows: *std.ArrayList(Row), count: u64) void {
     std.mem.reverse(Row, rows.items);
-    if (rows.items.len > count) {
+    const keep: usize = @intCast(@min(count, @as(u64, rows.items.len)));
+    if (rows.items.len > keep) {
         // Owned strings of truncated rows must be freed before shrinking.
-        freeRows(gpa, rows.items[count..]);
-        rows.shrinkRetainingCapacity(count);
+        freeRows(gpa, rows.items[keep..]);
+        rows.shrinkRetainingCapacity(keep);
     }
 }
 
@@ -838,7 +812,7 @@ test "rows mode: ranked subset emits canonical wire rows that decode back" {
 test "jsonParseOpts full record + defaults" {
     const o = jsonParseOpts("{\"count\":10,\"sort\":{\"Mem\":{}},\"rows\":true}") orelse
         return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(?u32, 10), o.count);
+    try testing.expectEqual(@as(?u64, 10), o.count);
     try testing.expectEqual(@as(?SortTag, .Mem), o.sort);
     try testing.expect(o.rows);
 
@@ -855,17 +829,17 @@ test "jsonParseOpts unknown union alternative rejected" {
 test "evalDhallArgs count+sort, defaults, rows" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ count = 10, sort = < Cpu | Mem >.Mem }", testing.allocator);
-    try testing.expectEqual(@as(u32, 10), o.count);
+    try testing.expectEqual(@as(u64, 10), o.count);
     try testing.expectEqual(@as(SortTag, .Mem), o.sort);
     try testing.expect(!o.rows);
 
     const d = try evalDhallArgs("{}", testing.allocator);
-    try testing.expectEqual(@as(u32, 15), d.count); // default
+    try testing.expectEqual(@as(u64, 15), d.count); // default
     try testing.expectEqual(@as(SortTag, .Cpu), d.sort); // default
 
     const r = try evalDhallArgs("{ rows = True, count = 0 }", testing.allocator);
     try testing.expect(r.rows);
-    try testing.expectEqual(@as(u32, 0), r.count);
+    try testing.expectEqual(@as(u64, 0), r.count);
 }
 
 test "evalDhallArgs unknown sort alternative rejected" {
@@ -873,23 +847,76 @@ test "evalDhallArgs unknown sort alternative rejected" {
     try testing.expectError(error.DhallType, evalDhallArgs("{ sort = < Cpu | Mem >.Foo }", testing.allocator));
 }
 
-test "parsePosixArgs flags + defaults" {
-    const d = try parsePosixArgs(&.{"fx-top"});
-    try testing.expectEqual(@as(u32, 15), d.count);
-    try testing.expectEqual(@as(SortTag, .Cpu), d.sort);
-    try testing.expect(!d.rows);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent (schema
+// completion -> renderDhallRecord -> THIS file's record evaluator), encoded
+// by the shared field-complete encoder and compared as strings.
 
-    const o = try parsePosixArgs(&.{ "fx-top", "-n", "10", "-m", "--rows" });
-    try testing.expectEqual(@as(u32, 10), o.count);
-    try testing.expectEqual(@as(SortTag, .Mem), o.sort);
-    try testing.expect(o.rows);
+/// One differential vector for fx-top — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_top, &.{ "schemas/top.dhall", "fx-core/schemas/top.dhall" }, evalDhallArgs, argv, user_record);
 }
 
-test "parsePosixArgs rejects bad/missing/unknown" {
-    try testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-top", "-x" }));
-    try testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-top", "operand" }));
-    try testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-top", "-n" }));
-    try testing.expectError(error.BadCount, parsePosixArgs(&.{ "fx-top", "-n", "abc" }));
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: empty argv keeps count=15, sort=Cpu (Cpu has NO POSIX
+    // spelling — it is pinned here and by the explicit record below) ---
+    try expectPosixEqualsRecord(&.{"fx-top"}, "{ }");
+    try expectPosixEqualsRecord(&.{"fx-top"}, "{ sort = < Cpu | Mem >.Cpu }");
+
+    // --- each flag alone; the sort union selector round-trips ---
+    try expectPosixEqualsRecord(&.{ "fx-top", "-m" }, "{ sort = < Cpu | Mem >.Mem }");
+    try expectPosixEqualsRecord(&.{ "fx-top", "-n", "10" }, "{ count = 10 }");
+    try expectPosixEqualsRecord(&.{ "fx-top", "--rows" }, "{ rows = True }");
+
+    // --- combinations, all orders; -n 0 is legal (prints nothing) ---
+    try expectPosixEqualsRecord(&.{ "fx-top", "-n", "5", "-m", "--rows" }, "{ count = 5, sort = < Cpu | Mem >.Mem, rows = True }");
+    try expectPosixEqualsRecord(&.{ "fx-top", "--rows", "-m", "-n", "7" }, "{ count = 7, sort = < Cpu | Mem >.Mem, rows = True }");
+    try expectPosixEqualsRecord(&.{ "fx-top", "-m", "-m", "-n", "3", "-n", "4" }, "{ count = 4, sort = < Cpu | Mem >.Mem }"); // repeats rebind
+    try expectPosixEqualsRecord(&.{ "fx-top", "-n", "0" }, "{ count = 0 }");
+
+    // --- short clusters: -m is a Flag short; a Value short never clusters ---
+    try expectPosixEqualsRecord(&.{ "fx-top", "-mm" }, "{ sort = < Cpu | Mem >.Mem }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed; the
+    // arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; a cluster with an unknown letter is an unknown option
+    try std.testing.expectError(error.UnknownOption, cli_top.parsePosix(&.{ "fx-top", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_top.parsePosix(&.{ "fx-top", "-mZ" }, gpa));
+
+    // ANY operand is rejected: fx-top takes no positionals (the hand parser
+    // folded this into UnknownOption; the generated one is precise)
+    try std.testing.expectError(error.UnexpectedOperand, cli_top.parsePosix(&.{ "fx-top", "operand" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_top.parsePosix(&.{ "fx-top", "--", "operand" }, gpa));
+
+    // -n with no value / with a non-Natural value (the hand BadCount class)
+    try std.testing.expectError(error.MissingValue, cli_top.parsePosix(&.{"fx-top", "-n"}, gpa));
+    try std.testing.expectError(error.BadValue, cli_top.parsePosix(&.{ "fx-top", "-n", "abc" }, gpa));
+
+    // --long=value on a Flag-kind long (--rows) is unknown — the = suffix
+    // does not split on Flag longs (schemas/README.md)
+    try std.testing.expectError(error.UnknownOption, cli_top.parsePosix(&.{ "fx-top", "--rows=true" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, bogus union constructor.  The POSIX form has no
+    // spelling that could reach any of these (its analogue is -x above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/top.dhall", "fx-core/schemas/top.dhall" }) catch
+        @panic("cannot locate schemas/top.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ count = (-2) }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ sort = < Cpu | Mem >.Foo }"));
 }
 
 // ---------------------------------------------------------------------------

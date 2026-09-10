@@ -5,15 +5,38 @@
 // closure) rule.  Output is lex-sorted.  This is the flagship fixpoint-style
 // command: "literally a least-fixed-point computation."
 //
-// Two arg forms:
-//   fx-find '{ root = ".", name = "*.c", maxdepth = 3 }'   Dhall record literal
-//   fx-find [-name GLOB] [-type f|d] [-maxdepth N] [ROOT]  POSIX-style fallback
+// Two arg forms, ONE source of truth for the RECORD side
+// (schemas/find.dhall):
+//   fx-find '{ root = ".", name_glob = "*.c", maxdepth = 3 }'  Dhall record literal
+//   fx-find [-name GLOB] [-type f|d] [-maxdepth N] [ROOT]      POSIX-style fallback
 //
+// MIGRATION STATUS (a deliberate PARTIAL, unlike ls/cp/mv — the fx-seq
+// precedent): Options is an ALIAS of the generated cli_find.Options and the
+// record side is differential-tested through the schema completion — but the
+// POSIX form STAYS on the hand parser.  schemas/find.dhall documents why:
+// -name/-type/-maxdepth are single-dash MULTI-CHAR tokens (expressible
+// neither as a short "-<c>" nor a long "--<name>"), and `-type f|d` is a
+// VALUE-CONSUMING enum selector no v1 flag kind models — the vocabulary gap.
+// cli_find.parsePosix is therefore record-form only (it binds the ROOT
+// positional and rejects every flag), and replacing the hand parser would
+// break `-name`/`-type`/`-maxdepth` entirely.  The differential matrix pins
+// the SHARED surface (the root positional, `--`, defaults) and the rejection
+// class that keeps the gap explicit.
+//
+// RENAME NOTE (schemas/find.dhall, the seq "increment"->"inc" precedent):
+// the hand record form read the JSON keys `name` and `type`; the schema
+// spells the STRUCT names `name_glob` / `type_filter`, so the record form now
+// reads `{ name_glob = "*.c", type_filter = < File | Dir >.File }` — the old
+// keys are rejections.  The `type_filter` union alternative spellings stay
+// `File`/`Dir` (nullary); the typed `< f : Text | d : Text >` payload form is
+// still accepted (the tag, not the payload, selects).
 // Dhall args are evaluated natively via the dhall-c Zig core (imported as a
 // single Zig module — no FFI).  Only datalog-dafsa remains C-FFI (libdatalog.so).
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_find = @import("cli-find");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -40,17 +63,22 @@ extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_sta
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED for the record side (single source of truth:
+// schemas/find.dhall).  The POSIX side stays HAND (see the header: the
+// vocabulary gap).
 // ---------------------------------------------------------------------------
 
-const TypeFilter = enum { f, d }; // -type f|d, and Dhall `< f | d >` union tag
+// cli_find.Options.type_filter is `?enum { Dir, File }` — the same members as
+// the old hand TypeFilter, only the Zig tags renamed (f->File, d->Dir).  The
+// walk dispatches on the ALIASED type below, no bridge needed.
+const Options = cli_find.Options;
 
-const Options = struct {
-    root: []const u8 = ".",
-    name_glob: ?[]const u8 = null, // basename glob (* and ?), applied on output
-    type_filter: ?TypeFilter = null, // -type f|d
-    maxdepth: ?usize = null, // depth limit (0 = only the root)
-};
+const TypeFilter = @typeInfo(@FieldType(Options, "type_filter")).optional.child; // enum { Dir, File }
+
+// The old hand parser spelled the tags f/d; keep the walk/main dispatch
+// sites readable under the schema's File/Dir spelling.
+const TypeFilter_f: TypeFilter = .File;
+const TypeFilter_d: TypeFilter = .Dir;
 
 // ---------------------------------------------------------------------------
 // Glob matcher (supports '*' and '?')
@@ -91,120 +119,288 @@ test "globMatch" {
     try std.testing.expect(globMatch("file", "file"));
 }
 
-test "jsonParseOpts full record" {
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — record-side half (the fx-seq template; see the
+// header for why the POSIX side stays hand)
+// ---------------------------------------------------------------------------
+//
+// UPSTREAM BLOCKER (reported; fx-cli.zig is outside this batch's scope):
+// the shared runner cli.expectPosixEqualsRecord is UNUSABLE for find.  Its
+// record side is completeSrc -> renderDhallRecord -> evalDhallArgs, and
+// renderValue's .none_ arm (fx-cli.zig) emits a BARE `None` — which this
+// dhall-c subset's parser rejects in value position (only the annotated
+// `None Natural` / `None Text` / `None < File | Dir >` forms parse; probes in
+// this file's history).  Every find completion carries at least one None
+// (name_glob/maxdepth/type_filter have no POSIX spelling), so EVERY vector
+// would die in evalDhallArgs.  schemas/find.dhall's RENDER CAVEAT has this
+// inverted: the render side is what is broken, not the .some arm.  The fix —
+// render `None` with its ty-projected inner type — belongs in fx-cli.zig.
+//
+// Until then find gets the fx-seq treatment: a record-side differential
+// through the schema completion for the ALL-SOME vectors (which render
+// parsably), direct evalDhallArgs pins for the defaults, and the JSON-layer
+// unit tests (term_to_json renders None as `null`, which jsonParseOpts
+// accepts — the RUNTIME record path is unaffected by the render bug).
+
+/// Locate schemas/find.dhall (tests run from varying CWDs).  Caller frees.
+fn findSchemaSrc() [:0]u8 {
+    return cli.readSchemaFile(std.testing.allocator, &.{ "schemas/find.dhall", "fx-core/schemas/find.dhall" }) catch
+        @panic("cannot locate schemas/find.dhall (run tests from the fx-core root)");
+}
+
+/// One record-side differential vector: (1) the record must be SCHEMA-VALID
+/// (the (dflt // user) : ty completion succeeds), and (2) the SAME record
+/// source evaluated by THIS file's evalDhallArgs — the exact runtime path
+/// `fx-find '{ ... }'` takes — must equal the expected Options field-for-field.
+/// (The completion's renderDhallRecord leg is unusable for find until the
+/// fx-cli renderer is fixed — see the blocker note above.)
+fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const schema_src = findSchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+    var c = try cli.completeSrc(gpa, schema_src, user_record);
+    defer c.deinit(gpa);
+
+    const record_o = try evalDhallArgs(user_record, gpa);
+    try std.testing.expectEqualStrings(expected.root, record_o.root);
+    // ?[]const u8 compares by CONTENT (an expectEqual on the optional would
+    // compare slice POINTERS — the static "x" vs the runtime dupe never match)
+    if (expected.name_glob) |exp| {
+        try std.testing.expectEqualStrings(exp, record_o.name_glob orelse return error.TestUnexpectedResult);
+    } else try std.testing.expect(record_o.name_glob == null);
+    try std.testing.expectEqual(expected.maxdepth, record_o.maxdepth);
+    try std.testing.expectEqual(expected.type_filter, record_o.type_filter);
+}
+
+test "DIFFERENTIAL: schema-valid record form matches the generated Options" {
+    // Optional fields must be spelled Some <value>: the annotation check
+    // rejects a bare value against `Optional T` (probe-pinned in
+    // "record-form rejections" below via { name_glob = "*.c" }).
+    try expectRecordEqualsOptions(
+        "{ root = \"/x\", name_glob = Some \"*.c\", maxdepth = Some 2 }",
+        .{ .root = "/x", .name_glob = "*.c", .maxdepth = 2, .type_filter = null },
+    );
+    try expectRecordEqualsOptions(
+        "{ root = \"/y\", name_glob = Some \"a?c\", maxdepth = Some 0 }",
+        .{ .root = "/y", .name_glob = "a?c", .maxdepth = 0, .type_filter = null },
+    );
+    // the type_filter union must ALSO sit inside Some (Optional < File | Dir >)
+    try expectRecordEqualsOptions(
+        "{ root = \"/z\", type_filter = Some < File | Dir >.Dir }",
+        .{ .root = "/z", .name_glob = null, .maxdepth = null, .type_filter = TypeFilter_d },
+    );
+    // every field at once (the typed-payload union spelling < f : Text |
+    // d : Text > does NOT survive the annotation check — the completion
+    // rejects it; only the nullary File/Dir tags are schema-valid)
+    try expectRecordEqualsOptions(
+        "{ root = \"/w\", name_glob = Some \"*.c\", maxdepth = Some 3, type_filter = Some < File | Dir >.File }",
+        .{ .root = "/w", .name_glob = "*.c", .maxdepth = 3, .type_filter = TypeFilter_f },
+    );
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the record form on the SHARED surface" {
+    // The shared runner is blocked upstream (see above), so the root-positional
+    // parity between the generated parser and the record form is pinned
+    // directly: both sides of the same intent, evaluated and compared.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_find.parsePosix(&.{ "fx-find", "/tmp" }, gpa);
+    const record_o = try evalDhallArgs("{ root = \"/tmp\" }", gpa);
+    try std.testing.expectEqualStrings(posix_o.root, record_o.root);
+    try std.testing.expectEqual(posix_o.name_glob, record_o.name_glob);
+    try std.testing.expectEqual(posix_o.maxdepth, record_o.maxdepth);
+    try std.testing.expectEqual(posix_o.type_filter, record_o.type_filter);
+
+    // empty argv vs the all-defaults record (root ".", everything None —
+    // the record side takes the { } literal, not a completion render)
+    const dflt_o = try cli_find.parsePosix(&.{"fx-find"}, gpa);
+    const empty_o = try evalDhallArgs("{ }", gpa);
+    try std.testing.expectEqualStrings(dflt_o.root, empty_o.root);
+    try std.testing.expectEqual(dflt_o.name_glob, empty_o.name_glob);
+    try std.testing.expectEqual(dflt_o.maxdepth, empty_o.maxdepth);
+    try std.testing.expectEqual(dflt_o.type_filter, empty_o.type_filter);
+}
+
+test "DIFFERENTIAL: the vocabulary-gap flags are generated-rejected (the gap pinned)" {
+    // an arena over the testing allocator (the generated parser's documented
+    // no-free-on-error discipline)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // -name/-type/-maxdepth are single-dash multi-char tokens: the generated
+    // parser has no vocabulary for them (UnknownOption), while the HAND
+    // parser — the one main() keeps using — accepts them.  Both sides of this
+    // pin are asserted so the gap cannot silently close or widen.
+    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-name", "*.c" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-type", "f" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-maxdepth", "3" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "--bogus" }, gpa));
+
+    // a SECOND bare operand: the generated single-slot binding rejects it
+    // (the fx-du/fx-tree precedent) where the hand parser is LAST-WINS
+    try std.testing.expectError(error.UnexpectedOperand, cli_find.parsePosix(&.{ "fx-find", "/a", "/b" }, gpa));
+    // the hand parser keeps last-wins (the schemas/find.dhall documented
+    // divergence it still owns while the POSIX side stays hand)
+    {
+        var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_i.deinit();
+        const aa = arena_i.allocator();
+        const args = [_][:0]const u8{ "fx-find", "/a", "/b" };
+        const o = try parsePosixArgs(&args, aa);
+        try std.testing.expectEqualStrings("/b", o.root);
+    }
+
+    // the hand parser's own spellings still bind (f/d, maxdepth coercion)
+    {
+        var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_i.deinit();
+        const aa = arena_i.allocator();
+        const args = [_][:0]const u8{ "fx-find", "-name", "*.c", "-type", "d", "-maxdepth", "2", "/tmp" };
+        const o = try parsePosixArgs(&args, aa);
+        try std.testing.expectEqualStrings("*.c", o.name_glob.?);
+        try std.testing.expectEqual(@as(?TypeFilter, TypeFilter_d), o.type_filter);
+        try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
+        try std.testing.expectEqualStrings("/tmp", o.root);
+    }
+}
+
+test "DIFFERENTIAL: record-form rejections at completion time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const schema_src = findSchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+
+    // unknown field / wrong type — and the OLD hand-layer key spellings
+    // `name` and `type`, gone from the schema in favor of the struct names
+    // `name_glob`/`type_filter` (the seq "increment"->"inc" precedent)
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ root = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ name = \"*.c\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ maxdepth = \"x\" }"));
+
+    // a bogus type_filter union alternative is a COMPLETION rejection
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ type_filter = < File | Dir >.Socket }"));
+}
+
+test "jsonParseOpts full record (schema key names)" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"root\":\".\",\"name\":\"*.c\",\"maxdepth\":3}", &buf) orelse
+    const o = jsonParseOpts("{\"root\":\".\",\"name_glob\":\"*.c\",\"maxdepth\":3}", &buf) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(".", o.root.?);
-    try std.testing.expectEqualStrings("*.c", o.name.?);
-    try std.testing.expectEqual(@as(?usize, 3), o.maxdepth);
+    try std.testing.expectEqualStrings("*.c", o.name_glob.?);
+    try std.testing.expectEqual(@as(?u64, 3), o.maxdepth);
 }
 
 test "jsonParseOpts None fields" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"root\":\"/tmp\",\"name\":null,\"maxdepth\":null}", &buf) orelse
+    const o = jsonParseOpts("{\"root\":\"/tmp\",\"name_glob\":null,\"maxdepth\":null,\"type_filter\":null}", &buf) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("/tmp", o.root.?);
-    try std.testing.expect(o.name == null);
+    try std.testing.expect(o.name_glob == null);
     try std.testing.expect(o.maxdepth == null);
+    try std.testing.expect(o.type_filter == null);
 }
 
-test "evalDhallArgs record" {
+test "jsonParseOpts type_filter union field f" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type_filter\":{\"f\":\"f\"}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .File), o.type_filter);
+}
+
+test "jsonParseOpts type_filter union field d" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type_filter\":{\"d\":\"d\"}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .Dir), o.type_filter);
+}
+
+test "jsonParseOpts type_filter unknown alt rejected" {
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(jsonParseOpts("{\"type_filter\":{\"x\":\"x\"}}", &buf) == null);
+}
+
+test "jsonParseOpts nullary type_filter File" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type_filter\":{\"File\":{}}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .File), o.type_filter);
+}
+
+test "jsonParseOpts nullary type_filter Dir" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"type_filter\":{\"Dir\":{}}}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .Dir), o.type_filter);
+}
+
+test "evalDhallArgs record (schema key names)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ root = \"/tmp\", name = \"*.c\", maxdepth = 2 }", std.testing.allocator);
+    const o = try evalDhallArgs("{ root = \"/tmp\", name_glob = \"*.c\", maxdepth = 2 }", std.testing.allocator);
     defer {
         if (o.name_glob) |s| std.testing.allocator.free(s);
         std.testing.allocator.free(o.root);
     }
     try std.testing.expectEqualStrings("/tmp", o.root);
     try std.testing.expectEqualStrings("*.c", o.name_glob.?);
-    try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
 }
 
-test "evalDhallArgs type union field" {
+test "evalDhallArgs type_filter nullary union field file" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ root = \".\", type = < f : Text | d : Text >.f \"f\" }", std.testing.allocator);
+    const o = try evalDhallArgs("{ root = \".\", type_filter = < File | Dir >.File }", std.testing.allocator);
     defer std.testing.allocator.free(o.root);
-    try std.testing.expectEqual(@as(?TypeFilter, .f), o.type_filter);
+    try std.testing.expectEqual(@as(?TypeFilter, TypeFilter_f), o.type_filter);
 }
 
-test "evalDhallArgs type union field dir" {
+test "evalDhallArgs type_filter nullary union field dir" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ root = \".\", type = < f : Text | d : Text >.d \"d\" }", std.testing.allocator);
+    const o = try evalDhallArgs("{ root = \".\", type_filter = < File | Dir >.Dir }", std.testing.allocator);
     defer std.testing.allocator.free(o.root);
-    try std.testing.expectEqual(@as(?TypeFilter, .d), o.type_filter);
+    try std.testing.expectEqual(@as(?TypeFilter, TypeFilter_d), o.type_filter);
 }
 
-test "evalDhallArgs type union wrong payload rejected" {
+test "evalDhallArgs type_filter typed union payload still selects (tag decides)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.DhallType, evalDhallArgs("{ type = < f : Text | d : Text >.f 1 }", std.testing.allocator));
-}
-
-test "evalDhallArgs type union unknown alt rejected" {
-    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.DhallType, evalDhallArgs("{ type = < f : Text | d : Text >.x \"y\" }", std.testing.allocator));
-}
-
-test "jsonParseOpts type field f" {
-    var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"type\":{\"f\":\"f\"}}", &buf) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .f), o.type);
-}
-
-test "jsonParseOpts type field d" {
-    var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"type\":{\"d\":\"d\"}}", &buf) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .d), o.type);
-}
-
-test "jsonParseOpts type field unknown alt rejected" {
-    var buf: [1024]u8 = undefined;
-    try std.testing.expect(jsonParseOpts("{\"type\":{\"x\":\"x\"}}", &buf) == null);
-}
-
-test "jsonParseOpts nullary type File" {
-    var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"type\":{\"File\":{}}}", &buf) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .f), o.type);
-}
-
-test "jsonParseOpts nullary type Dir" {
-    var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"type\":{\"Dir\":{}}}", &buf) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .d), o.type);
-}
-
-test "evalDhallArgs nullary type union field file" {
-    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ root = \".\", type = < File | Dir >.File }", std.testing.allocator);
+    const o = try evalDhallArgs("{ root = \".\", type_filter = < f : Text | d : Text >.f \"f\" }", std.testing.allocator);
     defer std.testing.allocator.free(o.root);
-    try std.testing.expectEqual(@as(?TypeFilter, .f), o.type_filter);
+    try std.testing.expectEqual(@as(?TypeFilter, TypeFilter_f), o.type_filter);
 }
 
-test "evalDhallArgs nullary type union field dir" {
+test "evalDhallArgs type_filter typed union wrong payload rejected" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ root = \".\", type = < File | Dir >.Dir }", std.testing.allocator);
-    defer std.testing.allocator.free(o.root);
-    try std.testing.expectEqual(@as(?TypeFilter, .d), o.type_filter);
+    try std.testing.expectError(error.DhallType, evalDhallArgs("{ type_filter = < f : Text | d : Text >.f 1 }", std.testing.allocator));
+}
+
+test "evalDhallArgs type_filter union unknown alt rejected" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    try std.testing.expectError(error.DhallType, evalDhallArgs("{ type_filter = < f : Text | d : Text >.x \"y\" }", std.testing.allocator));
 }
 
 // ---------------------------------------------------------------------------
 // Dhall arg evaluation -> Options
 // ---------------------------------------------------------------------------
 
-// Minimal JSON object parser: extracts top-level string/number/null fields
-// from the JSON produced by dhall serialize.term_to_json for our record.
-// We only need root:Text, name:Optional Text, maxdepth:Optional Natural.
+// Minimal JSON object parser: extracts top-level string/number/null/union
+// fields from the JSON produced by dhall serialize.term_to_json for our
+// record.  Keys are the SCHEMA struct names (schemas/find.dhall RENAME NOTE,
+// the seq "increment"->"inc" precedent): root:Text, name_glob:Optional Text,
+// maxdepth:Optional Natural, type_filter:Optional < File | Dir >.
 const JsonOpts = struct {
-    const TypeTag = enum { f, d };
     root: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    maxdepth: ?usize = null,
-    type: ?TypeTag = null,
+    name_glob: ?[]const u8 = null,
+    maxdepth: ?u64 = null,
+    type_filter: ?TypeTag = null,
+
+    const TypeTag = enum { File, Dir };
 };
 
 fn jsonSkipWs(s: []const u8, i: *usize) void {
@@ -257,16 +453,16 @@ fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
     return null;
 }
 
-fn jsonParseNumber(s: []const u8, i: *usize) ?usize {
+fn jsonParseNumber(s: []const u8, i: *usize) ?u64 {
     jsonSkipWs(s, i);
     const start = i.*;
     while (i.* < s.len and std.ascii.isDigit(s[i.*])) i.* += 1;
     if (i.* == start) return null;
-    return std.fmt.parseInt(usize, s[start..i.*], 10) catch null;
+    return std.fmt.parseInt(u64, s[start..i.*], 10) catch null;
 }
 
-// Parses an object like {"root":".","name":"*.c","maxdepth":3}.
-// name may be null (None); maxdepth may be null (None) or a number.
+// Parses an object like {"root":".","name_glob":"*.c","maxdepth":3}.
+// name_glob may be null (None); maxdepth may be null (None) or a number.
 // Parsed string values are copied into `buf` at non-overlapping offsets so the
 // returned slices do not alias (a naive single buffer would let the value parse
 // clobber the key slice).
@@ -286,13 +482,15 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
             if (std.mem.eql(u8, key, "root")) {
                 res.root = val;
-            } else if (std.mem.eql(u8, key, "name")) {
-                res.name = val;
+            } else if (std.mem.eql(u8, key, "name_glob")) {
+                res.name_glob = val;
             }
             off += val.len;
-        } else if (i < s.len and s[i] == 'n' and std.mem.startsWith(u8, s[i..], "null")) {
-            i += 4; // None (Optional absent)
-        } else if (std.mem.eql(u8, key, "type") and i < s.len and s[i] == '{') {
+        } else if (i < s.len and s[i] == 'n' and (std.mem.startsWith(u8, s[i..], "null") or std.mem.eql(u8, s[i..i + 4], "None"))) {
+            i += 4; // None (Optional absent) — term_to_json's `null`, or the
+            // completed-record render's bare `None` (the annotation
+            // lives only in the schema source; see findSchemaSrc below)
+        } else if (std.mem.eql(u8, key, "type_filter") and i < s.len and s[i] == '{') {
             // Union constructor serializes to a single-key nested object
             // {"type":{"f":"f"}}. The inner key is the chosen alternative; the
             // payload (the constructor argument) is discarded — `.f "anything"`
@@ -315,9 +513,9 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
             // Accept both the typed tags (< f : Text | d : Text > -> "f"/"d")
             // and the nullary tags (< File | Dir > -> "File"/"Dir").
             if (std.mem.eql(u8, tag, "f") or std.mem.eql(u8, tag, "File")) {
-                res.type = .f;
+                res.type_filter = .File;
             } else if (std.mem.eql(u8, tag, "d") or std.mem.eql(u8, tag, "Dir")) {
-                res.type = .d;
+                res.type_filter = .Dir;
             } else {
                 return null; // unknown alternative -> could not parse fields
             }
@@ -380,11 +578,11 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 
     var o = Options{};
     if (opts.root) |r| o.root = try gpa.dupe(u8, r);
-    if (opts.name) |n| o.name_glob = try gpa.dupe(u8, n);
+    if (opts.name_glob) |n| o.name_glob = try gpa.dupe(u8, n);
     o.maxdepth = opts.maxdepth;
-    if (opts.type) |tt| o.type_filter = switch (tt) {
-        .f => .f,
-        .d => .d,
+    if (opts.type_filter) |tt| o.type_filter = switch (tt) {
+        .File => .File,
+        .Dir => .Dir,
     };
     return o;
 }
@@ -403,25 +601,27 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
             o.name_glob = try gpa.dupe(u8, args[i]);
         } else if (std.mem.eql(u8, a, "-type") and i + 1 < args.len) {
             i += 1;
+            // the POSIX spelling stays f|d; the schema union is File|Dir
             if (std.mem.eql(u8, args[i], "f")) {
-                o.type_filter = .f;
+                o.type_filter = TypeFilter_f;
             } else if (std.mem.eql(u8, args[i], "d")) {
-                o.type_filter = .d;
+                o.type_filter = TypeFilter_d;
             } else {
                 std.debug.print("fx-find: unsupported -type '{s}'\n", .{args[i]});
                 return error.BadType;
             }
         } else if (std.mem.eql(u8, a, "-maxdepth") and i + 1 < args.len) {
             i += 1;
-            o.maxdepth = std.fmt.parseInt(usize, args[i], 10) catch {
+            const n = std.fmt.parseInt(u64, args[i], 10) catch {
                 std.debug.print("fx-find: bad -maxdepth '{s}'\n", .{args[i]});
                 return error.BadMaxdepth;
             };
+            o.maxdepth = n;
         } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
             std.debug.print("fx-find: unknown option '{s}'\n", .{a});
             return error.UnknownOption;
         } else {
-            // positional root
+            // positional root (LAST-WINS on further bare operands)
             o.root = try gpa.dupe(u8, a);
         }
     }
@@ -490,8 +690,8 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
         if (emit) {
             if (ctx.opts.type_filter) |tf| {
                 const ok = switch (tf) {
-                    .f => is_file,
-                    .d => is_dir,
+                    .File => is_file,
+                    .Dir => is_dir,
                 };
                 if (!ok) emit = false;
             }
@@ -639,7 +839,7 @@ pub fn main(init: std.process.Init) !void {
         if (!globMatch(g, root_base)) root_emit = false;
     }
     if (opts.type_filter) |tf| {
-        if (tf != .d) root_emit = false;
+        if (tf != .Dir) root_emit = false;
     }
     if (root_emit) {
         const dup = gpa.dupe(u8, opts.root) catch return error.Oom;

@@ -8,23 +8,33 @@
 //
 // Two arg forms:
 //   fx-head '{ n = 3, input = "/tmp/f" }'      Dhall record
-//   fx-head [-n N] [FILE]                      POSIX fallback
+//   fx-head [-n N] [FILE]                      POSIX
 //
-// - Dhall `n : Natural` defaults to 10; `input : Optional Text`: Some path =
-//   read that file, None = read stdin.
-// - POSIX: `-n N` sets the line count (default 10); a single FILE operand
-//   (stdin if none).  n=0 => emit nothing.
+// - Dhall `n : Natural` defaults to 10; `input : Text` (the schema's plain
+//   Text with the "" placeholder default): a path = read that file, "" or an
+//   omitted field = read stdin.
+// - POSIX (the GENERATED parser, src/generated/cli_head.zig, emitted from
+//   schemas/head.dhall by src/tools/fx-clijson.zig — pure Zig, no dhall at
+//   runtime; `zig build gen-cli-check` gates the regen): `-n N` sets the line
+//   count (default 10), `--lines=N` is the GNU long alias, and a single FILE
+//   operand binds `input` (stdin if none — the "" placeholder).  n=0 => emit
+//   nothing.  A second FILE operand is error.UnexpectedOperand (the hand
+//   parser's TooManyFiles); `-n` with no value is error.MissingValue; a
+//   non-numeric value is error.BadValue; the attached `-nN` form is
+//   error.UnknownOption (a Value short never clusters, schemas/README.md).
 // - Stream via extern read() into a 64KB buffer; lines may span chunk
 //   boundaries (carried in a small per-line accumulator).  Once `n` lines are
 //   emitted the fd is left unconsumed and the loop returns (early exit).
 // - A final line without a trailing '\n' still counts as a line.
 //
 // Divergences (deliberate scope cuts, documented): single-input only — GNU's
-// per-file `==> name <==` headers are omitted; combined `-nN` / `-N` forms
-// are not parsed (only `-n N`); a missing file is a hard error on stderr.
+// per-file `==> name <==` headers are omitted; a missing file is a hard error
+// on stderr.
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_head = @import("cli-head");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -53,15 +63,11 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/head.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Number of leading lines to emit (default 10).
-    n: usize = 10,
-    // Some path = read that file; null = read stdin.
-    input: ?[]const u8 = null,
-};
+const Options = cli_head.Options;
+const parsePosixArgs = cli_head.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     n: ?u64 = null,
@@ -180,6 +186,31 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 }
 
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // The hand-record spelling of stdin (`{ input = None Text }`) predates the
+    // schema and is ill-typed against plain Text; rewrite it at this single
+    // boundary to the schema spelling (an omitted field — the "" placeholder
+    // default; the head.dhall divergence note verbatim).
+    if (std.mem.indexOf(u8, src, "input = None") != null) {
+        const needle = "input = None Text";
+        if (std.mem.indexOf(u8, src, needle)) |pos| {
+            var buf: [512]u8 = undefined;
+            var n: usize = 0;
+            n += pos;
+            @memcpy(buf[0..n], src[0..pos]);
+            const rest = src[pos + needle.len ..];
+            @memcpy(buf[n .. n + rest.len], rest);
+            n += rest.len;
+            var zbuf: [512:0]u8 = undefined;
+            const rewritten = std.fmt.bufPrintZ(&zbuf, "{s}", .{buf[0..n]}) catch return error.DhallFields;
+            return evalDhallArgsSchema(rewritten, gpa);
+        }
+    }
+    return evalDhallArgsSchema(src, gpa);
+}
+
+/// The schema-typed record evaluator (the shared shape; parse -> infer ->
+/// normalize -> term_to_json -> field walk).  parse_source wants a C string.
+fn evalDhallArgsSchema(src: [:0]const u8, gpa: Allocator) !Options {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -224,41 +255,89 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.n) |n| o.n = @intCast(n);
+    if (opts.n) |n| o.n = n;
     if (opts.input) |inp| {
         o.input = try gpa.dupe(u8, inp);
     }
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-n")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("fx-head: -n requires a value\n", .{});
-                return error.MissingArg;
-            }
-            o.n = std.fmt.parseInt(usize, args[i], 10) catch {
-                std.debug.print("fx-head: invalid -n value '{s}'\n", .{args[i]});
-                return error.BadNumber;
-            };
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-head: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            if (o.input != null) {
-                std.debug.print("fx-head: more than one FILE operand\n", .{});
-                return error.TooManyFiles;
-            }
-            o.input = try gpa.dupe(u8, a);
-        }
-    }
-    return o;
+// The POSIX form is parsed by the GENERATED parser (cli_head.parsePosix,
+// aliased to parsePosixArgs above; schemas/head.dhall ->
+// src/generated/cli_head.zig).  stdin is o.input == "" (the schema's
+// placeholder for the old Optional None).
+
+// ---------------------------------------------------------------------------
+// The differential test — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion and evaluated by THIS file's evalDhallArgs (the exact
+// runtime path `fx-head '{ ... }'` takes), via the SHARED runner
+// (fx-cli.expectPosixEqualsRecord).  stdin is "" on BOTH sides (the schema's
+// placeholder for the old Optional None), so the empty-argv and empty-record
+// vectors pin the convergence.
+
+/// One differential vector (the shared generic runner; see fx-ls.zig).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_head, &.{ "schemas/head.dhall", "fx-core/schemas/head.dhall" }, evalDhallArgs, argv, user_record);
 }
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (stdin, n=10)
+    try expectPosixEqualsRecord(&.{"fx-head"}, "{ }");
+    try expectPosixEqualsRecord(&.{"fx-head"}, "{ input = \"\" }");
+    // -n with a separate-token value (the only -n spelling; -n7 is unknown)
+    try expectPosixEqualsRecord(&.{ "fx-head", "-n", "3" }, "{ n = 3 }");
+    try expectPosixEqualsRecord(&.{ "fx-head", "-n", "0" }, "{ n = 0 }");
+    // inline --long=value for the Value long (GNU alias)
+    try expectPosixEqualsRecord(&.{ "fx-head", "--lines=7" }, "{ n = 7 }");
+    // single FILE operand (the old parsePosixArgs smoke) composed with -n
+    try expectPosixEqualsRecord(&.{ "fx-head", "-n", "3", "/tmp/f" }, "{ n = 3, input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-head", "/tmp/f" }, "{ input = \"/tmp/f\" }");
+    // `--` ends flag parsing: a FILE that spells a flag
+    try expectPosixEqualsRecord(&.{ "fx-head", "--", "-n" }, "{ input = \"-n\" }");
+    // operand-before-flag interleave (the generated parser accepts flags
+    // anywhere)
+    try expectPosixEqualsRecord(&.{ "fx-head", "/tmp/f", "-n", "2" }, "{ n = 2, input = \"/tmp/f\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; the attached -n7 value form (a Value short never
+    // clusters); a cluster with an unknown letter
+    try std.testing.expectError(error.UnknownOption, cli_head.parsePosix(&.{ "fx-head", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_head.parsePosix(&.{ "fx-head", "-n7" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_head.parsePosix(&.{ "fx-head", "--bogus" }, gpa));
+    // a Value flag with no next token (the hand parser's error.MissingArg)
+    try std.testing.expectError(error.MissingValue, cli_head.parsePosix(&.{ "fx-head", "-n" }, gpa));
+    // a non-numeric / out-of-range -n (the hand parser's error.BadNumber)
+    try std.testing.expectError(error.BadValue, cli_head.parsePosix(&.{ "fx-head", "-n", "x" }, gpa));
+    try std.testing.expectError(error.BadValue, cli_head.parsePosix(&.{ "fx-head", "-n", "18446744073709551616" }, gpa));
+    // a second FILE operand (the hand parser's error.TooManyFiles).  The
+    // record form cannot express a second input at all.
+    try std.testing.expectError(error.UnexpectedOperand, cli_head.parsePosix(&.{ "fx-head", "a", "b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX analogue of the first is -Zz above.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/head.dhall", "fx-core/schemas/head.dhall" }) catch
+        @panic("cannot locate schemas/head.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ n = \"x\" }"));
+}
+
+// The POSIX form is parsed by the GENERATED parser (cli_head.parsePosix,
+// aliased to parsePosixArgs above).  See the differential block above for the
+// pinned surface and the deliberate deltas vs the hand parser this replaced.
 
 test "jsonParseOpts n and input string" {
     var buf: [1024]u8 = undefined;
@@ -287,43 +366,53 @@ test "jsonParseOpts null input" {
 test "evalDhallArgs record with n and input" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ n = 5, input = \"/tmp/f\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expectEqual(@as(usize, 5), o.n);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    defer std.testing.allocator.free(o.input);
+    try std.testing.expectEqual(@as(u64, 5), o.n);
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
 test "evalDhallArgs record None input (stdin), n defaults to 10" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    // the OLD hand-record stdin spelling, rewritten at the boundary (see
+    // evalDhallArgs)
     const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 10), o.n);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqual(@as(u64, 10), o.n);
+    try std.testing.expectEqualStrings("", o.input);
 }
 
 test "evalDhallArgs record n=0" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ n = 0 }", std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), o.n);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqual(@as(u64, 0), o.n);
+    try std.testing.expectEqualStrings("", o.input);
 }
 
-test "parsePosixArgs default (stdin, n=10)" {
-    const o = try parsePosixArgs(&.{}, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 10), o.n);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+test "parsePosixArgs (generated) default (stdin, n=10)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try parsePosixArgs(&.{"fx-head"}, aa);
+    try std.testing.expectEqual(@as(u64, 10), o.n);
+    try std.testing.expectEqualStrings("", o.input);
 }
 
-test "parsePosixArgs -n 0" {
-    const args = [_][:0]const u8{ "fx-head", "-n", "0" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), o.n);
+test "parsePosixArgs (generated) -n 0" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-head", "-n", "0" };
+    const o = try parsePosixArgs(&args, aa);
+    try std.testing.expectEqual(@as(u64, 0), o.n);
 }
 
-test "parsePosixArgs -n 3 with a file" {
-    const args = [_][:0]const u8{ "fx-head", "-n", "3", "/tmp/f" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expectEqual(@as(usize, 3), o.n);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+test "parsePosixArgs (generated) -n 3 with a file" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-head", "-n", "3", "/tmp/f" };
+    const o = try parsePosixArgs(&args, aa);
+    try std.testing.expectEqual(@as(u64, 3), o.n);
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
 // ---------------------------------------------------------------------------
@@ -550,8 +639,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const stdout_file = std.Io.File.stdout();
-    if (opts.input) |path| {
-        try headPath(opt_alloc, path, opts.n, stdout_file, init.io);
+    // stdin is the schema's "" placeholder (no FILE operand / omitted field).
+    if (opts.input.len > 0) {
+        try headPath(opt_alloc, opts.input, opts.n, stdout_file, init.io);
     } else {
         // stdin path: stream fd 0, early-exit at n lines.
         try emitHeadFd(opt_alloc, 0, opts.n, stdout_file, init.io);

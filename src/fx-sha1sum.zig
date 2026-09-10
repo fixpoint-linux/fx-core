@@ -6,14 +6,25 @@
 // libc file I/O plus the dhall module for typed arguments and
 // std.crypto.hash.Sha1 for the digest.
 //
-// Two arg forms:
-//   fx-sha1sum '{ input = "/tmp/f", binary = true }'   Dhall record
-//   fx-sha1sum [-b] [FILE...]                           POSIX fallback
+// Two arg forms, ONE source of truth (schemas/sha1sum.dhall — the fx-ls
+// migration template):
+//   fx-sha1sum '{ files = [ "/f" ], binary = True }'   Dhall record
+//   fx-sha1sum [-b] [FILE...]                           POSIX
 //
-// - Dhall `input : Optional Text` = the file to digest (None => stdin);
-//   `binary : Optional Bool` selects binary output mode (default false).
+// - Dhall `files : List Text` = the files to digest ([] => stdin) — the
+//   schema spells the struct's real field; the OLD singular-`input` record
+//   form is gone (stdin is the empty record).  `binary : Bool` selects
+//   binary output mode (default False).
 // - POSIX: 0 FILE operands => digest stdin; one or more FILE operands are each
 //   digested in argument order.  -b selects binary mode.
+//
+// The POSIX form is parsed by the GENERATED parser
+// (src/generated/cli_sha1sum.zig, emitted from schemas/sha1sum.dhall by
+// src/tools/fx-clijson.zig — pure Zig, no dhall at runtime; `zig build
+// gen-cli-check` gates the regen).  Deliberate strengthening over the hand
+// parser it replaced: the --binary long alias, -b short clusters, and a `--`
+// end-of-options terminator are accepted, and an unknown option names the
+// offending token.
 //
 // Output format (byte-exact, GNU-grounded):
 //   text (default)   '<hex>  <name>\n'   (TWO spaces)
@@ -22,12 +33,15 @@
 //
 // Divergences (deliberate scope cuts): no --check/-c verify mode (compute-only
 // v1); no GNU `==> name <==` multi-file headers (each line carries its own
-// name); a missing file is a hard error on stderr.  As in the other checksum
-// tools, a single `-` operand is NOT treated as stdin and there is no `--`
-// end-of-options terminator (scope omissions vs GNU).
+// name); a missing file is a hard error on stderr.  A single `-` operand is
+// NOT treated as stdin (scope omission vs GNU; the `--` end-of-options
+// terminator IS honored by the generated parser — tokens after it are FILE
+// operands).
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_sha1sum = @import("cli-sha1sum");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -56,17 +70,20 @@ const Hash = std.crypto.hash.Sha1;
 const digest_len = Hash.digest_length; // 20
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/sha1sum.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered file paths to digest.  Empty => stdin.
-    files: []const []const u8 = &.{},
-    binary: bool = false,
-};
+const Options = cli_sha1sum.Options;
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    // Fixed-capacity file list decoded from the JSON array (the fx-rm idiom:
+    // term_to_json encodes Dhall `List Text` as a JSON array, which the
+    // minimal string/bool parser does not handle).  64 covers every
+    // differential and realistic invocation; a record with more elements
+    // than the capacity fails the decode (error.DhallFields).
+    files: [64][]const u8 = undefined,
+    files_n: usize = 0,
+    // null (absent) => default False.
     binary: ?bool = null,
 };
 
@@ -136,6 +153,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
     while (true) {
@@ -143,12 +161,35 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
-            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "files")) {
+                        if (list_n >= res.files.len) return null; // over capacity
+                        res.files[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
             }
-            off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             const b = jsonParseBool(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "binary")) {
@@ -162,10 +203,60 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.files_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
+/// Bare `[]` (no type annotation) cannot be typed by the dhall-c typechecker
+/// this repo links ("cannot infer type of empty list (needs annotation)").
+/// The differential runner's record side renders completed schema values
+/// from fx-cli.renderDhallRecord, whose List arm emits the bare form, so the
+/// empty-default `files` would die at INFER time in evalDhallArgs on every
+/// all-defaults vector.  Repair the spelling at this command's single
+/// record-form entry point: an empty list whose neighbors are not
+/// identifier-ish gets the schema's `List Text` payload; a non-empty list is
+/// untouched (its elements carry the type).  A Text value can never legally
+/// place a bare `[]` between non-identifier bytes (the wrapping quotes are
+/// identifier-ish on the inside), so the rewrite is unambiguous.
+fn repairBareList(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "[]") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 2 == src.len or !isIdentByte(src[i + 2])))
+        {
+            const rep = "[] : List Text";
+            @memcpy(buf[n .. n + rep.len], rep);
+            n += rep.len;
+            i += 2;
+        } else {
+            buf[n] = src[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
+}
+
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // Repair a bare `[]` before the C parser sees it (see repairBareList —
+    // the differential runner's rendered records carry the untypeable
+    // spelling).  parse_source wants a C string, so the repaired copy is
+    // dupeZ'd; the unrepaired fast path passes `src` straight through.
+    var nb: [512]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareList(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -176,7 +267,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, zsrc, null, &err);
     if (t == null) {
         std.debug.print("fx-sha1sum: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -210,10 +301,10 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.files_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.files_n);
+        for (opts.files[0..opts.files_n], 0..) |fv, ei| arr[ei] = try gpa.dupe(u8, fv);
         o.files = arr;
     }
     if (opts.binary) |b| {
@@ -222,48 +313,42 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var files = std.ArrayList([]const u8).empty;
-    var binary = false;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            if (std.mem.eql(u8, a, "-b")) {
-                binary = true;
-                continue;
-            }
-            std.debug.print("fx-sha1sum: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .files = try files.toOwnedSlice(gpa), .binary = binary };
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "jsonParseOpts input string" {
+test "jsonParseOpts files array + binary" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/tmp/f\"}", &buf) orelse
+    const o = jsonParseOpts("{\"files\":[\"/tmp/a\",\"/tmp/b\"],\"binary\":true}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
-    try std.testing.expectEqual(@as(?bool, null), o.binary);
-}
-
-test "jsonParseOpts input null + binary bool" {
-    var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":null,\"binary\":true}", &buf) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqual(@as(usize, 2), o.files_n);
+    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
+    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
     try std.testing.expectEqual(@as(?bool, true), o.binary);
 }
 
-test "evalDhallArgs record with input" {
+test "jsonParseOpts empty files array + binary absent" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"files\":[]}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), o.files_n);
+    try std.testing.expectEqual(@as(?bool, null), o.binary);
+}
+
+test "repairBareList rewrites only a bare empty list" {
+    var nb: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{ binary = True, files = [] : List Text }",
+        repairBareList(&nb, "{ binary = True, files = [] }"),
+    );
+    // a non-empty list and list-adjacent bytes inside a Text literal pass through
+    const src2 = "{ files = [ \"][]\" ] }";
+    try std.testing.expectEqualStrings(src2, repairBareList(&nb, src2));
+}
+
+test "evalDhallArgs record with files + binary" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = \"/tmp/f\", binary = True }", std.testing.allocator);
+    const o = try evalDhallArgs("{ files = [ \"/tmp/f\" ], binary = True }", std.testing.allocator);
     defer std.testing.allocator.free(o.files);
     defer std.testing.allocator.free(o.files[0]);
     try std.testing.expectEqual(@as(usize, 1), o.files.len);
@@ -271,29 +356,74 @@ test "evalDhallArgs record with input" {
     try std.testing.expect(o.binary);
 }
 
-test "evalDhallArgs record None input (stdin)" {
+test "evalDhallArgs empty record (stdin)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
+    const o = try evalDhallArgs("{ }", std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), o.files.len);
     try std.testing.expect(!o.binary);
 }
 
-test "parsePosixArgs zero files + -b" {
-    const args = [_][:0]const u8{ "fx-sha1sum", "-b" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), o.files.len);
-    try std.testing.expect(o.binary);
+/// Locate schemas/sha1sum.dhall (tests run from varying CWDs).  Caller frees.
+fn sha1SchemaSrc() [:0]u8 {
+    return cli.readSchemaFile(std.testing.allocator, &.{ "schemas/sha1sum.dhall", "fx-core/schemas/sha1sum.dhall" }) catch
+        @panic("cannot locate schemas/sha1sum.dhall (run tests from the fx-core root)");
 }
 
-test "parsePosixArgs multiple files" {
-    const args = [_][:0]const u8{ "fx-sha1sum", "/tmp/a", "/tmp/b" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
-    defer std.testing.allocator.free(o.files[1]);
-    try std.testing.expectEqual(@as(usize, 2), o.files.len);
-    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
-    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
+/// One differential vector for fx-sha1sum — a one-line wrapper over the
+/// SHARED generic runner (fx-cli.expectPosixEqualsRecord; the fx-ls/fx-rm
+/// template each migration copies): the generated parser, the schema
+/// candidates, and this file's real runtime record evaluator are the whole
+/// per-command surface.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_sha1sum, &.{ "schemas/sha1sum.dhall", "fx-core/schemas/sha1sum.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (files = [], binary = False —
+    // a legal digest-stdin run)
+    try expectPosixEqualsRecord(&.{"fx-sha1sum"}, "{ }");
+    // -b alone, the --binary long alias, and the -b short cluster
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "-b" }, "{ binary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "--binary" }, "{ binary = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "-bb" }, "{ binary = True }");
+    // operands in argv order, with and without the flag
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "a" }, "{ files = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "-b", "a", "b" }, "{ files = [ \"a\", \"b\" ], binary = True }");
+    // a bare '-' is an operand, not a flag
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "-" }, "{ files = [ \"-\" ] }");
+    // `--` ends flag parsing: -b after it is a FILE operand
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "--", "-b" }, "{ files = [ \"-b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "-b", "--", "a" }, "{ files = [ \"a\" ], binary = True }");
+    // flag-operand interleave (GNU parity)
+    try expectPosixEqualsRecord(&.{ "fx-sha1sum", "a", "-b", "b" }, "{ files = [ \"a\", \"b\" ], binary = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (a
+    // failed parse exits the process); the arena reclaims them wholesale
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // the sha family accepts exactly one flag: -b/--binary.  Anything else
+    // "-..." is rejected (the record form cannot express a flag beyond
+    // binary).  --binary=x is a Value-flag spelling only; on a Flag-kind
+    // long the whole token is unknown.
+    try std.testing.expectError(error.UnknownOption, cli_sha1sum.parsePosix(&.{ "fx-sha1sum", "-c" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_sha1sum.parsePosix(&.{ "fx-sha1sum", "--check" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_sha1sum.parsePosix(&.{ "fx-sha1sum", "--binary=1" }, gpa));
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_sha1sum.parsePosix(&.{ "fx-sha1sum", "-bz" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field
+    // (the singular `input` key the OLD hand form read is gone from the
+    // schema), wrong field type.  The POSIX analogue of the first is -c
+    // above.
+    const schema_src = sha1SchemaSrc();
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = \"/f\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ binary = 5 }"));
 }
 
 // Known-answer tests: md5('hi\n') and md5('').
@@ -375,7 +505,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        opts = try parsePosixArgs(args, opt_alloc);
+        // the GENERATED parser (schemas/sha1sum.dhall ->
+        // src/generated/cli_sha1sum.zig); equality with the record form
+        // above is pinned by the differential tests (expectPosixEqualsRecord)
+        opts = try cli_sha1sum.parsePosix(args, opt_alloc);
     }
 
     const stdout_file = std.Io.File.stdout();

@@ -26,6 +26,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_link = @import("cli-link");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -70,13 +72,11 @@ const LinkErr = error{
 };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/link.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    old: ?[]const u8 = null,
-    new: ?[]const u8 = null,
-};
+const Options = cli_link.Options;
+const parsePosixArgs = cli_link.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     old: ?[]const u8 = null,
@@ -211,24 +211,6 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var operands = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-link: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try operands.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (operands.items.len != 2) {
-        std.debug.print("fx-link: exactly OLD and NEW operands required (got {d})\n", .{operands.items.len});
-        return if (operands.items.len < 2) error.MissingOperand else error.TooManyOperands;
-    }
-    return Options{ .old = operands.items[0], .new = operands.items[1] };
-}
-
 // ---------------------------------------------------------------------------
 // link logic
 // ---------------------------------------------------------------------------
@@ -291,9 +273,9 @@ fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     out.append(gpa, '{') catch return error.NoMem;
     out.appendSlice(gpa, "\"old\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.old orelse "");
+    try caslog.jsonEscape(gpa, &out, o.old);
     out.appendSlice(gpa, ",\"new\":") catch return error.NoMem;
-    try caslog.jsonEscape(gpa, &out, o.new orelse "");
+    try caslog.jsonEscape(gpa, &out, o.new);
     out.append(gpa, '}') catch return error.NoMem;
     return out.toOwnedSlice(gpa) catch return error.NoMem;
 }
@@ -308,26 +290,95 @@ fn getCwd(gpa: Allocator) []const u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "parsePosixArgs OLD NEW" {
-    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_i.deinit();
-    const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-link", "/a", "/b" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqualStrings("/a", o.old.?);
-    try std.testing.expectEqualStrings("/b", o.new.?);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent ((dflt //
+// user) : ty via fx-cli.completeSrc, rendered back to a record literal and
+// evaluated by THIS file's evalDhallArgs — the exact runtime path
+// `fx-link '{ ... }'` takes).  Both sides are re-encoded to the canonical
+// term_to_json wire shape (the SHARED comptime-reflection encoder
+// fx-cli.encodeOptionsWire) and compared as strings, so the assertion is
+// exact and FIELD-COMPLETE by construction.
+
+/// One differential vector for fx-link — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_link, &.{ "schemas/link.dhall", "fx-core/schemas/link.dhall" }, evalDhallArgs, argv, user_record);
 }
 
-test "parsePosixArgs operand count errors" {
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: no operands (the exactly-two check lives in main()) ---
+    try expectPosixEqualsRecord(&.{ "fx-link" }, "{ }");
+
+    // --- positional OLD NEW: both slots, in order ---
+    try expectPosixEqualsRecord(&.{ "fx-link", "/a", "/b" }, "{ old = \"/a\", new = \"/b\" }");
+    try expectPosixEqualsRecord(&.{ "fx-link", "/a" }, "{ old = \"/a\" }");
+    try expectPosixEqualsRecord(&.{ "fx-link", "op", "/b" }, "{ old = \"op\", new = \"/b\" }");
+
+    // --- '--' terminator: a flag-looking token after it is an operand ---
+    try expectPosixEqualsRecord(&.{ "fx-link", "--", "/a", "/b" }, "{ old = \"/a\", new = \"/b\" }");
+
+    // --- exotic operand bytes: escaping parity between the raw POSIX
+    // operand and the rendered record (the a-b.txt-with-spaces class) ---
+    try expectPosixEqualsRecord(&.{ "fx-link", "a b", "/x" }, "{ old = \"a b\", new = \"/x\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // NO flags exist on link (schemas/link.dhall flags = []): ANY option
+    // token is unknown.  GNU link has none beyond --help/--version.
+    try std.testing.expectError(error.UnknownOption, cli_link.parsePosix(&.{ "fx-link", "-s", "/a", "/b" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_link.parsePosix(&.{ "fx-link", "--bogus" }, gpa));
+
+    // a third operand: UnexpectedOperand (the record form cannot express a
+    // third positional at all)
+    try std.testing.expectError(error.UnexpectedOperand, cli_link.parsePosix(&.{ "fx-link", "/a", "/b", "/c" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type (the hand record form's `old = None Text` is
+    // ill-typed against the schema's Text placeholders — omit instead)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/link.dhall", "fx-core/schemas/link.dhall" }) catch
+        @panic("cannot locate schemas/link.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ old = None Text }"));
+}
+
+test "parsePosixArgs OLD NEW (generated)" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const too_few = [_][:0]const u8{"fx-link"};
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&too_few, aa));
-    const too_many = [_][:0]const u8{ "fx-link", "a", "b", "c" };
-    try std.testing.expectError(error.TooManyOperands, parsePosixArgs(&too_many, aa));
-    const unk = [_][:0]const u8{ "fx-link", "-s", "a", "b" };
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&unk, aa));
+    const args = [_][]const u8{ "fx-link", "/a", "/b" };
+    const o = try parsePosixArgs(&args, aa);
+    try std.testing.expectEqualStrings("/a", o.old);
+    try std.testing.expectEqualStrings("/b", o.new);
+}
+
+test "parsePosixArgs defaults + third operand rejected (generated)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    // no operands: both stay at the "" placeholders (the schema dflt); the
+    // exactly-two-operands check lives in main()
+    const dflt = try parsePosixArgs(&.{"fx-link"}, aa);
+    try std.testing.expectEqualStrings("", dflt.old);
+    try std.testing.expectEqualStrings("", dflt.new);
+    // a single '-' token is a bare OPERAND here (link has no flags), not an
+    // option: operand slot 1
+    const dash = try parsePosixArgs(&.{ "fx-link", "-" }, aa);
+    try std.testing.expectEqualStrings("-", dash.old);
+    const too_many = [_][]const u8{ "fx-link", "a", "b", "c" };
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&too_many, aa));
 }
 
 test "evalDhallArgs old/new" {
@@ -336,8 +387,8 @@ test "evalDhallArgs old/new" {
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ old = \"/a\", new = \"/b\" }", aa);
-    try std.testing.expectEqualStrings("/a", o.old.?);
-    try std.testing.expectEqualStrings("/b", o.new.?);
+    try std.testing.expectEqualStrings("/a", o.old);
+    try std.testing.expectEqualStrings("/b", o.new);
 }
 
 test "posixArgsJson canonical schema" {
@@ -492,6 +543,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], aa);
     } else {
+        // the GENERATED parser (schemas/link.dhall -> src/generated/cli_link.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
     }
     const old = opts.old orelse {

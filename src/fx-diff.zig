@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_diff = @import("cli-diff");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -43,14 +45,16 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/diff.dhall)
 // ---------------------------------------------------------------------------
+//
+// a/b are plain Text with the "" placeholder defaults (a positional must
+// bind a plain Text field): the both-operands-present check stays in main()
+// — the old `a = None Text` record spelling is ill-typed against the
+// schema's Text, omit the field instead.
 
-const Options = struct {
-    a: ?[]const u8 = null,
-    b: ?[]const u8 = null,
-    recursive: bool = false,
-};
+const Options = cli_diff.Options;
+const parsePosixArgs = cli_diff.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     a: ?[]const u8 = null,
@@ -205,26 +209,81 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-r")) {
-            o.recursive = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-diff: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else if (o.a == null) {
-            o.a = try gpa.dupe(u8, a);
-        } else if (o.b == null) {
-            o.b = try gpa.dupe(u8, a);
-        } else {
-            std.debug.print("fx-diff: too many positional arguments\n", .{});
-            return error.TooManyArgs;
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent ((dflt //
+// user) : ty via fx-cli.completeSrc, rendered back to a record literal and
+// evaluated by THIS file's evalDhallArgs — the exact runtime path
+// `fx-diff '{ ... }'` takes).  Both sides are re-encoded to the canonical
+// term_to_json wire shape (the SHARED comptime-reflection encoder
+// fx-cli.encodeOptionsWire) and compared as strings, so the assertion is
+// exact and FIELD-COMPLETE by construction.
+
+/// One differential vector for fx-diff — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_diff, &.{ "schemas/diff.dhall", "fx-core/schemas/diff.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: both paths at the "" placeholders (the both-present
+    // check lives in main()) ---
+    try expectPosixEqualsRecord(&.{ "fx-diff" }, "{ }");
+
+    // --- positional A B: both slots, in order ---
+    try expectPosixEqualsRecord(&.{ "fx-diff", "/f1", "/f2" }, "{ a = \"/f1\", b = \"/f2\" }");
+    try expectPosixEqualsRecord(&.{ "fx-diff", "/f1" }, "{ a = \"/f1\" }");
+
+    // --- the -r Flag: short, long alias, cluster, composed with operands,
+    // duplicate-flag idempotence ---
+    try expectPosixEqualsRecord(&.{ "fx-diff", "-r", "/d1", "/d2" }, "{ a = \"/d1\", b = \"/d2\", recursive = True }");
+    try expectPosixEqualsRecord(&.{ "fx-diff", "--recursive" }, "{ recursive = True }");
+    try expectPosixEqualsRecord(&.{ "fx-diff", "-rr" }, "{ recursive = True }");
+    try expectPosixEqualsRecord(&.{ "fx-diff", "/d1", "-r", "/d2" }, "{ a = \"/d1\", b = \"/d2\", recursive = True }");
+
+    // --- operand-BEFORE-flag interleave + '--' terminator ---
+    try expectPosixEqualsRecord(&.{ "fx-diff", "--", "-r", "/x" }, "{ a = \"-r\", b = \"/x\" }");
+
+    // --- exotic operand bytes: escaping parity between the raw POSIX
+    // operands and the rendered record ---
+    try expectPosixEqualsRecord(&.{ "fx-diff", "a b.txt", "c.txt" }, "{ a = \"a b.txt\", b = \"c.txt\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option (POSIX) ~ unknown field (record form, below)
+    try std.testing.expectError(error.UnknownOption, cli_diff.parsePosix(&.{ "fx-diff", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_diff.parsePosix(&.{ "fx-diff", "--bogus" }, gpa));
+
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_diff.parsePosix(&.{ "fx-diff", "-rZ" }, gpa));
+
+    // -r takes no value: the = suffix does not split on a Flag kind
+    try std.testing.expectError(error.UnknownOption, cli_diff.parsePosix(&.{ "fx-diff", "--recursive=true" }, gpa));
+
+    // a THIRD operand: TooManyArgs by the old hand spelling, now
+    // UnexpectedOperand (the record form cannot express a third positional)
+    try std.testing.expectError(error.UnexpectedOperand, cli_diff.parsePosix(&.{ "fx-diff", "a", "b", "c" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type (the hand record form's `a = None Text` is
+    // ill-typed against the schema's Text placeholders — omit instead)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/diff.dhall", "fx-core/schemas/diff.dhall" }) catch
+        @panic("cannot locate schemas/diff.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ a = None Text }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ recursive = 5 }"));
 }
 
 test "jsonParseOpts a/b/recursive" {
@@ -246,10 +305,10 @@ test "jsonParseOpts recursive true" {
 test "evalDhallArgs record" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ a = \"/tmp/f1\", b = \"/tmp/f2\", recursive = True }", std.testing.allocator);
-    defer std.testing.allocator.free(o.a.?);
-    defer std.testing.allocator.free(o.b.?);
-    try std.testing.expectEqualStrings("/tmp/f1", o.a.?);
-    try std.testing.expectEqualStrings("/tmp/f2", o.b.?);
+    defer std.testing.allocator.free(o.a);
+    defer std.testing.allocator.free(o.b);
+    try std.testing.expectEqualStrings("/tmp/f1", o.a);
+    try std.testing.expectEqualStrings("/tmp/f2", o.b);
     try std.testing.expect(o.recursive);
 }
 
@@ -673,14 +732,20 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/diff.dhall -> src/generated/cli_diff.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
-    const a = opts.a orelse {
+    // a/b are plain Text (the schema's "" placeholder); "" = unbound and
+    // the both-present check stays in main() (a lone "-" is a legit path,
+    // so emptiness — not optionality — is the unbound marker)
+    const a = if (opts.a.len > 0) opts.a else {
         std.debug.print("fx-diff: missing required 'a' path\n", .{});
         return error.MissingPath;
     };
-    const b = opts.b orelse {
+    const b = if (opts.b.len > 0) opts.b else {
         std.debug.print("fx-diff: missing required 'b' path\n", .{});
         return error.MissingPath;
     };

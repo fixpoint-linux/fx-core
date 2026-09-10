@@ -8,13 +8,17 @@
 // head/tail binaries).
 //
 // Two arg forms:
-//   fx-cat '{ input = "/tmp/f" }'               Dhall record
+//   fx-cat '{ files = [ "/tmp/f" ] }'           Dhall record
 //   fx-cat [FILE...]                            POSIX fallback
 //
-// - Dhall `input : Optional Text`: Some path = concatenate that file; None =
-//   read stdin.
+// - Dhall `files : List Text` (schemas/cat.dhall): the ordered files to
+//   concatenate; empty (or omitted) => read stdin.  The legacy singular
+//   `{ input = "/x" }` spelling is REJECTED (strict typed record).
 // - POSIX: 0 FILE operands => read stdin; one or more FILE operands are
-//   concatenated in argument order.
+//   concatenated in argument order.  Parsed by the GENERATED parser
+//   (src/generated/cli_cat.zig, emitted from schemas/cat.dhall by
+//   src/tools/fx-clijson.zig — pure Zig, no dhall at runtime); equality
+//   with the record form is pinned by the differential tests below.
 // - Chunked, binary-safe copy: extern read() into a 64KB buffer, written out
 //   per chunk until EOF.  No line splitting, no trailing-newline fixups.
 //
@@ -23,6 +27,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_cat = @import("cli-cat");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -51,16 +57,14 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/cat.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered file paths to concatenate in argument order.  Empty => stdin.
-    files: []const []const u8 = &.{},
-};
+const Options = cli_cat.Options;
+const parsePosixArgs = cli_cat.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    files: ?[]const []const u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -127,7 +131,7 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
     return null;
 }
 
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
@@ -140,10 +144,62 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
-            }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: `files` is read element-by-element (List Text);
+            // any other list is skipped balanced.  Elements point into the
+            // caller's scratch buf; the element ARRAY is gpa-owned.
+            if (std.mem.eql(u8, key, "files")) {
+                var items = std.ArrayList([]const u8).empty;
+                i += 1; // consume '['
+                jsonSkipWs(s, &i);
+                if (jsonExpect(s, &i, ']')) {
+                    res.files = items.toOwnedSlice(gpa) catch return null;
+                } else {
+                    var ok = true;
+                    while (ok) {
+                        jsonSkipWs(s, &i);
+                        if (i < s.len and s[i] == '"') {
+                            const el = jsonParseString(s, &i, buf[off..]) orelse return null;
+                            items.append(gpa, el) catch return null;
+                            off += el.len;
+                        } else return null;
+                        jsonSkipWs(s, &i);
+                        if (jsonExpect(s, &i, ',')) continue;
+                        if (jsonExpect(s, &i, ']')) break;
+                        ok = false;
+                    }
+                    if (!ok) return null;
+                    res.files = items.toOwnedSlice(gpa) catch return null;
+                }
+            } else {
+                var depth: usize = 0;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '[') depth += 1;
+                    if (s[i] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth != 0) return null;
+            }
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             _ = jsonParseBool(s, &i) orelse return null;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
@@ -158,6 +214,20 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
 }
 
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // The rendered record is annotated with the schema's ty, spelled inline
+    // (single source of truth: schemas/cat.dhall): the dhall subset cannot
+    // infer an EMPTY list literal (`files = []`, the default the differential's
+    // rendered records always carry), and the annotation makes the record form
+    // STRICTLY typed — the legacy singular `{ input = "/x" }` spelling is
+    // rejected instead of being silently mapped onto files[0].
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ files : List Text }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -168,7 +238,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-cat: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -196,79 +266,124 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-cat: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
 
     var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.files) |fs| {
+        // files elements point into the JSON scratch buf; dupe them out
+        // (the generated Options' List-Text views are gpa-owned like the
+        // parser's argv dupes)
+        const arr = try gpa.alloc([]const u8, fs.len);
+        for (fs, 0..) |item, idx| arr[idx] = try gpa.dupe(u8, item);
         o.files = arr;
     }
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-cat: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .files = try files.toOwnedSlice(gpa) };
-}
-
-test "jsonParseOpts input string" {
+test "jsonParseOpts files list" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/tmp/f\"}", &buf) orelse
+    const gpa = std.testing.allocator;
+    const o = jsonParseOpts("{\"files\":[\"/tmp/a\",\"/tmp/b\"]}", &buf, gpa) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    defer gpa.free(o.files.?);
+    try std.testing.expectEqual(@as(usize, 2), o.files.?.len);
+    try std.testing.expectEqualStrings("/tmp/a", o.files.?[0]);
+    try std.testing.expectEqualStrings("/tmp/b", o.files.?[1]);
 }
 
-test "jsonParseOpts input null" {
+test "jsonParseOpts empty files list" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":null}", &buf) orelse
+    const gpa = std.testing.allocator;
+    const o = jsonParseOpts("{\"files\":[]}", &buf, gpa) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    defer gpa.free(o.files.?);
+    try std.testing.expectEqual(@as(usize, 0), o.files.?.len);
 }
 
-test "evalDhallArgs record with input" {
+test "evalDhallArgs record with files" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = \"/tmp/f\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try evalDhallArgs("{ files = [ \"/tmp/f\" ] }", aa);
     try std.testing.expectEqual(@as(usize, 1), o.files.len);
     try std.testing.expectEqualStrings("/tmp/f", o.files[0]);
 }
 
-test "evalDhallArgs record None input (stdin)" {
+test "evalDhallArgs record empty list (stdin)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try evalDhallArgs("{ files = [] : List Text }", aa);
     try std.testing.expectEqual(@as(usize, 0), o.files.len);
 }
 
-test "parsePosixArgs zero files (stdin)" {
-    const o = try parsePosixArgs(&.{}, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), o.files.len);
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/fx-chown template
+// applied to a many-positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/cat.dhall
+// -> src/generated/cli_cat.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the SHARED runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.
+
+/// One differential vector for fx-cat — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_cat, &.{ "schemas/cat.dhall", "fx-core/schemas/cat.dhall" }, evalDhallArgs, argv, user_record);
 }
 
-test "parsePosixArgs multiple files" {
-    const args = [_][:0]const u8{ "fx-cat", "/tmp/a", "/tmp/b", "/tmp/c" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
-    defer std.testing.allocator.free(o.files[1]);
-    defer std.testing.allocator.free(o.files[2]);
-    try std.testing.expectEqual(@as(usize, 3), o.files.len);
-    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
-    try std.testing.expectEqualStrings("/tmp/c", o.files[2]);
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (files = [] => stdin)
+    try expectPosixEqualsRecord(&.{"fx-cat"}, "{ }");
+
+    // FILE operands: one, many, duplicates (order-preserving List), '-' and
+    // '--' are plain operands (cat has NO flags)
+    try expectPosixEqualsRecord(&.{ "fx-cat", "/tmp/a" }, "{ files = [ \"/tmp/a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-cat", "/tmp/a", "/tmp/b", "/tmp/c" }, "{ files = [ \"/tmp/a\", \"/tmp/b\", \"/tmp/c\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-cat", "/x", "/x" }, "{ files = [ \"/x\", \"/x\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-cat", "-" }, "{ files = [ \"-\" ] }");
+    // `--` ends flag parsing (a no-op here); a flag-looking token after it is
+    // an operand
+    try expectPosixEqualsRecord(&.{ "fx-cat", "--", "-n" }, "{ files = [ \"-n\" ] }");
+
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    // against the raw POSIX operand
+    try expectPosixEqualsRecord(&.{ "fx-cat", "a b.txt" }, "{ files = [ \"a b.txt\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-cat", "say \"hi\".txt" }, "{ files = [ \"say \\\"hi\\\".txt\" ] }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: NO flags — every "-..." token is error.UnknownOption
+    try std.testing.expectError(error.UnknownOption, cli_cat.parsePosix(&.{ "fx-cat", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_cat.parsePosix(&.{ "fx-cat", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_cat.parsePosix(&.{ "fx-cat", "-n", "5" }, gpa));
+
+    // the record form's own rejections: unknown field, wrong field type, and
+    // the LEGACY singular `input` spelling (rejected loudly — it used to map
+    // silently onto files[0])
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/cat.dhall", "fx-core/schemas/cat.dhall" }) catch
+        @panic("cannot locate schemas/cat.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ files = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = \"/x\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +479,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/cat.dhall -> src/generated/cli_cat.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 

@@ -4,12 +4,21 @@
 // final pathname component).  Pure libc + the dhall module for typed args — no
 // datalog / journal dependency.
 //
-// Two arg forms:
-//   fx-dirname '{ input = "/a/b/c" }'   Dhall record
-//   fx-dirname [NAME]...                POSIX fallback
+// Two arg forms (both derived from schemas/dirname.dhall — the fx-ls/whoami
+// migration template applied to the list-of-operands command):
+//   fx-dirname '{ names = ["/a/b", "/x"] }'   Dhall record
+//   fx-dirname [NAME]...                      POSIX
 //
-// - Dhall `input : Optional Text` = the single path to strip.
-// - POSIX: one or more NAME operands, each printed on its own line.
+// - Dhall `names : List Text` = the ordered pathnames to strip.
+// - POSIX: the NAME operands accumulate in argv order, one directory per
+//   line.  The POSIX form is parsed by the GENERATED parser
+//   (src/generated/cli_dirname.zig, emitted from schemas/dirname.dhall by
+//   src/tools/fx-clijson.zig — pure Zig, no dhall at runtime; `zig build
+//   gen-cli-check` gates the regen).  Deliberate strengthening over the hand
+//   parser it replaced: an unknown option is error.UnknownOption (with a
+//   usage-shaped diagnostic naming the offending token) and `--` ends flag
+//   parsing (`fx-dirname -- -weird` names the directory `-weird`), where the
+//   hand parser could only treat every token as an operand.
 //
 // Behavior (GNU-grounded, verified against host coreutils): `dirname a` -> `.`;
 // `/a/b/c` -> `/a/b`; `/` -> `/`; `a/b/` -> `a`; `''` -> `.`.  Trailing slashes
@@ -21,6 +30,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_dirname = @import("cli-dirname");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -34,16 +45,18 @@ const import_mod = dh.import_mod;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/dirname.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered pathnames to print directory components of.  Empty => error.
-    names: []const []const u8 = &.{},
-};
+const Options = cli_dirname.Options;
+const parsePosixArgs = cli_dirname.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    // Fixed-capacity operand list decoded from the JSON array.  64 covers
+    // every differential and realistic invocation; a record with more
+    // elements than the capacity fails the decode (error.DhallFields).
+    names: [64][]const u8 = undefined,
+    names_n: usize = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +124,7 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     var i: usize = 0;
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
@@ -119,11 +133,37 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
-            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the key's list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "names")) {
+                        if (list_n >= res.names.len) return null; // over capacity
+                        res.names[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
             }
+        } else if (i < s.len and s[i] == '"') {
+            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
             off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             _ = jsonParseBool(s, &i) orelse return null;
@@ -135,6 +175,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.names_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
@@ -183,27 +224,13 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.names_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.names_n);
+        for (opts.names[0..opts.names_n], 0..) |sv, ei| arr[ei] = try gpa.dupe(u8, sv);
         o.names = arr;
     }
     return o;
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var names = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-dirname: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try names.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .names = try names.toOwnedSlice(gpa) };
 }
 
 // ---------------------------------------------------------------------------
@@ -242,29 +269,105 @@ test "dirnameOf vectors" {
     try std.testing.expectEqualStrings("/", dirnameOf("/foo"));
 }
 
-test "jsonParseOpts input string" {
+test "jsonParseOpts names array" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/a/b/c\"}", &buf) orelse
+    const o = jsonParseOpts("{\"names\":[\"/a/b/c\",\"/x\"]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/a/b/c", o.input.?);
+    try std.testing.expectEqual(@as(usize, 2), o.names_n);
+    try std.testing.expectEqualStrings("/a/b/c", o.names[0]);
+    try std.testing.expectEqualStrings("/x", o.names[1]);
 }
 
-test "jsonParseOpts input null" {
+test "jsonParseOpts names empty array" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":null}", &buf) orelse
+    const o = jsonParseOpts("{\"names\":[]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqual(@as(usize, 0), o.names_n);
 }
 
-test "parsePosixArgs multiple names" {
-    const args = [_][:0]const u8{ "fx-dirname", "/a/b/c", "/x" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.names);
-    defer std.testing.allocator.free(o.names[0]);
-    defer std.testing.allocator.free(o.names[1]);
+test "evalDhallArgs names list" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ names = [ \"/a/b/c\", \"/x\" ] }", std.testing.allocator);
+    defer std.testing.allocator.free(o.names); // declared first -> runs last (LIFO)
+    defer for (o.names) |e| std.testing.allocator.free(e);
     try std.testing.expectEqual(@as(usize, 2), o.names.len);
     try std.testing.expectEqualStrings("/a/b/c", o.names[0]);
     try std.testing.expectEqualStrings("/x", o.names[1]);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/whoami template
+// applied to the list-of-operands command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-dirname '{ ... }'` takes.  Both sides are re-encoded
+// with the SHARED comptime-reflection encoder (fx-cli.encodeOptionsWire) and
+// compared as strings, so the assertion is exact and field-complete by
+// construction.
+
+/// One differential vector — the shared generic runner (fx-cli.
+/// expectPosixEqualsRecord; see fx-ls.zig) with this command's plumbing.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_dirname, &.{ "schemas/dirname.dhall", "fx-core/schemas/dirname.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // positional NAME operands accumulate in argv order
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "/a/b/c" }, "{ names = [ \"/a/b/c\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "/a/b/c", "/x" }, "{ names = [ \"/a/b/c\", \"/x\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "a", "b", "c" }, "{ names = [ \"a\", \"b\", \"c\" ] }");
+    // bare '-' is an operand; '--' ends flags (then a leading-dash operand)
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "-" }, "{ names = [ \"-\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "--", "-weird" }, "{ names = [ \"-weird\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "--", "/a/b", "-x" }, "{ names = [ \"/a/b\", \"-x\" ] }");
+    // exotic operand bytes: the record side's renderDhallRecord escaping
+    // must round-trip the raw POSIX operand (see fx-ls.zig SHOULD-FIX 3a)
+    try expectPosixEqualsRecord(&.{ "fx-dirname", "a b/c\"d" }, "{ names = [ \"a b/c\\\"d\" ] }");
+}
+
+test "DIFFERENTIAL: all-defaults equivalence (empty argv vs empty record)" {
+    // Pinned DIRECTLY (not via the shared runner): renderDhallRecord emits a
+    // bare "[]" for an empty List Text (and bare None), which evalDhallArgs'
+    // plain infer_type cannot type ("cannot infer type of empty list") — a
+    // known fx-cli gap this batch is the first to hit (ls/whoami have no
+    // list field).  The runner matrix therefore covers non-empty records
+    // only, and the empty/default equivalence is asserted here through the
+    // SAME encodeOptionsWire encoder the runner compares with.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_dirname.parsePosix(&.{"fx-dirname"}, gpa);
+    const record_o = try evalDhallArgs("{ names = [] : List Text }", gpa);
+
+    var wire_posix = try cli.encodeOptionsWire(cli_dirname.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try cli.encodeOptionsWire(cli_dirname.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    try std.testing.expectEqualStrings(wire_record.items, wire_posix.items);
+}
+
+test "DIFFERENTIAL: rejection parity — the POSIX form rejects flags loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // dirname has NO flags in this slice: any -token is unknown
+    try std.testing.expectError(error.UnknownOption, cli_dirname.parsePosix(&.{ "fx-dirname", "-z" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_dirname.parsePosix(&.{ "fx-dirname", "--zero" }, gpa));
+    // the record form cannot express flags at all (SchemaCheck on typo)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/dirname.dhall", "fx-core/schemas/dirname.dhall" }) catch
+        @panic("cannot locate schemas/dirname.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
 }
 
 // ---------------------------------------------------------------------------

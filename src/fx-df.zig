@@ -6,13 +6,14 @@
 // size is u64 end-to-end, probe-verified translatable under Zig 0.16
 // @cImport).
 //
-// Two arg forms:
-//   fx-df '{ path = Some "/" }' / fx-df '{ path = None Text }'  Dhall record
-//   fx-df [--rows] [PATH]                                       POSIX fallback
-//
-// - Dhall `path : Optional Text` = a single operand (bare `None` needs the
-//   `Text` annotation to typecheck: `{ path = None Text }`); `rows : Bool` =
-//   --rows.  POSIX: `--rows` and one optional PATH operand.
+// Two arg forms, ONE source of truth (schemas/df.dhall — the STEP-3
+// migration template):
+//   fx-df '{ path = "/", rows = True }'   Dhall record (absent path = "" =
+//       the sweep; the old `{ path = None Text }` spelling is ill-typed
+//       against the schema's Text)
+//   fx-df [--rows] [PATH]                 POSIX (the GENERATED parser,
+//       src/generated/cli_df.zig; no PATH => the sweep, a second PATH is
+//       error.UnexpectedOperand)
 // - PATH set -> ONE row for the fs containing PATH via statvfs(PATH); the
 //   device/mountpoint names are resolved by stat()ing each /proc/self/mounts
 //   entry and matching st_dev (GNU df's resolution, last match wins so an
@@ -55,6 +56,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
+const cli_df = @import("cli-df");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -73,14 +76,11 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/df.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Single-operand form; null = sweep /proc/self/mounts.
-    path: ?[]const u8 = null,
-    rows: bool = false, // --rows: canonical wire rows instead of display text
-};
+const Options = cli_df.Options;
+const parsePosixArgs = cli_df.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     path: ?[]const u8 = null,
@@ -225,31 +225,76 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.path) |v| o.path = try gpa.dupe(u8, v);
     if (opts.rows orelse false) o.rows = true;
+    if (opts.path) |v| if (v.len > 0) {
+        o.path = try gpa.dupe(u8, v);
+    };
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 1 and a[0] == '-') {
-            std.debug.print("fx-df: invalid option -- '{c}'\n", .{a[1]});
-            return error.UnknownOption;
-        } else {
-            if (o.path) |prev| {
-                gpa.free(prev);
-                std.debug.print("fx-df: extra operand '{s}'\n", .{a});
-                return error.TooManyOperands;
-            }
-            o.path = try gpa.dupe(u8, a);
-        }
-    }
-    return o;
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a long-flag + single-positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/df.dhall
+// -> src/generated/cli_df.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the shared runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.  df's surface: the --rows dispatch flag (no
+// short), one single PATH positional (absent = the /proc/self/mounts sweep),
+// and rejection parity.
+
+/// One differential vector for fx-df — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_df, &.{ "schemas/df.dhall", "fx-core/schemas/df.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // the sweep default: empty argv == the empty record
+    try expectPosixEqualsRecord(&.{"fx-df"}, "{ }");
+    // the --rows dispatch flag (no short spelling), alone and composed
+    try expectPosixEqualsRecord(&.{ "fx-df", "--rows" }, "{ rows = True }");
+    try expectPosixEqualsRecord(&.{ "fx-df", "--rows", "/tmp" }, "{ path = \"/tmp\", rows = True }");
+    // PATH positional: bare operand, bare '-' operand, '--' terminator
+    try expectPosixEqualsRecord(&.{ "fx-df", "/" }, "{ path = \"/\" }");
+    try expectPosixEqualsRecord(&.{ "fx-df", "-" }, "{ path = \"-\" }");
+    try expectPosixEqualsRecord(&.{ "fx-df", "--", "--rows" }, "{ path = \"--rows\" }");
+    try expectPosixEqualsRecord(&.{ "fx-df", "--rows", "--", "/" }, "{ path = \"/\", rows = True }");
+    // operand-BEFORE-flag interleave (GNU parity)
+    try expectPosixEqualsRecord(&.{ "fx-df", "/", "--rows" }, "{ path = \"/\", rows = True }");
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    try expectPosixEqualsRecord(&.{ "fx-df", "a b dir" }, "{ path = \"a b dir\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: --rows is the only flag; PATH is single — GNU df's multiple
+    // operands are a documented scope cut, so a second operand is
+    // error.UnexpectedOperand (the hand parser's error.TooManyOperands),
+    // an unknown option is error.UnknownOption
+    try std.testing.expectError(error.UnknownOption, cli_df.parsePosix(&.{ "fx-df", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_df.parsePosix(&.{ "fx-df", "--rows=true" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_df.parsePosix(&.{ "fx-df", "/a", "/b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/df.dhall", "fx-core/schemas/df.dhall" }) catch
+        @panic("cannot locate schemas/df.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ rows = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = None Text }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -665,39 +710,42 @@ test "rows mode: canonical bytes + decode round-trip" {
     }
 }
 
-test "evalDhallArgs: path Some/None Text + rows" {
+test "evalDhallArgs: record with rows and path" {
     const gpa = std.testing.allocator;
     {
-        const o = try evalDhallArgs("{ path = Some \"/\", rows = True }", gpa);
-        defer gpa.free(o.path.?);
-        try std.testing.expectEqualStrings("/", o.path.?);
+        // the completed-record spelling the differential drives: absent path
+        // = "" = the sweep; Some Text also works (evalDhallArgs infers the
+        // record's own type, so the Optional spelling stays legal at runtime)
+        const o = try evalDhallArgs("{ path = \"/\", rows = True }", gpa);
+        defer gpa.free(o.path);
+        try std.testing.expectEqualStrings("/", o.path);
         try std.testing.expect(o.rows);
     }
     {
-        const o = try evalDhallArgs("{ path = None Text }", gpa);
-        try std.testing.expect(o.path == null);
+        const o = try evalDhallArgs("{ }", gpa);
+        try std.testing.expectEqualStrings("", o.path);
         try std.testing.expect(!o.rows);
     }
 }
 
-test "parsePosixArgs: --rows, operand, errors" {
-    const gpa = std.testing.allocator;
+test "generated parsePosix: --rows, operand, errors" {
+    // an arena over the testing allocator: the generated parser does not
+    // free operand dupes bound before a failing token (a failed parse exits
+    // the process) — same discipline as the hand parser it replaced
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
     {
-        const args = [_][:0]const u8{ "fx-df", "--rows", "/" };
-        const o = try parsePosixArgs(&args, gpa);
-        defer gpa.free(o.path.?);
+        const o = try cli_df.parsePosix(&.{ "fx-df", "--rows", "/" }, gpa);
         try std.testing.expect(o.rows);
-        try std.testing.expectEqualStrings("/", o.path.?);
+        try std.testing.expectEqualStrings("/", o.path);
     }
     {
-        const args = [_][:0]const u8{"fx-df"};
-        const o = try parsePosixArgs(&args, gpa);
-        try std.testing.expect(o.path == null and !o.rows);
+        const o = try cli_df.parsePosix(&.{"fx-df"}, gpa);
+        try std.testing.expectEqualStrings("", o.path);
     }
-    const two = [_][:0]const u8{ "fx-df", "/a", "/b" };
-    try std.testing.expectError(error.TooManyOperands, parsePosixArgs(&two, gpa));
-    const bad = [_][:0]const u8{ "fx-df", "-x" };
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&bad, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_df.parsePosix(&.{ "fx-df", "/a", "/b" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_df.parsePosix(&.{ "fx-df", "-x" }, gpa));
 }
 
 test "statvfs('/'): structural sanity on the live root fs" {
@@ -750,6 +798,9 @@ pub fn main(init: std.process.Init) !void {
     const opts = if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{')
         try evalDhallArgs(args[1], opt_alloc)
     else
+        // the GENERATED parser (schemas/df.dhall -> src/generated/cli_df.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         try parsePosixArgs(args, opt_alloc);
 
     var mbuf = std.ArrayList(u8).empty;
@@ -757,11 +808,11 @@ pub fn main(init: std.process.Init) !void {
     var rows = std.ArrayList(FsRow).empty;
     defer rows.deinit(gpa);
 
-    if (opts.path) |p| {
+    if (opts.path.len > 0) {
         // The path form still reads /proc/self/mounts (best-effort) to name
         // the device + mountpoint of the fs containing PATH.
         if (!try readFile(gpa, "/proc/self/mounts", &mbuf)) mbuf.clearRetainingCapacity();
-        try collectPathRow(gpa, p, mbuf.items, &rows);
+        try collectPathRow(gpa, opts.path, mbuf.items, &rows);
     } else {
         if (!try readFile(gpa, "/proc/self/mounts", &mbuf)) {
             std.debug.print("fx-df: cannot read /proc/self/mounts\n", .{});

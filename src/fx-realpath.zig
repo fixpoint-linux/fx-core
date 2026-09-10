@@ -4,12 +4,21 @@
 // symbolic links and normalizing `.`/`..` and redundant slashes.  Pure libc +
 // the dhall module for typed args — no datalog / journal dependency.
 //
-// Two arg forms:
-//   fx-realpath '{ input = "/tmp/f" }'   Dhall record
-//   fx-realpath [FILE]...                POSIX fallback
+// Two arg forms (both derived from schemas/realpath.dhall — the fx-ls
+// migration template applied to the list-of-operands command):
+//   fx-realpath '{ names = ["/tmp/f", "/var"] }'   Dhall record
+//   fx-realpath [FILE]...                          POSIX
 //
-// - Dhall `input : Optional Text` = the single path to canonicalize.
-// - POSIX: one or more FILE operands, each printed on its own line.
+// - Dhall `names : List Text` = the ordered paths to canonicalize.
+// - POSIX: the FILE operands accumulate in argv order, one canonical path per
+//   line.  The POSIX form is parsed by the GENERATED parser
+//   (src/generated/cli_realpath.zig, emitted from schemas/realpath.dhall by
+//   src/tools/fx-clijson.zig — pure Zig, no dhall at runtime; `zig build
+//   gen-cli-check` gates the regen).  Deliberate strengthening over the hand
+//   parser it replaced: an unknown option is error.UnknownOption (with a
+//   usage-shaped diagnostic naming the offending token) and `--` ends flag
+//   parsing (`fx-realpath -- -weird` canonicalizes `-weird`), where the hand
+//   parser could only treat every token as an operand.
 //
 // Behavior (GNU-grounded, verified against host coreutils): the canonical
 // absolute path is printed (symlinks resolved, `..` collapsed, trailing slash
@@ -23,6 +32,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_realpath = @import("cli-realpath");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -38,16 +49,18 @@ const Allocator = std.mem.Allocator;
 extern fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/realpath.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered paths to canonicalize.  Empty => error.
-    names: []const []const u8 = &.{},
-};
+const Options = cli_realpath.Options;
+const parsePosixArgs = cli_realpath.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    // Fixed-capacity operand list decoded from the JSON array.  64 covers
+    // every differential and realistic invocation; a record with more
+    // elements than the capacity fails the decode (error.DhallFields).
+    names: [64][]const u8 = undefined,
+    names_n: usize = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +128,7 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     var i: usize = 0;
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
@@ -123,11 +137,37 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
-            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the key's list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "names")) {
+                        if (list_n >= res.names.len) return null; // over capacity
+                        res.names[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
             }
+        } else if (i < s.len and s[i] == '"') {
+            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
             off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             _ = jsonParseBool(s, &i) orelse return null;
@@ -139,6 +179,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.names_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
@@ -187,27 +228,13 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    if (opts.names_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.names_n);
+        for (opts.names[0..opts.names_n], 0..) |sv, ei| arr[ei] = try gpa.dupe(u8, sv);
         o.names = arr;
     }
     return o;
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var names = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-realpath: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try names.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .names = try names.toOwnedSlice(gpa) };
 }
 
 // ---------------------------------------------------------------------------
@@ -241,20 +268,97 @@ test "canonPath handles nonexistent path (returns null)" {
     _ = r;
 }
 
-test "jsonParseOpts input string" {
+test "jsonParseOpts names array" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/tmp\"}", &buf) orelse
+    const o = jsonParseOpts("{\"names\":[\"/tmp\",\"/var\"]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/tmp", o.input.?);
+    try std.testing.expectEqual(@as(usize, 2), o.names_n);
+    try std.testing.expectEqualStrings("/tmp", o.names[0]);
+    try std.testing.expectEqualStrings("/var", o.names[1]);
 }
 
-test "parsePosixArgs multiple names" {
-    const args = [_][:0]const u8{ "fx-realpath", "/tmp", "/var" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.names);
-    defer std.testing.allocator.free(o.names[0]);
-    defer std.testing.allocator.free(o.names[1]);
+test "evalDhallArgs names list" {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ names = [ \"/tmp\", \"/var\" ] }", std.testing.allocator);
+    defer std.testing.allocator.free(o.names); // declared first -> runs last (LIFO)
+    defer for (o.names) |e| std.testing.allocator.free(e);
     try std.testing.expectEqual(@as(usize, 2), o.names.len);
+    try std.testing.expectEqualStrings("/tmp", o.names[0]);
+    try std.testing.expectEqualStrings("/var", o.names[1]);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls/whoami template
+// applied to the list-of-operands command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-realpath '{ ... }'` takes.  Both sides are re-encoded
+// with the SHARED comptime-reflection encoder (fx-cli.encodeOptionsWire) and
+// compared as strings, so the assertion is exact and field-complete by
+// construction.
+
+/// One differential vector — the shared generic runner (fx-cli.
+/// expectPosixEqualsRecord; see fx-ls.zig) with this command's plumbing.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_realpath, &.{ "schemas/realpath.dhall", "fx-core/schemas/realpath.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // positional FILE operands accumulate in argv order
+    try expectPosixEqualsRecord(&.{ "fx-realpath", "/tmp" }, "{ names = [ \"/tmp\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-realpath", "/tmp", "/var" }, "{ names = [ \"/tmp\", \"/var\" ] }");
+    // bare '-' is an operand; '--' ends flags (then a leading-dash operand)
+    try expectPosixEqualsRecord(&.{ "fx-realpath", "-" }, "{ names = [ \"-\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-realpath", "--", "-weird" }, "{ names = [ \"-weird\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-realpath", "--", "/tmp", "-x" }, "{ names = [ \"/tmp\", \"-x\" ] }");
+    // exotic operand bytes: the record side's renderDhallRecord escaping
+    // must round-trip the raw POSIX operand (see fx-ls.zig SHOULD-FIX 3a)
+    try expectPosixEqualsRecord(&.{ "fx-realpath", "a b\"c" }, "{ names = [ \"a b\\\"c\" ] }");
+}
+
+test "DIFFERENTIAL: all-defaults equivalence (empty argv vs empty record)" {
+    // Pinned DIRECTLY (not via the shared runner): renderDhallRecord emits a
+    // bare "[]" for an empty List Text, which evalDhallArgs' plain infer_type
+    // cannot type ("cannot infer type of empty list") — a known fx-cli gap
+    // this batch is the first to hit (ls/whoami have no list field).  The
+    // runner matrix therefore covers non-empty records only, and the
+    // empty/default equivalence is asserted here through the SAME
+    // encodeOptionsWire encoder the runner compares with.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_realpath.parsePosix(&.{"fx-realpath"}, gpa);
+    const record_o = try evalDhallArgs("{ names = [] : List Text }", gpa);
+
+    var wire_posix = try cli.encodeOptionsWire(cli_realpath.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try cli.encodeOptionsWire(cli_realpath.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    try std.testing.expectEqualStrings(wire_record.items, wire_posix.items);
+}
+
+test "DIFFERENTIAL: rejection parity — the POSIX form rejects flags loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // realpath has NO flags in this slice: any -token is unknown
+    try std.testing.expectError(error.UnknownOption, cli_realpath.parsePosix(&.{ "fx-realpath", "-e" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_realpath.parsePosix(&.{ "fx-realpath", "--relative-to=/x" }, gpa));
+    // the record form cannot express flags at all (SchemaCheck on typo)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/realpath.dhall", "fx-core/schemas/realpath.dhall" }) catch
+        @panic("cannot locate schemas/realpath.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
 }
 
 // ---------------------------------------------------------------------------

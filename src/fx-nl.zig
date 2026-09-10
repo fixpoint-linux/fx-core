@@ -2,9 +2,25 @@
 // No datalog / caslog dependency — pure libc + the dhall module for typed args.
 //
 // Two arg forms:
-//   fx-nl '{ input = "/f", body = Some "a", sep = Some ":", width = Some 3,
-//            fmt = Some "rz" }'                             Dhall record
-//   fx-nl [-ba] [-s SEP] [-w N] [-n rn|ln|rz] [FILE]        POSIX fallback
+//   fx-nl '{ file = "/f", body = "a", sep = ":", width = 3, fmt = "rz" }'
+//                                                          Dhall record
+//   fx-nl [-b t|a] [-s SEP] [-w N] [-n rn|ln|rz] [FILE]    POSIX
+//
+// The POSIX form is parsed by the GENERATED parser (src/generated/cli_nl.zig,
+// emitted from schemas/nl.dhall by src/tools/fx-clijson.zig — pure Zig, no
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  Deltas vs the
+// hand parser it replaced: the attached `-ba`/`-bt` value forms are now
+// error.UnknownOption (a Value short never clusters, schemas/README.md — the
+// nl.dhall note verbatim; use `-b a`), long aliases
+// --body-numbering/--number-separator/--number-width/--number-format exist,
+// inline `--long=value` works, and `--` ends flag parsing.
+//
+// schemas/nl.dhall models `-b`/`-n` as Value-on-Text (no argumentless enum
+// kind in the v1 vocabulary): body/fmt arrive as strings in BOTH arg forms
+// and the enum mapping + invalid-value rejection happen at the runtime
+// boundary in main() (the chmod mode precedent).  The record form spells the
+// fields PLAIN (the old `Some "a"` Optional-wrapping predates the schema and
+// is now ill-typed), and the old JSON key `input` is the schema field `file`.
 //
 // Semantics (GNU-grounded, verified against host coreutils):
 //   - `-b t` (default): number only NON-EMPTY lines.  An unnumbered line emits
@@ -20,6 +36,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_nl = @import("cli-nl");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -48,19 +66,28 @@ const Body = enum { t, a };
 const Fmt = enum { rn, ln, rz };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/nl.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    file: ?[]const u8 = null, // null => stdin
-    body: Body = .t,
-    sep: []const u8 = "\t",
-    width: usize = 6,
-    fmt: Fmt = .rn,
-};
+const Options = cli_nl.Options;
+const parsePosixArgs = cli_nl.parsePosix; // the generated POSIX parser
+
+// The core numbering engine stays enum-driven (zero per-line string compares);
+// the generated Text fields map into this view at the runtime boundary.
+const Numbering = struct { body: Body, fmt: Fmt };
+
+/// The string -> enum mapping the schema moved to the runtime (the chmod
+/// mode precedent): unknown values fall back to the GNU defaults (the hand
+/// record form's `else` branches, fx-nl.zig:214/219 — verbatim behavior).
+fn numberingOf(o: Options) Numbering {
+    return .{
+        .body = if (std.mem.eql(u8, o.body, "a")) .a else .t,
+        .fmt = if (std.mem.eql(u8, o.fmt, "ln")) .ln else if (std.mem.eql(u8, o.fmt, "rz")) .rz else .rn,
+    };
+}
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    file: ?[]const u8 = null,
     body: ?[]const u8 = null,
     sep: ?[]const u8 = null,
     width: ?u64 = null,
@@ -140,8 +167,8 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+            if (std.mem.eql(u8, key, "file")) {
+                res.file = val;
             } else if (std.mem.eql(u8, key, "body")) {
                 res.body = val;
             } else if (std.mem.eql(u8, key, "sep")) {
@@ -209,81 +236,99 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |v| o.file = try gpa.dupe(u8, v);
+    if (opts.file) |v| o.file = try gpa.dupe(u8, v);
     if (opts.body) |b| {
-        o.body = if (std.mem.eql(u8, b, "a")) .a else .t;
+        o.body = try gpa.dupe(u8, b);
     }
     if (opts.sep) |s| o.sep = try gpa.dupe(u8, s);
-    if (opts.width) |w| o.width = @intCast(@min(w, 4096));
+    if (opts.width) |w| o.width = @min(w, 4096);
     if (opts.fmt) |f| {
-        o.fmt = if (std.mem.eql(u8, f, "ln")) .ln else if (std.mem.eql(u8, f, "rz")) .rz else .rn;
+        o.fmt = try gpa.dupe(u8, f);
     }
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-b")) {
-            if (i + 1 >= args.len) return error.BadArgs;
-            i += 1;
-            if (std.mem.eql(u8, args[i], "a")) {
-                o.body = .a;
-            } else if (std.mem.eql(u8, args[i], "t")) {
-                o.body = .t;
-            } else {
-                return error.BadArgs;
-            }
-            continue;
-        } else if (std.mem.eql(u8, a, "-s")) {
-            if (i + 1 >= args.len) return error.BadArgs;
-            i += 1;
-            o.sep = try gpa.dupe(u8, args[i]);
-            continue;
-        } else if (std.mem.eql(u8, a, "-w")) {
-            if (i + 1 >= args.len) return error.BadArgs;
-            i += 1;
-            o.width = std.fmt.parseInt(usize, args[i], 10) catch return error.BadArgs;
-            continue;
-        } else if (std.mem.eql(u8, a, "-n")) {
-            if (i + 1 >= args.len) return error.BadArgs;
-            i += 1;
-            if (std.mem.eql(u8, args[i], "rn")) {
-                o.fmt = .rn;
-            } else if (std.mem.eql(u8, args[i], "ln")) {
-                o.fmt = .ln;
-            } else if (std.mem.eql(u8, args[i], "rz")) {
-                o.fmt = .rz;
-            } else {
-                return error.BadArgs;
-            }
-            continue;
-        } else if (std.mem.eql(u8, a, "-ba")) {
-            o.body = .a;
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and std.mem.eql(u8, a[1..2], "b")) {
-            if (std.mem.eql(u8, a[2..], "a")) {
-                o.body = .a;
-            } else if (std.mem.eql(u8, a[2..], "t")) {
-                o.body = .t;
-            } else {
-                return error.BadArgs;
-            }
-            continue;
-        } else if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-nl: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        if (o.file == null) {
-            o.file = try gpa.dupe(u8, a);
-        } else {
-            std.debug.print("fx-nl: extra operand '{s}'\n", .{a});
-            return error.TooManyOperands;
-        }
-    }
-    return o;
+// The POSIX form is parsed by the GENERATED parser (cli_nl.parsePosix, aliased
+// to parsePosixArgs above; schemas/nl.dhall -> src/generated/cli_nl.zig).  A
+// malformed -b/-n VALUE (not "a"/"t" / "rn"/"ln"/"rz") is a runtime concern
+// now: main() maps body/fmt through numberingOf (unknown -> GNU default).  A
+// second FILE operand is error.UnexpectedOperand (was TooManyOperands), a
+// missing -w value is error.MissingValue (was BadArgs), a non-numeric -w is
+// error.BadValue.
+
+// ---------------------------------------------------------------------------
+// The differential test — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion and evaluated by THIS file's evalDhallArgs (the exact
+// runtime path `fx-nl '{ ... }'` takes), via the SHARED runner
+// (fx-cli.expectPosixEqualsRecord).  body/fmt are Text on BOTH sides (the
+// enum mapping is a runtime concern), so the generated-vs-record equality
+// covers them verbatim.
+
+/// One differential vector (the shared generic runner; see fx-ls.zig).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_nl, &.{ "schemas/nl.dhall", "fx-core/schemas/nl.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (stdin, -b t, -w 6, -n rn, TAB sep)
+    try expectPosixEqualsRecord(&.{"fx-nl"}, "{ }");
+    // each Value flag, separate-token
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-b", "a" }, "{ body = \"a\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-b", "t" }, "{ body = \"t\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-s", ":" }, "{ sep = \":\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-w", "3" }, "{ width = 3 }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-n", "rz" }, "{ fmt = \"rz\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-n", "ln" }, "{ fmt = \"ln\" }");
+    // inline --long=value spellings (one per Value long)
+    try expectPosixEqualsRecord(&.{ "fx-nl", "--body-numbering=a" }, "{ body = \"a\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "--number-separator=|" }, "{ sep = \"|\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "--number-width=9" }, "{ width = 9 }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "--number-format=rn" }, "{ fmt = \"rn\" }");
+    // the whole composition (the old -ba -n ln FILE smoke)
+    try expectPosixEqualsRecord(&.{ "fx-nl", "-b", "a", "-n", "ln", "-w", "4", "-s", "#", "f.txt" }, "{ file = \"f.txt\", body = \"a\", fmt = \"ln\", width = 4, sep = \"#\" }");
+    // positional FILE, `--` terminator, then a FILE that spells a flag
+    try expectPosixEqualsRecord(&.{ "fx-nl", "f.txt" }, "{ file = \"f.txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-nl", "--", "-b" }, "{ file = \"-b\" }");
+    // operand-before-flag interleave (the generated parser accepts flags
+    // anywhere)
+    try expectPosixEqualsRecord(&.{ "fx-nl", "f.txt", "-b", "a" }, "{ file = \"f.txt\", body = \"a\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; the attached value forms (-bX, -nX) are value shorts
+    // that never cluster; a cluster with an unknown letter
+    try std.testing.expectError(error.UnknownOption, cli_nl.parsePosix(&.{ "fx-nl", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_nl.parsePosix(&.{ "fx-nl", "-ba" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_nl.parsePosix(&.{ "fx-nl", "-nrn" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_nl.parsePosix(&.{ "fx-nl", "-bZa" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_nl.parsePosix(&.{ "fx-nl", "--bogus" }, gpa));
+    // a Value flag with no next token (the hand parser's error.BadArgs)
+    try std.testing.expectError(error.MissingValue, cli_nl.parsePosix(&.{ "fx-nl", "-s" }, gpa));
+    // a non-numeric -w (the hand parser's error.BadArgs)
+    try std.testing.expectError(error.BadValue, cli_nl.parsePosix(&.{ "fx-nl", "-w", "x" }, gpa));
+    // a second FILE operand (the hand parser's error.TooManyOperands)
+    try std.testing.expectError(error.UnexpectedOperand, cli_nl.parsePosix(&.{ "fx-nl", "a", "b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field
+    // (the OLD `input` key is gone from the schema), wrong field type.
+    // The POSIX analogue of the first is -Zz above.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/nl.dhall", "fx-core/schemas/nl.dhall" }) catch
+        @panic("cannot locate schemas/nl.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = \"/f\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ width = \"x\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -291,26 +336,26 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
 // ---------------------------------------------------------------------------
 
 /// Append the line-number field (width + padding) to `out`.
-fn writeNumberField(out: *std.ArrayList(u8), gpa: Allocator, num: u64, width: usize, fmt: Fmt) !void {
+fn writeNumberField(out: *std.ArrayList(u8), gpa: Allocator, num: u64, width: u64, fmt: Fmt) !void {
     var digits: [32]u8 = undefined;
     const num_str = std.fmt.bufPrint(&digits, "{d}", .{num}) catch unreachable;
     switch (fmt) {
         .rn => {
-            var pad: usize = 0;
+            var pad: u64 = 0;
             if (num_str.len < width) pad = width - num_str.len;
-            try out.appendNTimes(gpa, ' ', pad);
+            try out.appendNTimes(gpa, ' ', @intCast(pad));
             try out.appendSlice(gpa, num_str);
         },
         .ln => {
             try out.appendSlice(gpa, num_str);
-            var pad: usize = 0;
+            var pad: u64 = 0;
             if (num_str.len < width) pad = width - num_str.len;
-            try out.appendNTimes(gpa, ' ', pad);
+            try out.appendNTimes(gpa, ' ', @intCast(pad));
         },
         .rz => {
-            var pad: usize = 0;
+            var pad: u64 = 0;
             if (num_str.len < width) pad = width - num_str.len;
-            try out.appendNTimes(gpa, '0', pad);
+            try out.appendNTimes(gpa, '0', @intCast(pad));
             try out.appendSlice(gpa, num_str);
         },
     }
@@ -334,21 +379,23 @@ fn splitLines(data: []const u8, gpa: Allocator) ![]const []const u8 {
     return lines.toOwnedSlice(gpa);
 }
 
-/// Number the given lines into `out` (the nl output stream).
-fn numberLines(lines: []const []const u8, o: Options, out: *std.ArrayList(u8), gpa: Allocator) !void {
+/// Number the given lines into `out` (the nl output stream).  `num` is the
+/// enum view of the generated Text body/fmt fields; `sep`/`width` the raw
+/// generated values.
+fn numberLines(lines: []const []const u8, num: Numbering, sep: []const u8, width: u64, out: *std.ArrayList(u8), gpa: Allocator) !void {
     var line_no: u64 = 1;
     for (lines) |line| {
-        const numbered = (o.body == .a) or (line.len > 0);
+        const numbered = (num.body == .a) or (line.len > 0);
         if (numbered) {
-            try writeNumberField(out, gpa, line_no, o.width, o.fmt);
-            try out.appendSlice(gpa, o.sep);
+            try writeNumberField(out, gpa, line_no, width, num.fmt);
+            try out.appendSlice(gpa, sep);
             try out.appendSlice(gpa, line);
             line_no += 1;
         } else {
             // An unnumbered line (blank under -b t): GNU emits the blank number
             // field of width `w` plus a single separator-replacement space, i.e.
             // w+1 spaces, then a newline — no separator, no content.
-            try out.appendNTimes(gpa, ' ', o.width + 1);
+            try out.appendNTimes(gpa, ' ', @intCast(width + 1));
         }
         try out.append(gpa, '\n');
     }
@@ -378,8 +425,14 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], aa);
     } else {
+        // the GENERATED parser (schemas/nl.dhall -> src/generated/cli_nl.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
     }
+    // The string -> enum mapping at the runtime boundary (the schema's Value-
+    // on-Text modeling of -b/-n; unknown -> the GNU default).
+    const num = numberingOf(opts);
 
     var data: []u8 = undefined;
     if (opts.file) |f| {
@@ -402,7 +455,7 @@ pub fn main(init: std.process.Init) !void {
     const stdout_file = std.Io.File.stdout();
     var out = std.ArrayList(u8).empty;
     defer out.deinit(aa);
-    try numberLines(lines, opts, &out, aa);
+    try numberLines(lines, num, opts.sep, opts.width, &out, aa);
     _ = std.Io.File.writeStreamingAll(stdout_file, init.io, out.items) catch return error.WriteFailed;
 }
 
@@ -448,7 +501,7 @@ test "numberLines default -b t (empty line unnumbered)" {
     defer gpa.free(lines);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(gpa);
-    try numberLines(lines, .{}, &out, gpa);
+    try numberLines(lines, .{ .body = .t, .fmt = .rn }, "\t", 6, &out, gpa);
     // "     1\thello\n" + "       \n" (w+1=7 spaces) + "     2\tworld\n"
     const want = "     1\thello\n       \n     2\tworld\n";
     try std.testing.expectEqualStrings(want, out.items);
@@ -460,26 +513,54 @@ test "numberLines -b a -s : -w3 -n rz" {
     defer gpa.free(lines);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(gpa);
-    try numberLines(lines, .{ .body = .a, .sep = ":", .width = 3, .fmt = .rz }, &out, gpa);
+    try numberLines(lines, .{ .body = .a, .fmt = .rz }, ":", 3, &out, gpa);
     try std.testing.expectEqualStrings("001:a\n002:b\n", out.items);
 }
 
 test "jsonParseOpts fields" {
     var buf: [2048]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/f\",\"body\":\"a\",\"sep\":\":\",\"width\":3,\"fmt\":\"rz\"}", &buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/f", o.input.?);
+    const o = jsonParseOpts("{\"file\":\"/f\",\"body\":\"a\",\"sep\":\":\",\"width\":3,\"fmt\":\"rz\"}", &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/f", o.file.?);
     try std.testing.expectEqualStrings("a", o.body.?);
     try std.testing.expectEqual(@as(?u64, 3), o.width);
     try std.testing.expectEqualStrings("rz", o.fmt.?);
 }
 
-test "parsePosixArgs -ba and -n ln" {
+test "evalDhallArgs plain-typed record (schema shape)" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-nl", "-ba", "-n", "ln", "f.txt" };
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    const o = try evalDhallArgs("{ file = \"/f\", body = \"a\", sep = \":\", width = 3, fmt = \"rz\" }", aa);
+    defer aa.free(o.file);
+    defer aa.free(o.body);
+    defer aa.free(o.sep);
+    defer aa.free(o.fmt);
+    try std.testing.expectEqualStrings("/f", o.file);
+    try std.testing.expectEqualStrings("a", o.body);
+    try std.testing.expectEqual(@as(u64, 3), o.width);
+    try std.testing.expectEqualStrings("rz", o.fmt);
+}
+
+test "numberingOf maps body/fmt text (unknown -> defaults)" {
+    const dflt = numberingOf(.{});
+    try std.testing.expect(dflt.body == .t);
+    try std.testing.expect(dflt.fmt == .rn);
+    const mapped = numberingOf(.{ .body = "a", .fmt = "rz" });
+    try std.testing.expect(mapped.body == .a);
+    try std.testing.expect(mapped.fmt == .rz);
+    const unknown = numberingOf(.{ .body = "x", .fmt = "zz" });
+    try std.testing.expect(unknown.body == .t);
+    try std.testing.expect(unknown.fmt == .rn);
+}
+
+test "parsePosixArgs (generated) -b a and -n ln" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-nl", "-b", "a", "-n", "ln", "f.txt" };
     const o = try parsePosixArgs(&args, aa);
-    try std.testing.expect(o.body == .a);
-    try std.testing.expect(o.fmt == .ln);
-    try std.testing.expectEqualStrings("f.txt", o.file.?);
+    try std.testing.expectEqualStrings("a", o.body);
+    try std.testing.expectEqualStrings("ln", o.fmt);
+    try std.testing.expectEqualStrings("f.txt", o.file);
 }

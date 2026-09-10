@@ -32,11 +32,14 @@
 //
 // Divergences (deliberate scope cuts): no GNU `==> name <==` multi-file
 // headers; a missing file is a hard error on stderr.  As in the other
-// checksum tools, a single `-` operand is NOT treated as stdin and there is
-// no `--` end-of-options terminator (scope omissions vs GNU).
+// checksum tools, a single `-` operand is NOT treated as stdin (scope
+// omission vs GNU).  `--` IS supported (the generated parser's shared
+// argv walk).
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_sum = @import("cli-sum");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -57,17 +60,23 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/sum.dhall)
 // ---------------------------------------------------------------------------
+//
+// MIGRATION DELTA (documented in schemas/sum.dhall): the runtime Dhall
+// record form grows from the single-input subset `{ input = "/tmp/f" }` to
+// the full struct surface `{ files = [ "/a", "/b" ], sysv = True }` — the
+// schema models the files list, and evalDhallArgs below now fills it
+// directly.
 
-const Options = struct {
-    // Ordered file paths to sum.  Empty => stdin.
-    files: []const []const u8 = &.{},
-    sysv: bool = false,
-};
+const Options = cli_sum.Options;
+const parsePosixArgs = cli_sum.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    input: ?[]const u8 = null,
+    // List Text elements, slices into the caller's scratch buf.
+    files: [64][]const u8 = undefined,
+    files_len: usize = 0,
+    sysv: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -143,14 +152,35 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
+        if (std.mem.eql(u8, key, "files") and i < s.len and s[i] == '[') {
+            // List Text -> ["a","b"]; element strings re-use the scratch buf
+            i += 1; // consume '['
+            if (jsonExpect(s, &i, ']')) {
+                // empty list: nothing to record
+            } else {
+                while (true) {
+                    if (res.files_len >= res.files.len) return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    res.files[res.files_len] = val;
+                    res.files_len += 1;
+                    off += val.len;
+                    if (jsonExpect(s, &i, ',')) continue;
+                    if (!jsonExpect(s, &i, ']')) return null;
+                    break;
+                }
+            }
+        } else if (i < s.len and s[i] == '"') {
+            // legacy single-input subset spelling: {"input":"/tmp/f"}
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
             if (std.mem.eql(u8, key, "input")) {
-                res.input = val;
+                if (res.files_len >= res.files.len) return null;
+                res.files[res.files_len] = val;
+                res.files_len += 1;
             }
             off += val.len;
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
-            _ = jsonParseBool(s, &i) orelse return null;
+            const b = jsonParseBool(s, &i) orelse return null;
+            if (std.mem.eql(u8, key, "sysv")) res.sysv = b;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4;
         } else {
@@ -206,92 +236,208 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
         return error.DhallFields;
     };
 
-    var o = Options{};
-    if (opts.input) |inp| {
-        const dup = try gpa.dupe(u8, inp);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
-        o.files = arr;
+    var files = std.ArrayList([]const u8).empty;
+    errdefer files.deinit(gpa);
+    var k: usize = 0;
+    while (k < opts.files_len) : (k += 1) {
+        try files.append(gpa, try gpa.dupe(u8, opts.files[k]));
     }
-    return o;
+    return .{ .files = try files.toOwnedSlice(gpa), .sysv = opts.sysv };
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var files = std.ArrayList([]const u8).empty;
-    var sysv = false;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            if (std.mem.eql(u8, a, "-s")) {
-                sysv = true;
-                continue;
-            }
-            std.debug.print("fx-sum: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
-    }
-    return Options{ .files = try files.toOwnedSlice(gpa), .sysv = sysv };
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent ((dflt //
+// user) : ty via fx-cli.completeSrc, rendered back to a record literal and
+// evaluated by THIS file's evalDhallArgs — the exact runtime path
+// `fx-sum '{ ... }'` takes).  Both sides are re-encoded to the canonical
+// term_to_json wire shape (the SHARED comptime-reflection encoder
+// fx-cli.encodeOptionsWire) and compared as strings, so the assertion is
+// exact and FIELD-COMPLETE by construction.
+
+/// One differential vector for fx-sum — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_sum, &.{ "schemas/sum.dhall", "fx-core/schemas/sum.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // positional FILE operands accumulate in argv order.  CONSTRAINT (the
+    // fx-yes precedent, a known fx-cli gap): renderDhallRecord emits a bare
+    // "[]" for an empty List Text, which evalDhallArgs' plain infer_type
+    // cannot type — so the SHARED-runner matrix covers vectors whose record
+    // side has a NON-EMPTY files list only.  Flag-only and no-operand
+    // vectors (empty list on the record side) are pinned DIRECTLY below
+    // through the same encodeOptionsWire comparison.
+    // --- FILE operands: one and many, in argv order; '-' is a bare
+    // operand (NOT stdin — the documented divergence) ---
+    try expectPosixEqualsRecord(&.{ "fx-sum", "/tmp/a" }, "{ files = [ \"/tmp/a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-sum", "/tmp/a", "/tmp/b" }, "{ files = [ \"/tmp/a\", \"/tmp/b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-sum", "-", "/tmp/b" }, "{ files = [ \"-\", \"/tmp/b\" ] }");
+
+    // --- flag/operand interleave, both orders (the flag position does not
+    // affect the accumulated operand order) ---
+    try expectPosixEqualsRecord(&.{ "fx-sum", "-s", "/tmp/a", "/tmp/b" }, "{ files = [ \"/tmp/a\", \"/tmp/b\" ], sysv = True }");
+    try expectPosixEqualsRecord(&.{ "fx-sum", "/tmp/a", "-s", "/tmp/b" }, "{ files = [ \"/tmp/a\", \"/tmp/b\" ], sysv = True }");
+
+    // --- '--' terminator: a flag-looking token after it is an operand ---
+    try expectPosixEqualsRecord(&.{ "fx-sum", "--", "-s" }, "{ files = [ \"-s\" ] }");
+
+    // --- exotic operand bytes: escaping parity between the raw POSIX
+    // operands and the rendered record ---
+    try expectPosixEqualsRecord(&.{ "fx-sum", "a b.txt" }, "{ files = [ \"a b.txt\" ] }");
+}
+
+/// One DIRECT wire-equality vector: argv vs an explicitly-typed record
+/// literal (empty lists need the `[] : List Text` annotation — see the
+/// matrix comment above), compared through the same encodeOptionsWire
+/// encoder the shared runner uses.
+fn expectWireEquals(argv: []const []const u8, user_record: [:0]const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const posix_o = try cli_sum.parsePosix(argv, gpa);
+    const record_o = try evalDhallArgs(user_record, gpa);
+
+    var wire_posix = try cli.encodeOptionsWire(cli_sum.Options, gpa, posix_o);
+    defer wire_posix.deinit(gpa);
+    var wire_record = try cli.encodeOptionsWire(cli_sum.Options, gpa, record_o);
+    defer wire_record.deinit(gpa);
+    std.testing.expectEqualStrings(wire_record.items, wire_posix.items) catch |e| {
+        var abuf: [256]u8 = undefined;
+        std.debug.print(
+            \\differential mismatch (direct): POSIX argv vs Dhall-record form
+            \\  argv:            {s}
+            \\  user record:     {s}
+            \\  POSIX encoding:  {s}
+            \\  record encoding: {s}
+            \\
+        , .{ cli.dbgArgv(&abuf, argv), user_record, wire_posix.items, wire_record.items });
+        return e;
+    };
+}
+
+test "DIFFERENTIAL: empty-list vectors (defaults + flag-only), pinned directly" {
+    // --- defaults: no operands (stdin), BSD algorithm ---
+    try expectWireEquals(&.{"fx-sum"}, "{ files = [] : List Text }");
+    // --- the -s Flag: short, long alias, cluster (no operands) ---
+    try expectWireEquals(&.{ "fx-sum", "-s" }, "{ files = [] : List Text, sysv = True }");
+    try expectWireEquals(&.{ "fx-sum", "--sysv" }, "{ files = [] : List Text, sysv = True }");
+    try expectWireEquals(&.{ "fx-sum", "-ss" }, "{ files = [] : List Text, sysv = True }");
+    // --- the canonical all-defaults bytes (the fx-ls ANCHOR discipline) ---
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    var w = try cli.encodeOptionsWire(cli_sum.Options, gpa, cli_sum.Options{});
+    defer w.deinit(gpa);
+    try std.testing.expectEqualStrings("{\"files\":[],\"sysv\":false}", w.items);
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option (POSIX) ~ unknown field (record form, below)
+    try std.testing.expectError(error.UnknownOption, cli_sum.parsePosix(&.{ "fx-sum", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_sum.parsePosix(&.{ "fx-sum", "--bogus" }, gpa));
+
+    // a cluster with an unknown letter is an unknown option, never an operand
+    try std.testing.expectError(error.UnknownOption, cli_sum.parsePosix(&.{ "fx-sum", "-sZ" }, gpa));
+
+    // -s takes no value: the = suffix does not split on a Flag kind
+    try std.testing.expectError(error.UnknownOption, cli_sum.parsePosix(&.{ "fx-sum", "--sysv=true" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, wrong list element type
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/sum.dhall", "fx-core/schemas/sum.dhall" }) catch
+        @panic("cannot locate schemas/sum.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ sysv = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ files = [ 1 ] }"));
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "jsonParseOpts input string" {
+test "jsonParseOpts files list" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":\"/tmp/f\"}", &buf) orelse
+    const o = jsonParseOpts("{\"files\":[\"/tmp/a\",\"/tmp/b\"],\"sysv\":true}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    try std.testing.expectEqual(@as(usize, 2), o.files_len);
+    try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
+    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
+    try std.testing.expect(o.sysv);
 }
 
-test "jsonParseOpts input null" {
+test "jsonParseOpts empty files list" {
     var buf: [1024]u8 = undefined;
-    const o = jsonParseOpts("{\"input\":null}", &buf) orelse
+    const o = jsonParseOpts("{\"files\":[]}", &buf) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
+    try std.testing.expectEqual(@as(usize, 0), o.files_len);
+    try std.testing.expect(!o.sysv);
 }
 
-test "evalDhallArgs record with input" {
+test "evalDhallArgs record with files and sysv" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = \"/tmp/f\" }", std.testing.allocator);
+    const o = try evalDhallArgs("{ files = [ \"/tmp/f\", \"/tmp/g\" ], sysv = True }", std.testing.allocator);
     defer std.testing.allocator.free(o.files);
     defer std.testing.allocator.free(o.files[0]);
-    try std.testing.expectEqual(@as(usize, 1), o.files.len);
+    defer std.testing.allocator.free(o.files[1]);
+    try std.testing.expectEqual(@as(usize, 2), o.files.len);
     try std.testing.expectEqualStrings("/tmp/f", o.files[0]);
-    try std.testing.expect(!o.sysv);
+    try std.testing.expectEqualStrings("/tmp/g", o.files[1]);
+    try std.testing.expect(o.sysv);
 }
 
 test "evalDhallArgs record None input (stdin)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    // the LEGACY spelling, still accepted by the record-side JSON parser
+    // (JsonOpts bridges `input` into files[0]); the schema itself spells
+    // stdin as the empty/omitted files list
     const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), o.files.len);
 }
 
 test "parsePosixArgs zero files (stdin)" {
-    const o = try parsePosixArgs(&.{}, std.testing.allocator);
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try parsePosixArgs(&.{"fx-sum"}, aa);
     try std.testing.expectEqual(@as(usize, 0), o.files.len);
     try std.testing.expect(!o.sysv);
 }
 
-test "parsePosixArgs -s flag" {
-    const args = [_][:0]const u8{ "fx-sum", "-s", "/tmp/a" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
+test "parsePosixArgs -s flag (generated)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-sum", "-s", "/tmp/a" };
+    const o = try parsePosixArgs(&args, aa);
     try std.testing.expect(o.sysv);
+    try std.testing.expectEqual(@as(usize, 1), o.files.len);
     try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
 }
 
-test "parsePosixArgs multiple files" {
-    const args = [_][:0]const u8{ "fx-sum", "/tmp/a", "/tmp/b" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.files);
-    defer std.testing.allocator.free(o.files[0]);
-    defer std.testing.allocator.free(o.files[1]);
+test "parsePosixArgs multiple files (generated)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const args = [_][]const u8{ "fx-sum", "/tmp/a", "/tmp/b" };
+    const o = try parsePosixArgs(&args, aa);
     try std.testing.expectEqual(@as(usize, 2), o.files.len);
     try std.testing.expectEqualStrings("/tmp/a", o.files[0]);
+    try std.testing.expectEqualStrings("/tmp/b", o.files[1]);
 }
 
 // Known-answer tests (GNU-grounded):
@@ -377,6 +523,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/sum.dhall -> src/generated/cli_sum.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 

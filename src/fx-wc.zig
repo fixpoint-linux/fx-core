@@ -16,12 +16,16 @@
 // Group-by vars are HEAD vars only (compiler.c:3089), so with a bare result
 // head both rules aggregate over ALL lines.
 //
-// Two arg forms:
-//   fx-wc '{ input = "/tmp/f" }'   Dhall record
-//   fx-wc [FILE]                   POSIX fallback
-//
-// - Dhall `input : Optional Text`: Some path = count that file; None = count
-//   stdin.  POSIX: 0 FILE operands => stdin; one FILE operand.
+// Two arg forms, ONE source of truth (schemas/wc.dhall — the STEP-3
+// migration template):
+//   fx-wc '{ input = "/tmp/f" }'   Dhall record (absent input = stdin; the
+//                                  old `{ input = None Text }` spelling is
+//                                  ill-typed against the schema's Text)
+//   fx-wc [FILE]                   POSIX (the GENERATED parser,
+//                                  src/generated/cli_wc.zig; no FILE =>
+//                                  stdin, a second FILE is
+//                                  error.UnexpectedOperand, any -flag is
+//                                  error.UnknownOption)
 // - Reads the WHOLE input via an extern read() loop, then splits into lines.
 // - word = a maximal run of non-' '/non-'\t' characters (ASCII space class;
 //   a documented subset of GNU's iswspace).
@@ -38,6 +42,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_wc = @import("cli-wc");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -70,17 +76,11 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/wc.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Input file path; null => stdin.
-    input: ?[]const u8 = null,
-};
-
-const JsonOpts = struct {
-    input: ?[]const u8 = null,
-};
+const Options = cli_wc.Options;
+const parsePosixArgs = cli_wc.parsePosix; // the generated POSIX parser
 
 // ---------------------------------------------------------------------------
 // Word counting (ASCII space class: ' ' and '\t')
@@ -174,6 +174,10 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
     return null;
 }
 
+const JsonOpts = struct {
+    input: ?[]const u8 = null,
+};
+
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
@@ -249,8 +253,73 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     };
 
     var o = Options{};
-    if (opts.input) |inp| o.input = try gpa.dupe(u8, inp);
+    if (opts.input) |inp| if (inp.len > 0) {
+        o.input = try gpa.dupe(u8, inp);
+    };
     return o;
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a single-positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/wc.dhall
+// -> src/generated/cli_wc.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the shared runner
+// (fx-cli.expectPosixEqualsRecord): schema completion ((dflt // user) : ty),
+// renderDhallRecord, THIS file's evalDhallArgs, then a field-complete
+// encodeOptionsWire comparison of both sides.  wc has NO flags; its whole
+// surface is the FILE positional (absent = stdin) plus rejection parity for
+// the record form's own ill-typed spellings.
+
+/// One differential vector for fx-wc — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_wc, &.{ "schemas/wc.dhall", "fx-core/schemas/wc.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // the stdin default: empty argv == the empty record
+    try expectPosixEqualsRecord(&.{ "fx-wc" }, "{ }");
+    // one FILE positional: bare operand, bare '-' operand, '--' terminator
+    try expectPosixEqualsRecord(&.{ "fx-wc", "/tmp/f" }, "{ input = \"/tmp/f\" }");
+    try expectPosixEqualsRecord(&.{ "fx-wc", "-" }, "{ input = \"-\" }");
+    try expectPosixEqualsRecord(&.{ "fx-wc", "--", "-l" }, "{ input = \"-l\" }");
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    // against the raw POSIX operand (the ls migration's SHOULD-FIX vectors)
+    try expectPosixEqualsRecord(&.{ "fx-wc", "a b.txt" }, "{ input = \"a b.txt\" }");
+    try expectPosixEqualsRecord(&.{ "fx-wc", "say \"hi\".txt" }, "{ input = \"say \\\"hi\\\".txt\" }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: wc takes NO flags, and the FILE positional is single — the
+    // generated parser rejects a second operand as error.UnexpectedOperand
+    // (the hand parser's error.TooManyArgs); an unknown option is
+    // error.UnknownOption with the offending token named
+    try std.testing.expectError(error.UnknownOption, cli_wc.parsePosix(&.{ "fx-wc", "-x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_wc.parsePosix(&.{ "fx-wc", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_wc.parsePosix(&.{ "fx-wc", "/tmp/a", "/tmp/b" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_wc.parsePosix(&.{ "fx-wc", "--", "/tmp/a", "/tmp/b" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  (The old `input = None Text` spelling is ill-typed
+    // against the schema's Text too — omit the field for stdin instead.)
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/wc.dhall", "fx-core/schemas/wc.dhall" }) catch
+        @panic("cannot locate schemas/wc.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = None Text }"));
 }
 
 test "jsonParseOpts input string" {
@@ -276,60 +345,14 @@ test "jsonParseOpts empty object keeps default" {
 test "evalDhallArgs record with input" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ input = \"/tmp/f\" }", std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
+    defer std.testing.allocator.free(o.input);
+    try std.testing.expectEqualStrings("/tmp/f", o.input);
 }
 
-test "evalDhallArgs record None input (stdin)" {
+test "evalDhallArgs empty record (stdin default)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const o = try evalDhallArgs("{ input = None Text }", std.testing.allocator);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
-}
-
-// ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
-// ---------------------------------------------------------------------------
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-wc: unknown option '{s}'\n", .{a});
-            if (o.input) |p| gpa.free(p);
-            return error.UnknownOption;
-        }
-        if (o.input != null) {
-            std.debug.print("fx-wc: too many FILE operands\n", .{});
-            gpa.free(o.input.?);
-            return error.TooManyArgs;
-        }
-        o.input = try gpa.dupe(u8, a);
-    }
-    return o;
-}
-
-test "parsePosixArgs zero files (stdin)" {
-    const o = try parsePosixArgs(&.{"fx-wc"}, std.testing.allocator);
-    try std.testing.expectEqual(@as(?[]const u8, null), o.input);
-}
-
-test "parsePosixArgs one file" {
-    const args = [_][:0]const u8{ "fx-wc", "/tmp/f" };
-    const o = try parsePosixArgs(&args, std.testing.allocator);
-    defer std.testing.allocator.free(o.input.?);
-    try std.testing.expectEqualStrings("/tmp/f", o.input.?);
-}
-
-test "parsePosixArgs too many files rejected" {
-    const args = [_][:0]const u8{ "fx-wc", "/tmp/a", "/tmp/b" };
-    try std.testing.expectError(error.TooManyArgs, parsePosixArgs(&args, std.testing.allocator));
-}
-
-test "parsePosixArgs unknown option rejected" {
-    const args = [_][:0]const u8{"fx-wc", "-x"};
-    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
+    const o = try evalDhallArgs("{ }", std.testing.allocator);
+    try std.testing.expectEqualStrings("", o.input);
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +595,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         opts = try evalDhallArgs(args[1], opt_alloc);
     } else {
+        // the GENERATED parser (schemas/wc.dhall -> src/generated/cli_wc.zig);
+        // equality with the record form above is pinned by the differential
+        // tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, opt_alloc);
     }
 

@@ -7,14 +7,22 @@
 // coreutils has no `hostname`.  Implemented here anyway as a print-only tool,
 // matching the inetutils behavior of printing the kernel hostname.
 //
-// Two arg forms:
+// Two arg forms (both derived from schemas/hostname.dhall — the fx-whoami
+// migration template applied to the degenerate no-arg command):
 //   fx-hostname '{ input = "/tmp/f" }'   Dhall record (input ignored — see cut)
 //   fx-hostname                          POSIX (none)
 //
 // - Dhall `input : Optional Text` is accepted for interface uniformity but is
 //   IGNORED: hostname is print-only (the hostname cannot be set without root
 //   and is outside this command's honest cut).
-// - POSIX: no options/operands (print-only).
+// - POSIX: no options/operands (print-only).  The POSIX form is parsed by the
+//   GENERATED parser (src/generated/cli_hostname.zig, emitted from
+//   schemas/hostname.dhall by src/tools/fx-clijson.zig — pure Zig, no dhall
+//   at runtime; `zig build gen-cli-check` gates the regen).  Deliberate
+//   strengthening over the hand parser it replaced: an unknown option is
+//   error.UnknownOption (with a usage-shaped diagnostic naming the offending
+//   token) and an operand is error.UnexpectedOperand, rather than the hand
+//   parser's TooManyOperands reporting only args[1].
 //
 // Behavior (grounded against host inetutils/uname): gethostname() returns the
 // kernel hostname, byte-identical to `uname -n`.  Prints `babylon.lan\n` etc.
@@ -26,6 +34,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_hostname = @import("cli-hostname");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -43,13 +53,11 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/hostname.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // hostname takes no real options or operands (print-only).
-    nothing: bool = true,
-};
+const Options = cli_hostname.Options;
+const parsePosixArgs = cli_hostname.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
     input: ?[]const u8 = null,
@@ -194,14 +202,6 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     return Options{};
 }
 
-fn parsePosixArgs(args: []const [:0]const u8) !Options {
-    if (args.len > 1) {
-        std.debug.print("fx-hostname: extra operand '{s}'\n", .{args[1]});
-        return error.TooManyOperands;
-    }
-    return Options{};
-}
-
 test "jsonParseOpts input field" {
     var buf: [1024]u8 = undefined;
     const o = jsonParseOpts("{\"input\":\"/x\"}", &buf) orelse return error.TestUnexpectedResult;
@@ -213,8 +213,52 @@ test "evalDhallArgs empty record" {
     _ = try evalDhallArgs("{ }", std.testing.allocator);
 }
 
-test "parsePosixArgs no args" {
-    _ = try parsePosixArgs(&.{});
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-whoami template
+// applied to the degenerate no-arg command)
+// ---------------------------------------------------------------------------
+//
+// The generated POSIX parser and the Dhall-record form both reduce to the
+// same void Options (the `nothing` placeholder); the differential matrix pins
+// them equal through the SHARED runner (fx-cli.expectPosixEqualsRecord) so a
+// future flag added to schemas/hostname.dhall fails here until the matrix
+// covers it.
+
+/// One differential vector — the shared generic runner (fx-cli.
+/// expectPosixEqualsRecord; see fx-ls.zig) with this command's plumbing.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_hostname, &.{ "schemas/hostname.dhall", "fx-core/schemas/hostname.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    try expectPosixEqualsRecord(&.{"fx-hostname"}, "{ }");
+    try expectPosixEqualsRecord(&.{"fx-hostname"}, "{ nothing = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that a rejected parse exits the process (same discipline as the hand
+    // parser it replaced); the arena reclaims any state wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option / operand: hostname accepts NOTHING beyond argv[0]
+    // (the record form cannot express either at all)
+    try std.testing.expectError(error.UnknownOption, cli_hostname.parsePosix(&.{ "fx-hostname", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_hostname.parsePosix(&.{ "fx-hostname", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, cli_hostname.parsePosix(&.{ "fx-hostname", "op" }, gpa));
+    // `--` alone ends flag parsing; a token AFTER it is a bare operand
+    try std.testing.expectError(error.UnexpectedOperand, cli_hostname.parsePosix(&.{ "fx-hostname", "--", "op" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type.  The POSIX form has no spelling that could reach
+    // either (its analogue is -Zz above).
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/hostname.dhall", "fx-core/schemas/hostname.dhall" }) catch
+        @panic("cannot locate schemas/hostname.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ input = True }"));
 }
 
 test "hostnameName returns non-empty" {
@@ -243,7 +287,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
         _ = try evalDhallArgs(args[1], opt_alloc);
     } else {
-        _ = try parsePosixArgs(args);
+        // the GENERATED parser (schemas/hostname.dhall ->
+        // src/generated/cli_hostname.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
+        _ = try parsePosixArgs(args, opt_alloc);
     }
 
     const stdout_file = std.Io.File.stdout();

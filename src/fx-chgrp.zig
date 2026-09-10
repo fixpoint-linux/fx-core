@@ -1,12 +1,18 @@
 // fx-chgrp.zig — Dhall-typed chgrp coreutil over the global derivation log
 // (Option B; see concept.md).  Replaces the build.zig stub.
 //
-// Two arg forms:
-//   fx-chgrp '{ path = "/x", group = "1000" }'           Dhall record
-//   fx-chgrp GROUP FILE...                               POSIX fallback
+// Two arg forms (both derived from schemas/chgrp.dhall — the fx-chown
+// migration template applied to chgrp's identical GROUP/FILE shape):
+//   fx-chgrp '{ group = "1000", paths = [ "/x" ] }'      Dhall record
+//   fx-chgrp GROUP FILE...                               POSIX
 //
 // - GROUP is a numeric gid string, parsed with radix 10.  NAME lookup
 //   (getgrnam) out of scope v1 — non-numeric rejected with a clear error.
+//   group is REQUIRED in both forms: the record form is annotated with the
+//   schema's ty (a missing group field is a type error) and main() keeps the
+//   POSIX-side check (the "" default is a placeholder).
+//   The legacy singular `{ path = "/x" }` spelling is REJECTED (strict typed
+//   record) — it used to map silently onto paths[0].
 // - chgrp changes ONLY the group: the unified `.chown` op is reused with
 //   target_uid=null (uid unchanged).  e.gid carries the PRIOR gid (undo
 //   restores it); e.uid is null, so restoring prior uid is a no-op.
@@ -26,6 +32,8 @@
 const std = @import("std");
 const dh = @import("dhall");
 const caslog = @import("caslog");
+const cli_chgrp = @import("cli-chgrp");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -59,19 +67,15 @@ extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 const ChgrpErr = error{ StatFailed, ChownFailed, BadPath, NoMem, BadGroup };
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/chgrp.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    // Ordered paths to chgrp.  Empty => error (missing operand).
-    paths: []const []const u8 = &.{},
-    // Target gid (numeric).
-    group: u32 = 0,
-};
+const Options = cli_chgrp.Options;
+const parsePosixArgs = cli_chgrp.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    path: ?[]const u8 = null,
     group: ?[]const u8 = null,
+    paths: ?[]const []const u8 = null,
 };
 
 /// Parse a numeric gid string ("1000") into a u32 (radix 10).  Non-numeric or
@@ -129,7 +133,7 @@ fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
     }
     return null;
 }
-fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+fn jsonParseOpts(s: []const u8, buf: []u8, gpa: Allocator) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
     var i: usize = 0;
@@ -142,12 +146,65 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         jsonSkipWs(s, &i);
         if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "path")) {
-                res.path = val;
-            } else if (std.mem.eql(u8, key, "group")) {
+            if (std.mem.eql(u8, key, "group")) {
                 res.group = val;
             }
             off += val.len;
+        } else if (i < s.len and s[i] == '[') {
+            // a list value: `paths` is read element-by-element (List Text);
+            // any other list is skipped balanced.  Elements point into the
+            // caller's scratch buf; the element ARRAY is gpa-owned.
+            if (std.mem.eql(u8, key, "paths")) {
+                var items = std.ArrayList([]const u8).empty;
+                i += 1; // consume '['
+                jsonSkipWs(s, &i);
+                if (jsonExpect(s, &i, ']')) {
+                    res.paths = items.toOwnedSlice(gpa) catch return null;
+                } else {
+                    var ok = true;
+                    while (ok) {
+                        jsonSkipWs(s, &i);
+                        if (i < s.len and s[i] == '"') {
+                            const el = jsonParseString(s, &i, buf[off..]) orelse return null;
+                            items.append(gpa, el) catch return null;
+                            off += el.len;
+                        } else return null;
+                        jsonSkipWs(s, &i);
+                        if (jsonExpect(s, &i, ',')) continue;
+                        if (jsonExpect(s, &i, ']')) break;
+                        ok = false;
+                    }
+                    if (!ok) return null;
+                    res.paths = items.toOwnedSlice(gpa) catch return null;
+                }
+            } else {
+                var depth: usize = 0;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '[') depth += 1;
+                    if (s[i] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth != 0) return null;
+            }
+        } else if (i < s.len and s[i] == '{') {
+            // a nested record/union value: skip it (unread by this surface)
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '{') depth += 1;
+                if (s[i] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0) return null;
         } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4;
         } else {
@@ -164,7 +221,33 @@ const DhallArgs = struct {
     args_json: []const u8,
 };
 
-fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
+/// The runtime record evaluator in the harness shape: Options only (main()
+/// builds its args_json separately via evalDhallRecord; the differential
+/// runner needs exactly this signature).
+fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    const d = try evalDhallRecord(src, gpa);
+    return d.opts;
+}
+
+fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
+    // The record is checked against the schema's ty, spelled inline (single
+    // source of truth: schemas/chgrp.dhall; the differential test pins this
+    // copy to the schema — completeSrc re-checks the rendered record against
+    // the SCHEMA's ty).  The annotation is not decoration: the dhall subset
+    // cannot infer an EMPTY list literal (`paths = []`, the default the
+    // differential's rendered records always carry) without a surrounding
+    // type, it makes `group` REQUIRED (a missing field is a type error — the
+    // v1 schema has no required-field vocabulary), and it makes the record
+    // form STRICTLY typed (the old singular `{ path = "/x", group = ... }`
+    // spelling is rejected instead of being silently mapped onto paths[0]).
+    const wrapped = std.fmt.allocPrintSentinel(
+        gpa,
+        "({s} : {{ group : Text, paths : List Text }})",
+        .{src},
+        0,
+    ) catch return error.NoMem;
+    defer gpa.free(wrapped);
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -175,7 +258,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, wrapped, null, &err);
     if (t == null) {
         std.debug.print("fx-chgrp: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -205,7 +288,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
 
     const buf = try gpa.alloc(u8, 65536);
     defer gpa.free(buf);
-    const opts = jsonParseOpts(ob.items, buf) orelse {
+    const opts = jsonParseOpts(ob.items, buf, gpa) orelse {
         std.debug.print("fx-chgrp: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
         return error.DhallFields;
     };
@@ -213,38 +296,18 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !DhallArgs {
         std.debug.print("fx-chgrp: dhall record missing required 'group' field\n", .{});
         return error.DhallFields;
     }
+    // Validate the gid spec eagerly (reject non-numeric with a clear error).
+    _ = try parseGid(opts.group.?);
 
-    var o = Options{ .group = try parseGid(opts.group.?) };
-    if (opts.path) |pathv| {
-        const dup = try gpa.dupe(u8, pathv);
-        const arr = try gpa.alloc([]const u8, 1);
-        arr[0] = dup;
+    var o = Options{ .group = try gpa.dupe(u8, opts.group.?) };
+    if (opts.paths) |ps| {
+        // elements point into the JSON scratch buf; dupe them out (the
+        // generated Options' List-Text views are gpa-owned like argv dupes)
+        const arr = try gpa.alloc([]const u8, ps.len);
+        for (ps, 0..) |item, idx| arr[idx] = try gpa.dupe(u8, item);
         o.paths = arr;
     }
     return .{ .opts = o, .args_json = args_json };
-}
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var paths = std.ArrayList([]const u8).empty;
-    var group: ?u32 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (a.len > 0 and a[0] == '-') {
-            std.debug.print("fx-chgrp: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        if (group == null) {
-            group = try parseGid(a);
-            continue;
-        }
-        try paths.append(gpa, try gpa.dupe(u8, a));
-    }
-    if (group == null) {
-        std.debug.print("fx-chgrp: missing group operand\n", .{});
-        return error.MissingOperand;
-    }
-    return Options{ .paths = try paths.toOwnedSlice(gpa), .group = group.? };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,9 +357,9 @@ fn posixArgsJson(gpa: Allocator, o: Options) ![]const u8 {
         if (idx > 0) out.append(gpa, ',') catch return error.NoMem;
         try caslog.jsonEscape(gpa, &out, p);
     }
-    out.appendSlice(gpa, "],\"group\":\"") catch return error.NoMem;
-    out.print(gpa, "{d}", .{o.group}) catch return error.NoMem;
-    out.appendSlice(gpa, "\"}") catch return error.NoMem;
+    out.appendSlice(gpa, "],\"group\":") catch return error.NoMem;
+    try caslog.jsonEscape(gpa, &out, o.group);
+    out.append(gpa, '}') catch return error.NoMem;
     return out.toOwnedSlice(gpa) catch return error.NoMem;
 }
 
@@ -318,25 +381,28 @@ test "parseGid numeric only" {
     try std.testing.expectError(error.BadGroup, parseGid("1000x"));
 }
 
-test "parsePosixArgs GROUP and multiple files" {
+test "parsePosixArgs GROUP and multiple files (generated parser)" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-chgrp", "1000", "a", "b" };
-    const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqual(@as(u32, 1000), o.group);
+    const o = try parsePosixArgs(&.{ "fx-chgrp", "1000", "a", "b" }, aa);
+    try std.testing.expectEqualStrings("1000", o.group);
     try std.testing.expectEqual(@as(usize, 2), o.paths.len);
     try std.testing.expectEqualStrings("a", o.paths[0]);
     try std.testing.expectEqualStrings("b", o.paths[1]);
 }
 
-test "parsePosixArgs missing group errors" {
-    const args = [_][:0]const u8{ "fx-chgrp" };
-    try std.testing.expectError(error.MissingOperand, parsePosixArgs(&args, std.testing.allocator));
+test "parsePosixArgs missing group leaves group empty (main errors)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    const o = try parsePosixArgs(&.{"fx-chgrp"}, aa);
+    try std.testing.expectEqualStrings("", o.group);
+    try std.testing.expectEqual(@as(usize, 0), o.paths.len);
 }
 
 test "parsePosixArgs unknown option errors" {
-    const args = [_][:0]const u8{ "fx-chgrp", "-R", "1000", "x" };
+    const args = [_][]const u8{ "fx-chgrp", "-R", "1000", "x" };
     try std.testing.expectError(error.UnknownOption, parsePosixArgs(&args, std.testing.allocator));
 }
 
@@ -345,10 +411,10 @@ test "evalDhallArgs path and group" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    const d = try evalDhallArgs("{ path = \"/x\", group = \"1000\" }", aa);
+    const d = try evalDhallRecord("{ group = \"1000\", paths = [ \"/x\" ] }", aa);
     try std.testing.expectEqual(@as(usize, 1), d.opts.paths.len);
     try std.testing.expectEqualStrings("/x", d.opts.paths[0]);
-    try std.testing.expectEqual(@as(u32, 1000), d.opts.group);
+    try std.testing.expectEqualStrings("1000", d.opts.group);
 }
 
 test "evalDhallArgs missing group errors" {
@@ -356,7 +422,15 @@ test "evalDhallArgs missing group errors" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ path = \"/x\" }", aa));
+    try std.testing.expectError(error.DhallType, evalDhallRecord("{ paths = [ \"/x\" ] }", aa));
+}
+
+test "evalDhallArgs legacy singular path spelling is rejected (strict record)" {
+    var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_i.deinit();
+    const aa = arena_i.allocator();
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    try std.testing.expectError(error.DhallType, evalDhallRecord("{ path = \"/x\", group = \"1000\" }", aa));
 }
 
 test "evalDhallArgs non-numeric group errors" {
@@ -364,7 +438,7 @@ test "evalDhallArgs non-numeric group errors" {
     defer arena_i.deinit();
     const aa = arena_i.allocator();
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
-    try std.testing.expectError(error.BadGroup, evalDhallArgs("{ path = \"/x\", group = \"staff\" }", aa));
+    try std.testing.expectError(error.BadGroup, evalDhallRecord("{ group = \"staff\", paths = [ \"/x\" ] }", aa));
 }
 
 fn testTmpDir(gpa: Allocator) ![]const u8 {
@@ -443,9 +517,71 @@ test "posixArgsJson renders group string" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const o = Options{ .paths = &.{"a"}, .group = 1000 };
+    const o = Options{ .paths = &.{"a"}, .group = "1000" };
     const s = try posixArgsJson(aa, o);
     try std.testing.expectEqualStrings("{\"paths\":[\"a\"],\"group\":\"1000\"}", s);
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (STEP 3; the fx-whoami/fx-ls
+// template applied to a single-plus-many positional command)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser (schemas/chgrp.dhall
+// -> src/generated/cli_chgrp.zig) must produce the SAME Options as the Dhall
+// record form of the same user intent, driven through the shared runner
+// (fx-cli.expectPosixEqualsRecord): schema completion, renderDhallRecord,
+// THIS file's evalDhallArgs, then a field-complete encodeOptionsWire
+// comparison of both sides.  chgrp's surface: NO flags, GROUP as the first
+// operand (the numeric gid STRING, validated at use time), the rest FILE...
+// (many).
+
+/// One differential vector for fx-chgrp — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the STEP-3 template each
+/// migration copies).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_chgrp, &.{ "schemas/chgrp.dhall", "fx-core/schemas/chgrp.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // the GROUP operand, alone and with FILE operands
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000" }, "{ group = \"1000\" }");
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000", "a" }, "{ group = \"1000\", paths = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000", "a", "b" }, "{ group = \"1000\", paths = [ \"a\", \"b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "0", "x", "y", "z" }, "{ group = \"0\", paths = [ \"x\", \"y\", \"z\" ] }");
+    // the '--' terminator and bare '-' are plain operands here (no flags)
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "--", "1000", "-x" }, "{ group = \"1000\", paths = [ \"-x\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000", "-" }, "{ group = \"1000\", paths = [ \"-\" ] }");
+    // exotic operand bytes: space + quote pins record-side Dhall escaping
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000", "a b.txt" }, "{ group = \"1000\", paths = [ \"a b.txt\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000", "say \"hi\".txt" }, "{ group = \"1000\", paths = [ \"say \\\"hi\\\".txt\" ] }");
+    // duplicate operands bind twice (order-preserving List)
+    try expectPosixEqualsRecord(&.{ "fx-chgrp", "1000", "a", "a" }, "{ group = \"1000\", paths = [ \"a\", \"a\" ] }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // POSIX: NO flags — every "-..." token is error.UnknownOption (-R
+    // recursion is a documented scope cut)
+    try std.testing.expectError(error.UnknownOption, cli_chgrp.parsePosix(&.{ "fx-chgrp", "-R", "1000", "x" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_chgrp.parsePosix(&.{ "fx-chgrp", "--bogus" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field,
+    // wrong field type, and the SINGULAR legacy spelling (rejected loudly —
+    // it used to map silently onto paths[0])
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/chgrp.dhall", "fx-core/schemas/chgrp.dhall" }) catch
+        @panic("cannot locate schemas/chgrp.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ group = 5 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ path = \"/x\", group = \"1000\" }"));
 }
 
 // ---------------------------------------------------------------------------
@@ -459,16 +595,28 @@ pub fn main(init: std.process.Init) !void {
     var opts: Options = undefined;
     var args_json: []const u8 = undefined;
     if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
-        const d = try evalDhallArgs(args[1], aa);
+        const d = try evalDhallRecord(args[1], aa);
         opts = d.opts;
         args_json = d.args_json;
     } else {
+        // the GENERATED parser (schemas/chgrp.dhall ->
+        // src/generated/cli_chgrp.zig); equality with the record form above
+        // is pinned by the differential tests (expectPosixEqualsRecord)
         opts = try parsePosixArgs(args, aa);
         args_json = posixArgsJson(aa, opts) catch {
             std.debug.print("fx-chgrp: internal error building args\n", .{});
             return error.BadArgs;
         };
     }
+
+    // group is REQUIRED (the "" default is a placeholder — the check stays
+    // in main, the chown required-operand precedent), validated eagerly by
+    // parseGid (NAME lookup out of scope v1)
+    if (opts.group.len == 0) {
+        std.debug.print("fx-chgrp: missing group operand\n", .{});
+        return error.MissingOperand;
+    }
+    const target_gid: u32 = try parseGid(opts.group);
 
     const state_dir = caslog.resolveStateDir(aa) catch |e| {
         std.debug.print("fx-chgrp: cannot resolve state dir: {s}\n", .{@errorName(e)});
@@ -482,7 +630,7 @@ pub fn main(init: std.process.Init) !void {
     var effects = std.ArrayList(caslog.Effect).empty;
     var failed: ?anyerror = null;
     for (opts.paths) |p| {
-        walkChgrp(aa, p, opts.group, &effects) catch |e| {
+        walkChgrp(aa, p, target_gid, &effects) catch |e| {
             std.debug.print("fx-chgrp: cannot chgrp '{s}': {s}\n", .{ p, @errorName(e) });
             failed = e;
             break;

@@ -19,6 +19,8 @@
 
 const std = @import("std");
 const dh = @import("dhall");
+const cli_paste = @import("cli-paste");
+const cli = @import("fx-cli");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -44,20 +46,17 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model
+// CLI option model — GENERATED (single source of truth: schemas/paste.dhall)
 // ---------------------------------------------------------------------------
 
-const Options = struct {
-    files: []const []const u8 = &.{}, // '-' => stdin
-    delim: u8 = '\t',
-    serial: bool = false,
-};
+const Options = cli_paste.Options;
+const parsePosixArgs = cli_paste.parsePosix; // the generated POSIX parser
 
 const JsonOpts = struct {
-    a: ?[]const u8 = null,
-    b: ?[]const u8 = null,
     delim: ?[]const u8 = null,
     serial: ?bool = null,
+    files_n: usize = 0,
+    files: [16][]const u8 = undefined, // bounded like fx-echo's strings
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +122,7 @@ fn jsonParseBool(s: []const u8, i: *usize) ?bool {
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
+    var list_n: usize = 0; // elements stored for the (single) list field
     var i: usize = 0;
     if (!jsonExpect(s, &i, '{')) return null;
     if (jsonExpect(s, &i, '}')) return res;
@@ -131,13 +131,38 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         const key = jsonParseString(s, &i, &keybuf) orelse return null;
         if (!jsonExpect(s, &i, ':')) return null;
         jsonSkipWs(s, &i);
-        if (i < s.len and s[i] == '"') {
+        if (i < s.len and s[i] == '[') {
+            // JSON array of strings (term_to_json encodes Dhall List Text
+            // as a JSON array) — accumulate into the key's list, empty ok.
+            i += 1;
+            jsonSkipWs(s, &i);
+            if (i < s.len and s[i] == ']') {
+                i += 1;
+            } else {
+                while (true) {
+                    if (i >= s.len or s[i] != '"') return null;
+                    const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+                    if (std.mem.eql(u8, key, "files")) {
+                        if (list_n >= res.files.len) return null; // over capacity
+                        res.files[list_n] = val;
+                        list_n += 1;
+                    }
+                    off += val.len;
+                    jsonSkipWs(s, &i);
+                    if (i < s.len and s[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (i < s.len and s[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    return null;
+                }
+            }
+        } else if (i < s.len and s[i] == '"') {
             const val = jsonParseString(s, &i, buf[off..]) orelse return null;
-            if (std.mem.eql(u8, key, "a")) {
-                res.a = val;
-            } else if (std.mem.eql(u8, key, "b")) {
-                res.b = val;
-            } else if (std.mem.eql(u8, key, "delim")) {
+            if (std.mem.eql(u8, key, "delim")) {
                 res.delim = val;
             }
             off += val.len;
@@ -152,10 +177,58 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         if (!jsonExpect(s, &i, ',')) break;
     }
     if (!jsonExpect(s, &i, '}')) return null;
+    res.files_n = list_n; // the decode wrote the LOCAL; publish the count
     return res;
 }
 
+/// Bare `[]` (no type annotation) cannot be typed by the dhall-c typechecker
+/// this repo links ("cannot infer type of empty list (needs annotation)").
+/// The differential runner's record side renders completed schema values
+/// from fx-cli.renderDhallRecord, whose List arm emits the bare form, so the
+/// empty-default `files` would die at INFER time in evalDhallArgs on the
+/// all-defaults vector.  Repair the spelling at this command's single
+/// record-form entry point (fx-echo's repairBareList verbatim): an empty list
+/// whose neighbors are not identifier-ish gets the schema's `List Text`
+/// payload; a non-empty list is untouched (its elements carry the type).
+fn repairBareList(buf: []u8, src: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, src, "[]") == null) return src;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + 2 <= src.len and std.mem.eql(u8, src[i .. i + 2], "[]") and
+            (i == 0 or !isIdentByte(src[i - 1])) and
+            (i + 2 == src.len or !isIdentByte(src[i + 2])))
+        {
+            const rep = "[] : List Text";
+            @memcpy(buf[n .. n + rep.len], rep);
+            n += rep.len;
+            i += 2;
+        } else {
+            buf[n] = src[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn isIdentByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '"' or ch == '\\';
+}
+
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    // Repair a bare `[]` before the C parser sees it (see repairBareList —
+    // the differential runner's rendered records carry the untypeable
+    // spelling).  parse_source wants a C string, so the repaired copy is
+    // dupeZ'd; the unrepaired fast path passes `src` straight through.
+    var nb: [512]u8 = undefined;
+    var zbuf: [512:0]u8 = undefined;
+    const repaired = repairBareList(&nb, src);
+    const zsrc: [:0]const u8 = if (repaired.ptr == src.ptr)
+        src
+    else
+        std.fmt.bufPrintZ(&zbuf, "{s}", .{repaired}) catch return error.DhallFields;
+
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     arena.arena_reset(arena.dhall_arena.?);
 
@@ -166,7 +239,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     p.loader = loader;
     var err: dhall.DhallError = undefined;
     ast.dhall_error_clear(&err);
-    const t = parser.parse_source(&p, src, null, &err);
+    const t = parser.parse_source(&p, zsrc, null, &err);
     if (t == null) {
         std.debug.print("fx-paste: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
         return error.DhallParse;
@@ -201,47 +274,115 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
 
     var o = Options{};
     if (opts.delim) |d| {
-        if (d.len > 0) o.delim = d[0];
+        if (d.len > 0) o.delim = try gpa.dupe(u8, d);
     }
     if (opts.serial) |s| o.serial = s;
-    // 2-file Dhall form: a, b (or stdin if absent).
-    var files = std.ArrayList([]const u8).empty;
-    if (opts.a) |a| try files.append(gpa, try gpa.dupe(u8, a));
-    if (opts.b) |b| try files.append(gpa, try gpa.dupe(u8, b));
-    o.files = try files.toOwnedSlice(gpa);
+    if (opts.files_n > 0) {
+        // dupe the BYTES: the decoded slices point into the freed scratch buf
+        const arr = try gpa.alloc([]const u8, opts.files_n);
+        for (opts.files[0..opts.files_n], 0..) |sv, fi| arr[fi] = try gpa.dupe(u8, sv);
+        o.files = arr;
+    }
     return o;
 }
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var files = std.ArrayList([]const u8).empty;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-d")) {
-            if (i + 1 >= args.len) return error.BadArgs;
-            i += 1;
-            if (args[i].len > 0) o.delim = args[i][0];
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and std.mem.eql(u8, a[1..2], "d")) {
-            if (a.len > 2) o.delim = a[2];
-            continue;
-        } else if (std.mem.eql(u8, a, "-s")) {
-            o.serial = true;
-            continue;
-        } else if (a.len > 1 and a[0] == '-' and a[1] != '-') {
-            std.debug.print("fx-paste: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        }
-        try files.append(gpa, try gpa.dupe(u8, a));
-    }
-    o.files = try files.toOwnedSlice(gpa);
-    return o;
+// The POSIX form is parsed by the GENERATED parser (cli_paste.parsePosix,
+// aliased to parsePosixArgs above; schemas/paste.dhall -> src/generated/
+// cli_paste.zig).  Deliberate deltas vs the hand parser it replaced: `-dX`
+// (the attached value form) is now error.UnknownOption — a Value short never
+// clusters (schemas/README.md; the paste.dhall note verbatim) — `-d` without
+// a following token is error.MissingValue, `--delimiters=X` binds inline, and
+// `--` ends flag parsing.
+
+// ---------------------------------------------------------------------------
+// The differential test — the drift-kill proof (the fx-ls/fx-whoami template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion and evaluated by THIS file's evalDhallArgs (the exact
+// runtime path `fx-paste '{ ... }'` takes), via the SHARED runner
+// (fx-cli.expectPosixEqualsRecord).  The old two-file record spelling
+// (`{ a = "/f", b = "/g" }`) is NOT schema-typed (the schema models the files
+// LIST) — the record form is now `{ files = [ ... ] }`.
+
+/// One differential vector (the shared generic runner; see fx-ls.zig).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_paste, &.{ "schemas/paste.dhall", "fx-core/schemas/paste.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // empty argv == the all-defaults record (delim TAB, no files => stdin)
+    try expectPosixEqualsRecord(&.{"fx-paste"}, "{ }");
+    // -d with a separate-token value (the only -d spelling; -dx is unrepresentable)
+    try expectPosixEqualsRecord(&.{ "fx-paste", "-d", "," }, "{ delim = \",\" }");
+    // the Value long is inline-only (--delimiters=X; separate-token --delimiters
+    // is unknown in the generated surface)
+    try expectPosixEqualsRecord(&.{ "fx-paste", "--delimiters=:" }, "{ delim = \":\" }");
+    // inline --long=value for the Value long
+    try expectPosixEqualsRecord(&.{ "fx-paste", "--delimiters=|" }, "{ delim = \"|\" }");
+    // -s alone, the --serial long alias, then composed with -d
+    try expectPosixEqualsRecord(&.{ "fx-paste", "-s" }, "{ serial = True }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "--serial" }, "{ serial = True }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "-s", "-d", "," }, "{ delim = \",\", serial = True }");
+    // FILE operands: one, many (order-pinned), '-' (stdin) entries, and
+    // composed with the flags
+    try expectPosixEqualsRecord(&.{ "fx-paste", "a" }, "{ files = [ \"a\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "a", "b" }, "{ files = [ \"a\", \"b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "-", "b" }, "{ files = [ \"-\", \"b\" ] }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "-d", ",", "a", "b" }, "{ files = [ \"a\", \"b\" ], delim = \",\" }");
+    try expectPosixEqualsRecord(&.{ "fx-paste", "-s", "a", "b" }, "{ files = [ \"a\", \"b\" ], serial = True }");
+    // `--` ends flag parsing: a FILE that spells a flag
+    try expectPosixEqualsRecord(&.{ "fx-paste", "--", "-s" }, "{ files = [ \"-s\" ] }");
+    // operand-before-flag interleave (GNU parity; the generated parser
+    // accepts flags anywhere)
+    try expectPosixEqualsRecord(&.{ "fx-paste", "a", "-s", "b" }, "{ files = [ \"a\", \"b\" ], serial = True }");
+}
+
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator: the generated parser documents
+    // that operand dupes bound BEFORE the failing token are not freed (same
+    // discipline as the hand parser it replaced — a failed parse exits the
+    // process); the arena reclaims them wholesale here
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // unknown option; a cluster with an unknown letter; a value short that
+    // never clusters (`-ds` was the hand parser's attached -ds delimiter)
+    try std.testing.expectError(error.UnknownOption, cli_paste.parsePosix(&.{ "fx-paste", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_paste.parsePosix(&.{ "fx-paste", "-sQ" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_paste.parsePosix(&.{ "fx-paste", "-ds" }, gpa));
+    try std.testing.expectError(error.UnknownOption, cli_paste.parsePosix(&.{ "fx-paste", "--bogus" }, gpa));
+    // a Value flag with no next token (the hand parser's error.BadArgs)
+    try std.testing.expectError(error.MissingValue, cli_paste.parsePosix(&.{ "fx-paste", "-d" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field
+    // (the OLD two-file spelling a/b is not schema-typed), wrong field type.
+    // The POSIX analogue of the first is -Zz above.
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/paste.dhall", "fx-core/schemas/paste.dhall" }) catch
+        @panic("cannot locate schemas/paste.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ a = \"/f\", b = \"/g\" }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ delim = 5 }"));
 }
 
 // ---------------------------------------------------------------------------
 // Core logic (testable)
 // ---------------------------------------------------------------------------
+
+/// The runtime delim is the generated Text field (default "\t", schemas/
+/// paste.dhall); the core joins on ONE byte.  First byte of the (non-empty)
+/// delimiter is the honest cut the old u8 field spelled directly.
+fn delimByte(delim: []const u8) u8 {
+    return if (delim.len > 0) delim[0] else '\t';
+}
+
+test "delimByte" {
+    try std.testing.expectEqual(@as(u8, '\t'), delimByte("\t"));
+    try std.testing.expectEqual(@as(u8, ','), delimByte(","));
+    try std.testing.expectEqual(@as(u8, '\t'), delimByte("")); // defensive default
+}
 
 /// Split `data` into lines (on \n), dropping a single trailing newline so an
 /// unterminated final segment still counts as a line.  Returns gpa-owned slices
@@ -364,7 +505,7 @@ pub fn main(init: std.process.Init) !void {
                 try line_sets.append(aa, lines);
             }
         }
-        try pasteSerial(line_sets.items, opts.delim, &out, aa);
+        try pasteSerial(line_sets.items, delimByte(opts.delim), &out, aa);
     } else {
         var line_sets = std.ArrayList([]const []const u8).empty;
         defer line_sets.deinit(aa);
@@ -386,7 +527,7 @@ pub fn main(init: std.process.Init) !void {
                 try line_sets.append(aa, lines);
             }
         }
-        try pasteParallel(line_sets.items, opts.delim, &out, aa);
+        try pasteParallel(line_sets.items, delimByte(opts.delim), &out, aa);
     }
     _ = std.Io.File.writeStreamingAll(stdout_file, init.io, out.items) catch return error.WriteFailed;
 }
@@ -430,22 +571,31 @@ test "pasteSerial joins each file onto one line" {
     try std.testing.expectEqualStrings("x:y:z\n", out.items);
 }
 
-test "parsePosixArgs -d -s and files" {
+test "parsePosixArgs via the generated parser (d, s, files)" {
     var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_i.deinit();
     const aa = arena_i.allocator();
-    const args = [_][:0]const u8{ "fx-paste", "-d", ",", "-s", "a", "b" };
+    const args = [_][]const u8{ "fx-paste", "-d", ",", "-s", "a", "b" };
     const o = try parsePosixArgs(&args, aa);
-    try std.testing.expectEqual(@as(u8, ','), o.delim);
+    try std.testing.expectEqualStrings(",", o.delim);
     try std.testing.expect(o.serial);
     try std.testing.expectEqual(@as(usize, 2), o.files.len);
 }
 
-test "jsonParseOpts a/b/delim/serial" {
+test "jsonParseOpts files list + delim + serial" {
     var buf: [2048]u8 = undefined;
-    const o = jsonParseOpts("{\"a\":\"/x\",\"b\":\"/y\",\"delim\":\":\",\"serial\":true}", &buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/x", o.a.?);
-    try std.testing.expectEqualStrings("/y", o.b.?);
+    const o = jsonParseOpts("{\"delim\":\":\",\"files\":[\"/x\",\"/y\"],\"serial\":true}", &buf) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(":", o.delim.?);
+    try std.testing.expectEqual(@as(usize, 2), o.files_n);
+    try std.testing.expectEqualStrings("/x", o.files[0]);
+    try std.testing.expectEqualStrings("/y", o.files[1]);
     try std.testing.expectEqual(true, o.serial.?);
+}
+
+test "jsonParseOpts empty files list (stdin)" {
+    var buf: [2048]u8 = undefined;
+    const o = jsonParseOpts("{\"files\":[]}", &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), o.files_n);
+    try std.testing.expectEqual(@as(?[]const u8, null), o.delim);
+    try std.testing.expectEqual(@as(?bool, null), o.serial);
 }
