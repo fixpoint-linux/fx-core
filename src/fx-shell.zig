@@ -609,6 +609,183 @@ pub fn buildPlan(gpa: Allocator, line: []const u8) ShellError![]eval.Stage {
 /// fx-compose itself calls, so the shell and the DSL cannot drift; the
 /// report's ownership matches eval.run's exactly (see fx-eval).
 ///
+
+// ---------------------------------------------------------------------------
+// U5a — the RUN-MODE (|) pipe executor
+// ---------------------------------------------------------------------------
+//
+// `|` means RUN: fork/exec each stage connected by real pipes, streaming, and
+// record NOTHING.  `|>` keeps the record path (fx-eval.run: CAS-intern every
+// intermediate).  lineMode() picks; see runByMode.
+//
+// WHY A SEPARATE ARGV BUILDER: in record mode a stage receives its input as an
+// ARGV operand (a CAS blob path) or as a bare-Text VALUE; in run mode it
+// arrives on stdin.  So the argv differs by role — but the USER's tokens always
+// ride verbatim, exactly as appendUserArgv does in the record path, and the
+// engine only APPENDS the plan tokens.  The rules mirror fx-eval's execDispatch
+// switch (specs/fx-stages.zig is the shared table).
+
+extern "c" fn fork() std.c.pid_t;
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn _exit(status: c_int) noreturn;
+
+/// Build the child argv for one stage IN RUN MODE.  Returns a NULL-terminated
+/// slice of NUL-terminated strings (caller frees each + the slice).
+fn buildRunArgv(gpa: Allocator, stage: *const eval.Stage, bin_dir: []const u8) ![]?[*:0]const u8 {
+    const spec = specs.lookup(stage.name) orelse return error.UnknownStage;
+
+    var argv = std.ArrayList(?[*:0]const u8).empty;
+    errdefer {
+        for (argv.items) |a| if (a) |p| gpa.free(std.mem.span(p));
+        argv.deinit(gpa);
+    }
+
+    const bin = try std.fmt.allocPrintSentinel(gpa, "{s}/fx-{s}", .{ bin_dir, stage.name }, 0);
+    try argv.append(gpa, bin.ptr);
+
+    // a text-operand stage takes its operand from STDIN in run mode: the lone
+    // '-' convention (fx-cli.isStdinOperand) reads the value from fd 0.
+    if (spec.role == .text_operand) {
+        const dash = try gpa.dupeZ(u8, "-");
+        try argv.append(gpa, dash.ptr);
+    }
+
+    // the user's tokens, verbatim and in order
+    for (stage.argv) |tok| {
+        const z = try gpa.dupeZ(u8, tok);
+        try argv.append(gpa, z.ptr);
+    }
+
+    // the plan token: rows-producing stages must be told to emit the declared
+    // wire rows.  This mirrors execDispatch's --rows append AND covers
+    // find/grep, whose BINARIES now grow a --rows mode (U10) so exec and the
+    // in-process native path emit identical bytes.
+    switch (spec.role) {
+        .operand_rows, .generator_rows, .native => {
+            const rows = try gpa.dupeZ(u8, "--rows");
+            try argv.append(gpa, rows.ptr);
+        },
+        else => {},
+    }
+
+    try argv.append(gpa, null);
+    return argv.toOwnedSlice(gpa);
+}
+
+fn freeRunArgv(gpa: Allocator, argv: []?[*:0]const u8) void {
+    for (argv) |a| if (a) |p| gpa.free(std.mem.span(p));
+    gpa.free(argv);
+}
+
+/// The child side of a fork.  TOUCHES ONLY libc: dup2/close/execvp/_exit.  No
+/// allocator, no error-unwind, no buffered I/O — after fork only async-signal-
+/// safe calls are valid (the discipline zinc-vm's execplan documents too).
+fn childExec(
+    stdin_fd: std.c.fd_t,
+    stdout_fd: std.c.fd_t,
+    argv: []?[*:0]const u8,
+    all_pipes: []const [2]std.c.fd_t,
+) noreturn {
+    // close every pipe fd we are not deliberately keeping, or the pipes never
+    // see EOF (each child would hold a write end of every later pipe)
+    for (all_pipes) |p| {
+        if (p[0] != stdin_fd and p[0] != stdout_fd) _ = std.c.close(p[0]);
+        if (p[1] != stdin_fd and p[1] != stdout_fd) _ = std.c.close(p[1]);
+    }
+    if (stdin_fd != 0) {
+        if (std.c.dup2(stdin_fd, 0) < 0) _exit(127);
+        _ = std.c.close(stdin_fd);
+    }
+    if (stdout_fd != 1) {
+        if (std.c.dup2(stdout_fd, 1) < 0) _exit(127);
+        _ = std.c.close(stdout_fd);
+    }
+    _ = execvp(argv[0].?, @ptrCast(argv.ptr));
+    _exit(127); // execvp failed (127 = not found, the shell convention)
+}
+
+/// Run a plan in RUN MODE.  Returns the LAST stage's exit status.  Nothing is
+/// interned and nothing is recorded — that is the point of `|`.
+pub fn runPipes(plan: []const eval.Stage, bin_dir: []const u8, gpa: Allocator) !u8 {
+    const n = plan.len;
+    if (n == 0) return error.NoStages;
+
+    var argvs = try gpa.alloc([]?[*:0]const u8, n);
+    defer gpa.free(argvs);
+    var built: usize = 0;
+    errdefer for (argvs[0..built]) |a| freeRunArgv(gpa, a);
+    for (plan, 0..) |*stage, i| {
+        argvs[i] = try buildRunArgv(gpa, stage, bin_dir);
+        built = i + 1;
+    }
+    defer for (argvs) |a| freeRunArgv(gpa, a);
+
+    const npipes = if (n > 1) n - 1 else 0;
+    const pipes = try gpa.alloc([2]std.c.fd_t, npipes);
+    defer gpa.free(pipes);
+    for (pipes) |*p| {
+        if (std.c.pipe(p) != 0) {
+            for (pipes) |q| {
+                _ = std.c.close(q[0]);
+                _ = std.c.close(q[1]);
+            }
+            return error.PipeFailed;
+        }
+    }
+
+    var pids = try gpa.alloc(std.c.pid_t, n);
+    defer gpa.free(pids);
+
+    for (plan, 0..) |_, i| {
+        const stdin_fd: std.c.fd_t = if (i == 0) 0 else pipes[i - 1][0];
+        const stdout_fd: std.c.fd_t = if (i == n - 1) 1 else pipes[i][1];
+        const pid = fork();
+        if (pid < 0) return error.ForkFailed;
+        if (pid == 0) childExec(stdin_fd, stdout_fd, argvs[i], pipes);
+        pids[i] = pid;
+    }
+
+    // the parent holds no pipe end, or the readers never see EOF
+    for (pipes) |p| {
+        _ = std.c.close(p[0]);
+        _ = std.c.close(p[1]);
+    }
+
+    var last_status: u8 = 0;
+    for (pids, 0..) |pid, i| {
+        var st: c_int = 0;
+        while (std.c.waitpid(pid, &st, 0) < 0) {}
+        if (i == n - 1) {
+            const u: u32 = @bitCast(st);
+            last_status = if (std.posix.W.IFEXITED(u)) std.posix.W.EXITSTATUS(u) else 128;
+        }
+    }
+    return last_status;
+}
+
+/// What a line produced: a record-mode derivation, or a run-mode exit status.
+pub const Outcome = union(enum) {
+    recorded: eval.RunReport,
+    streamed: u8,
+};
+
+/// The single dispatcher: pick the executor from the line's MODE.  record keeps
+/// the CAS path (unchanged); pipe is the streaming executor above.
+pub fn runByMode(
+    mode: Op,
+    plan: []const eval.Stage,
+    input: []const u8,
+    state_dir: []const u8,
+    bin_dir: []const u8,
+    gpa: Allocator,
+    io: std.Io,
+) !Outcome {
+    return switch (mode) {
+        .record => .{ .recorded = try eval.run(plan, input, state_dir, bin_dir, gpa, io) },
+        .pipe => .{ .streamed = try runPipes(plan, bin_dir, gpa) },
+    };
+}
+
 /// EXECUTOR SEAM: this call is the ONE place a pipeline is executed.  A
 /// pipe-based run mode (streaming stdout between stages instead of
 /// CAS-materializing each hop) and/or an execplan-backed executor slot in
@@ -624,6 +801,29 @@ pub fn run(
     io: std.Io,
 ) !eval.RunReport {
     return eval.run(plan, input, state_dir, bin_dir, gpa, io);
+}
+
+/// Mode-aware pipeline execution: the ONE place a line is executed.  `|>`
+/// (record) CAS-interns every intermediate and returns a derivation; `|`
+/// (pipe) forks the stages together, streams, records nothing, and returns the
+/// last stage's exit status.  The plan was already typechecked by buildPlan —
+/// the mode changes only HOW it runs, never WHAT is accepted.
+pub fn runLine(
+    gpa: Allocator,
+    line: []const u8,
+    input: []const u8,
+    state_dir: []const u8,
+    bin_dir: []const u8,
+    io: std.Io,
+) !Outcome {
+    const stage_toks = try tokenizeStages(gpa, line);
+    defer freeStageTokens(gpa, stage_toks);
+    const mode = lineMode(stage_toks);
+    // buildPlan re-tokenizes internally; it is cheap and keeps one code path
+    // for the typecheck (the plan must be identical in both modes).
+    const plan = try buildPlan(gpa, line);
+    defer for (plan) |*st| freeStage(gpa, st);
+    return runByMode(mode, plan, input, state_dir, bin_dir, gpa, io);
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,4 +1311,68 @@ test "run delegate: native find |> grep through the seam, end-to-end" {
     const out = try caslog.casGet(gpa, state, rep.final_hash);
     defer gpa.free(out);
     try testing.expectEqualStrings("needle.txt\n", out);
+}
+
+// ---------------------------------------------------------------------------
+// U5a tests — mode selection + the run-mode executor
+// ---------------------------------------------------------------------------
+
+test "mode selection: | runs (pipes), |> records (CAS)" {
+    // The operator picks the executor.  This asserts the DISPATCH, not the
+    // execution: runLine is the single mode-aware entry point, and lineMode is
+    // the rule it consults.  The end-to-end behaviour of each path is covered
+    // by the shell's own smoke tests (they need real binaries).
+    const gpa = testing.allocator;
+    const expect = struct {
+        fn mode(g: Allocator, line: []const u8, want: Op) !void {
+            const toks = try tokenizeStages(g, line);
+            defer freeStageTokens(g, toks);
+            try testing.expectEqual(want, lineMode(toks));
+        }
+    }.mode;
+    try expect(gpa, "find /tmp | grep x", .pipe);
+    try expect(gpa, "find /tmp |> grep x", .record);
+    try expect(gpa, "cat", .pipe);
+    try expect(gpa, "cat |> wc", .record);
+}
+
+test "run-mode argv: the ROLE decides the plan token, user tokens ride verbatim" {
+    // buildRunArgv is the run-mode twin of fx-eval's execDispatch.  A
+    // rows-producing role gets --rows appended (so the child emits the
+    // declared wire rows, not display text); a text-operand role gets the
+    // lone '-' (the stdin-operand convention); the USER's tokens always ride
+    // first and unmodified.  Pinned here because a wrong token here would
+    // silently change what the child computes in run mode only — exactly the
+    // class of bug U1 fixed for the record path.
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const check = struct {
+        fn run(alloc: Allocator, name: []const u8, user: []const []const u8, want: []const []const u8) !void {
+            var argv_store = [_][]const u8{};
+            _ = &argv_store;
+            const stage = eval.Stage{
+                .name = name,
+                .argv = user,
+                .shape_in = .{ .tag = .lines },
+                .shape_out = .{ .tag = .lines },
+            };
+            const got = try buildRunArgv(alloc, &stage, "/bin");
+            for (want, 0..) |w, i| {
+                try testing.expectEqualStrings(w, std.mem.span(got[i].?));
+            }
+            try testing.expect(got[want.len] == null);
+        }
+    }.run;
+
+    // sort: a file_operand stage — bin + user tokens, NO plan token
+    try check(a, "sort", &.{"-r"}, &.{ "/bin/fx-sort", "-r" });
+    // ls: operand_rows — bin + user tokens + --rows
+    try check(a, "ls", &.{"/tmp"}, &.{ "/bin/fx-ls", "/tmp", "--rows" });
+    // find: native — bin + user tokens + --rows (its binary grew --rows in U10)
+    try check(a, "find", &.{"/tmp"}, &.{ "/bin/fx-find", "/tmp", "--rows" });
+    // basename: text_operand — bin + '-' (stdin) + the SUFFIX user token
+    try check(a, "basename", &.{".txt"}, &.{ "/bin/fx-basename", "-", ".txt" });
 }
