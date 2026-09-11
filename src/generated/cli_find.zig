@@ -20,6 +20,13 @@ pub const Options = struct {
     type_filter: ?enum { Dir, File, } = null,
 };
 
+/// The declared pipeline OUTPUT type (this schema's `out` section,
+/// rendered in DECLARED field order — the order pins the canonical
+/// wire JSON key order).  SINGLE SOURCE shared with the fx-pipeline
+/// registry's builtin(): the producers' wire encoders and the
+/// compose() type-checker both consume THIS literal.
+pub const out_type_src = "{ path : Text, kind : < Dir | File >, size : Natural, mtime : Natural }";
+
 /// Errors the parser can fail with.  (No MissingOperand in v1: every
 /// positional is optional-or-many via its dflt default; required
 /// operands land with the mutator batch.)

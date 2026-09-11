@@ -992,6 +992,13 @@ pub fn build(b: *std.Build) void {
 /// Existence is checked at build.zig RUNTIME against the build root (build.zig
 /// is a normal program — comptime file access is not possible), so a missing
 /// parser simply leaves that command's imports as extra ++ { dhall }.
+/// Shared cli-find / cli-grep module objects, set once in build().  cliImports
+/// must REUSE these for find/grep rather than making a second module over the
+/// same file (two modules with one root file is a hard Zig error, and the
+/// engine reaches those files by module name).
+var shared_cli_find: ?*std.Build.Module = null;
+var shared_cli_grep: ?*std.Build.Module = null;
+
 fn cliImports(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1009,21 +1016,35 @@ fn cliImports(
     // other than success means no generated parser for this command.
     const gen_exists = if (b.build_root.handle.access(b.graph.io, gen_path, .{})) |_| true else |_| false;
 
-    const total = extra.len + 1 + (if (gen_exists) @as(usize, 2) else 0);
+    // find/grep get NO `cli-<bare>` module.  Their generated parser is reached
+    // by PATH instead — from the binary AND from the engine (fx-pipeline's
+    // builtin() reads the same schema literal, and fx-eval's native find/grep
+    // decode with it).  A file imported by path in one place and as a module
+    // in another is a hard Zig error ("file exists in modules X and Y"); the
+    // path form is the one that composes across all of those, so both import it
+    // that way and `fx-cli` (the schema evaluator) is still provided by name.
+    const uses_path = std.mem.eql(u8, bare, "find") or std.mem.eql(u8, bare, "grep");
+
+    const total = extra.len + 1 +
+        (if (gen_exists) @as(usize, if (uses_path) 1 else 2) else 0);
     const imports = b.allocator.alloc(std.Build.Module.Import, total) catch @panic("OOM");
     @memcpy(imports[0..extra.len], extra);
     imports[extra.len] = .{ .name = "dhall", .module = dhall_mod };
     if (gen_exists) {
-        imports[extra.len + 1] = .{
-            .name = std.fmt.allocPrint(b.allocator, "cli-{s}", .{bare}) catch @panic("OOM"),
-            .module = b.createModule(.{
-                .root_source_file = b.path(gen_path),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        };
-        imports[extra.len + 2] = .{ .name = "fx-cli", .module = cli_mod };
+        if (uses_path) {
+            imports[extra.len + 1] = .{ .name = "fx-cli", .module = cli_mod };
+        } else {
+            imports[extra.len + 1] = .{
+                .name = std.fmt.allocPrint(b.allocator, "cli-{s}", .{bare}) catch @panic("OOM"),
+                .module = b.createModule(.{
+                    .root_source_file = b.path(gen_path),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            };
+            imports[extra.len + 2] = .{ .name = "fx-cli", .module = cli_mod };
+        }
     }
     return imports;
 }

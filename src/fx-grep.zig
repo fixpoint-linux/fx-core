@@ -56,7 +56,7 @@
 
 const std = @import("std");
 const dh = @import("dhall");
-const cli_grep = @import("cli-grep");
+const cli_grep = @import("generated/cli_grep.zig");
 const cli = @import("fx-cli");
 // the Lens-3 wire codec, imported by path like fx-eval/fx-shell/fx-find do
 // (fx-grep's build module table carries only dhall/cli-grep/fx-cli; fx-wire
@@ -538,9 +538,11 @@ test "DIFFERENTIAL: POSIX stays hand — parity with the generated flagless subs
 // --rows: the ROW-FILTER mode (nativeGrep's contract)
 // ---------------------------------------------------------------------------
 
-// The grep input rows type — a spelled twin of fx-eval.zig's grep_rows_src,
-// the SAME literal the fx-pipeline registry and nativeGrep decode against.
-const grep_rows_src = "{ path : Text }";
+// The grep INPUT rows type — the schema's `input` section via the generated
+// cli_grep.zig, ONE literal shared with fx-eval's nativeGrep decode and
+// fx-pipeline's builtin("grep").  Imported by PATH (the `cli-grep` module form
+// would collide with the engine's import of the same file).
+const grep_rows_src = cli_grep.input_type_src;
 
 /// Full-key DFA walk (fx-eval.zig dfaMatchFull's twin — regexwalk.h's
 /// transparent regex_dfa contract: trans[s*256+byte], UINT32_MAX dead marker,

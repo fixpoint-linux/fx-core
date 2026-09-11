@@ -1371,9 +1371,36 @@ fn emitUsage(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
 /// Rendering goes through cli.outTypeSrcOrdered (declared field order —
 /// order is load-bearing, see its header).
 fn emitOutType(out: *Out, gpa: Allocator, name: []const u8, schema_src: [:0]const u8, s: *const cli.Schema) GenError!void {
-    if (s.out == null) return;
-    const src = cli.outTypeSrcOrdered(gpa, schema_src, s) catch |e| {
-        std.debug.print("fx-clijson: {s}: out section rendering failed: {s}\n", .{ name, @errorName(e) });
+    try emitSectionType(out, gpa, name, schema_src, s, "out");
+}
+
+/// Emit the `input` section's type (the pipeline INPUT rows this stage
+/// consumes) as `input_type_src`.  Same single-source rule as `out`: the wire
+/// decoder and the registry's builtin() both parse THIS literal.
+fn emitInputType(out: *Out, gpa: Allocator, name: []const u8, schema_src: [:0]const u8, s: *const cli.Schema) GenError!void {
+    try emitSectionType(out, gpa, name, schema_src, s, "input");
+}
+
+fn emitSectionType(
+    out: *Out,
+    gpa: Allocator,
+    name: []const u8,
+    schema_src: [:0]const u8,
+    s: *const cli.Schema,
+    comptime section: []const u8,
+) GenError!void {
+    const is_out = comptime std.mem.eql(u8, section, "out");
+    if (is_out) {
+        if (s.out == null) return;
+    } else {
+        if (s.input == null) return;
+    }
+    const const_name = comptime if (is_out) "out_type_src" else "input_type_src";
+    const src = (if (is_out)
+        cli.outTypeSrcOrdered(gpa, schema_src, s)
+    else
+        cli.inputTypeSrcOrdered(gpa, schema_src, s)) catch |e| {
+        std.debug.print("fx-clijson: {s}: {s} section rendering failed: {s}\n", .{ name, section, @errorName(e) });
         return error.Schema;
     };
     defer gpa.free(src);
@@ -1388,7 +1415,9 @@ fn emitOutType(out: *Out, gpa: Allocator, name: []const u8, schema_src: [:0]cons
         \\/// compose() type-checker both consume THIS literal.
         \\
     );
-    try out.put("pub const out_type_src = \"");
+    try out.put("pub const ");
+    try out.put(const_name);
+    try out.put(" = \"");
     try out.put(e);
     try out.put("\";\n");
 }
@@ -2077,6 +2106,7 @@ fn emit(gpa: Allocator, name: []const u8, schema_src: [:0]const u8, s: *const cl
     try emitEnumDecls(&out, gpa, s);
     try emitOptions(&out, gpa, s);
     try emitOutType(&out, gpa, name, schema_src, s);
+    try emitInputType(&out, gpa, name, schema_src, s);
     try emitParsePosix(&out, gpa, name, s);
     try emitUsage(&out, gpa, name, s);
     try emitTests(&out, gpa, name, s);

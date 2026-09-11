@@ -42,6 +42,8 @@ const cli_tree = @import("generated/cli_tree.zig");
 const cli_df = @import("generated/cli_df.zig");
 const cli_ps = @import("generated/cli_ps.zig");
 const cli_top = @import("generated/cli_top.zig");
+const cli_find = @import("generated/cli_find.zig");
+const cli_grep = @import("generated/cli_grep.zig");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -242,12 +244,16 @@ pub fn builtin(name: []const u8, gpa: Allocator) !Command {
     // find:  single { path : Text } -> rows { path, kind, size, mtime }
     if (std.mem.eql(u8, name, "find")) {
         const in_t = try parseType("{ path : Text }", gpa);
-        const out_t = try parseType("{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }", gpa);
+        // the schema's `out` section (single source — the same literal the
+        // native producer's wire encoder parses)
+        const out_t = try parseType(cli_find.out_type_src, gpa);
         return .{ .name = "find", .input = Shape.single(in_t), .output = Shape.rows(out_t) };
     }
     // grep:  rows { path : Text } -> lines
     if (std.mem.eql(u8, name, "grep")) {
-        const in_t = try parseType("{ path : Text }", gpa);
+        // the schema's `input` section (single source — the same literal the
+        // stdin-rows decoder parses)
+        const in_t = try parseType(cli_grep.input_type_src, gpa);
         return .{ .name = "grep", .input = Shape.rows(in_t), .output = .{ .tag = .lines } };
     }
     // ls:    single { path : Text } -> rows { name, size, mode }
@@ -708,9 +714,10 @@ test "registry: ps/top are generators (position 0 only); tree/df are {path} oper
 // registry arm re-duplicated as a hand-written string that diverges) fails
 // THIS test.
 //
-// find/grep are deliberately absent: their literals still live in
-// fx-eval.zig (peer-owned this unit) — single-sourcing them is the recorded
-// follow-up.
+// find/grep are now included: fx-eval's native producers read the SAME
+// generated literals (find's `out` section, grep's `input` section — so
+// single-sourcing is structural, not test-enforced, for the producer side).
+// This test still guards the REGISTRY half of each pair.
 // ---------------------------------------------------------------------------
 
 test "drift: builtin outputs match the schema-declared out types (U8 single-source)" {
@@ -723,6 +730,10 @@ test "drift: builtin outputs match the schema-declared out types (U8 single-sour
         .{ .name = "df", .src = cli_df.out_type_src },
         .{ .name = "ps", .src = cli_ps.out_type_src },
         .{ .name = "top", .src = cli_top.out_type_src },
+        // find's producer is NATIVE (fx-eval.nativeFind) and reads this very
+        // literal now, so this pins the registry's agreement with the schema
+        // rather than a duplicate.
+        .{ .name = "find", .src = cli_find.out_type_src },
     };
     for (cases) |c| {
         const cmd = try builtin(c.name, t.allocator);
@@ -742,6 +753,29 @@ test "drift: builtin outputs match the schema-declared out types (U8 single-sour
     }
 }
 
+test "drift: builtin inputs match the schema-declared input types" {
+    // grep's pipeline INPUT rows type comes from the schema's `input` section
+    // (NOT `out` — grep CONSUMES rows and PRODUCES lines).  The registry's
+    // Shape.rows(in_t) must be that declared type, and fx-eval's stdin-rows
+    // decoder reads the same literal.
+    const cases = [_]struct { name: []const u8, src: [:0]const u8 }{
+        .{ .name = "grep", .src = cli_grep.input_type_src },
+    };
+    for (cases) |c| {
+        const cmd = try builtin(c.name, t.allocator);
+        const declared = try parseType(c.src, t.allocator);
+        try t.expect(cmd.input.tag == .rows);
+        try t.expect(cmd.input.ty != null);
+        if (!ast.alpha_eq(declared, cmd.input.ty.?)) {
+            std.debug.print(
+                "drift: builtin(\"{s}\").input is not the schema-declared input type (generated literal: {s})\n",
+                .{ c.name, c.src },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "drift: the generated out literals keep their declared (wire key) order" {
     // The literal's textual field order pins the canonical wire JSON key
     // order (fx-wire.declaredFieldKinds scans the source), and dhall-c
@@ -752,6 +786,10 @@ test "drift: the generated out literals keep their declared (wire key) order" {
     // sort first).
     try t.expect(std.mem.startsWith(u8, cli_ls.out_type_src, "{ name : Text, size : Natural, mode : Natural }"));
     try t.expect(std.mem.startsWith(u8, cli_tree.out_type_src, "{ path : Text, kind : < Dir | File >, size : Natural, mtime : Natural }"));
+    // find's declared order path,kind,size,mtime (its union renders sorted —
+    // < Dir | File > — which is unrecoverable from the parsed Term and is
+    // alpha-equal to the hand-written < File | Dir > it replaced)
+    try t.expect(std.mem.startsWith(u8, cli_find.out_type_src, "{ path : Text, kind : < Dir | File >, size : Natural, mtime : Natural }"));
     try t.expect(std.mem.startsWith(u8, cli_du.out_type_src, "{ path : Text, bytes : Natural }"));
     try t.expect(std.mem.startsWith(u8, cli_df.out_type_src, "{ fs : Text, mount : Text, total_kb : Natural, used_kb : Natural, avail_kb : Natural }"));
     try t.expect(std.mem.startsWith(u8, cli_ps.out_type_src, "{ pid : Natural, state : Text, ppid : Natural, cpu : Natural, rss_kb : Natural, comm : Text }"));

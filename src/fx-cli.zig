@@ -136,6 +136,14 @@ pub const Schema = struct {
     /// for builtin(name) — so the type compose() type-checks against and
     /// the type the producers' wire encoders enforce are ONE literal.
     out: ?*TypeExpr = null,
+    /// OPTIONAL declared pipeline INPUT rows type (schemas' `input` section —
+    /// a Dhall record TYPE, e.g. grep's `{ path : Text }`: the rows it
+    /// CONSUMES).  null when absent: the registry's own modelling of that
+    /// stage's input stands.  Declared as `input` and NOT `in` because `in`
+    /// is a Dhall KEYWORD and dhall-c rejects it as a field label (verified).
+    /// Rendered by fx-clijson into the generated file's `input_type_src`
+    /// constant, the single literal the decoders and builtin() share.
+    input: ?*TypeExpr = null,
 
     pub fn deinit(self: *Schema, gpa: Allocator) void {
         self.ty.deinit(gpa);
@@ -146,6 +154,10 @@ pub const Schema = struct {
         if (self.out) |o| {
             o.deinit(gpa);
             gpa.destroy(o);
+        }
+        if (self.input) |i| {
+            i.deinit(gpa);
+            gpa.destroy(i);
         }
     }
 };
@@ -779,7 +791,20 @@ pub fn renderTypeInto(gpa: Allocator, s: *std.ArrayList(u8), ty: *const TypeExpr
 /// wire bytes do not depend on it.
 /// One whole-arena transaction, like evalSchemaSrc.
 pub fn outTypeSrcOrdered(gpa: Allocator, schema_src: [:0]const u8, s: *const Schema) Error![]const u8 {
-    const out = s.out orelse return error.SchemaShape;
+    return sectionTypeSrcOrdered(gpa, schema_src, s.out, "out");
+}
+
+/// Same rendering for the `input` section (the pipeline INPUT rows type).
+pub fn inputTypeSrcOrdered(gpa: Allocator, schema_src: [:0]const u8, s: *const Schema) Error![]const u8 {
+    return sectionTypeSrcOrdered(gpa, schema_src, s.input, "input");
+}
+
+/// Render ONE schema section's record TYPE in DECLARED field order.  Shared by
+/// `out` and `input`: both need the order because the wire's canonical JSON key
+/// order is the declared one, while dhall-c SORTS record fields at parse — the
+/// order is only recoverable from the source, hence the re-parse.
+fn sectionTypeSrcOrdered(gpa: Allocator, schema_src: [:0]const u8, te: ?*TypeExpr, section: []const u8) Error![]const u8 {
+    const out = te orelse return error.SchemaShape;
     if (out.* != .record or out.record.len == 0) return error.SchemaShape;
 
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
@@ -791,7 +816,7 @@ pub fn outTypeSrcOrdered(gpa: Allocator, schema_src: [:0]const u8, s: *const Sch
     var body = parsed;
     while (body.tag == .TmLet) body = body.as.let_.body orelse return error.SchemaShape;
     if (body.tag != .TmRecordLit) return error.SchemaShape;
-    const out_t = recField(body, "out") orelse return error.SchemaShape;
+    const out_t = recField(body, section) orelse return error.SchemaShape;
     if (out_t.tag != .TmRecordType) return error.SchemaShape;
 
     // declared order: sort the (sorted) field-type terms by source position
@@ -878,8 +903,20 @@ pub fn evalSchemaSrc(gpa: Allocator, src: [:0]const u8) Error!Schema {
         out = try copyType(gpa, out_t);
     }
 
+    // input : the pipeline INPUT rows type — same additive/shape rules as
+    // `out`.  Named `input` because `in` is a Dhall keyword.
+    var input: ?*TypeExpr = null;
+    errdefer if (input) |i| {
+        i.deinit(gpa);
+        gpa.destroy(i);
+    };
+    if (recField(nf, "input")) |in_t| {
+        if (in_t.tag != .TmRecordType) return error.SchemaShape;
+        input = try copyType(gpa, in_t);
+    }
+
     arena.arena_reset(arena.dhall_arena.?);
-    return .{ .ty = ty, .dflt = dflt, .posix = posix, .doc = doc, .out = out };
+    return .{ .ty = ty, .dflt = dflt, .posix = posix, .doc = doc, .out = out, .input = input };
 }
 
 // ---------------------------------------------------------------------------

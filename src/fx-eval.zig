@@ -203,9 +203,19 @@ fn lookupEntry(name: []const u8) ?DispatchEntry {
 // ---------------------------------------------------------------------------
 
 /// Find's declared output record type, used for canonical key order (T1/L3).
-const find_rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
+/// SINGLE SOURCE: the schema's `out` section, rendered into the generated
+/// file by fx-clijson — the same literal fx-pipeline's builtin("find") parses
+/// and fx-find's encoder uses.  Imported by PATH (not as the `cli-find`
+/// module) so the binary, the registry and this native path all share ONE
+/// module graph: a file reached by path in one place and as a module in
+/// another is a hard Zig error.
+const cli_find = @import("generated/cli_find.zig");
+const cli_grep = @import("generated/cli_grep.zig");
+const find_rows_src = cli_find.out_type_src;
 /// Grep's declared input record type (it only reads `path` — width subtyping).
-const grep_rows_src = "{ path : Text }";
+/// SINGLE SOURCE: the schema's `input` section (the `in` vocabulary name is
+/// unavailable — `in` is a Dhall keyword, rejected as a field label).
+const grep_rows_src = cli_grep.input_type_src;
 
 const FindEntry = struct {
     path: []const u8,
@@ -1438,8 +1448,9 @@ test "native find emits deterministic sorted JSONL rows" {
 
 test "native grep extracts and regex-matches paths (DAFSA)" {
     const gpa = testing.allocator;
-    const rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
-    const kk = try wire.declaredFieldKinds(gpa, rows_src);
+    // the find-shaped producer rows these grep tests feed: the same
+    // schema-derived literal everything else uses (no hand-spelled copy).
+    const kk = try wire.declaredFieldKinds(gpa, find_rows_src);
     defer {
         for (kk.names) |n| gpa.free(n);
         gpa.free(kk.names);

@@ -47,7 +47,7 @@
 
 const std = @import("std");
 const dh = @import("dhall");
-const cli_find = @import("cli-find");
+const cli_find = @import("generated/cli_find.zig");
 const cli = @import("fx-cli");
 // the Lens-3 wire codec, imported by path like fx-eval/fx-shell do (fx-find's
 // build module table carries only dhall/cli-find/fx-cli; fx-wire imports
@@ -97,11 +97,12 @@ const TypeFilter_f: TypeFilter = .File;
 const TypeFilter_d: TypeFilter = .Dir;
 
 /// The --rows wire record type: find's declared pipeline rows type.  The
-/// schema-generated literal does not exist yet (cli_find has no `out` —
-/// fx-eval's single-sourcing follow-up is peer-owned), so this is a spelled
-/// twin of fx-eval.zig's find_rows_src, the SAME literal the fx-pipeline
-/// registry and nativeFind use; the rows test below pins the bytes it pins.
-const find_rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
+/// The schema's `out` section, via the generated cli_find.zig — ONE literal
+/// shared with fx-eval's nativeFind path and fx-pipeline's builtin("find").
+/// Imported by PATH so the binary, the registry and the native path stay in
+/// one module graph (the `cli-find` module form would collide with the engine's
+/// import of the same file).
+const find_rows_src = cli_find.out_type_src;
 
 /// One emitted --rows entry: the path exactly as bare mode would print it,
 /// plus the nativeFind-mirroring stat facts (kind/size/mtime).

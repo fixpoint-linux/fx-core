@@ -68,6 +68,15 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "print lines of files under ROOT matching a regex PATTERN"
+-- input: the pipeline INPUT rows type this stage CONSUMES.  SINGLE SOURCE:
+-- fx-clijson renders it into the generated cli_grep.zig `input_type_src`, which
+-- the stdin-rows decoder and the registry's builtin("grep") both parse — so the
+-- shape the decoder reads and the shape compose() type-checks against cannot
+-- drift.  `path` is the ONLY field grep reads; width-subtyping means a producer
+-- emitting MORE fields (find's {path,kind,size,mtime}) composes.
+, input =
+    { path : Text
+    }
 , ty =
     { root : Text
     , pattern : Text

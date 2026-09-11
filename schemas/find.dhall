@@ -69,6 +69,18 @@ let Positional = { field : Text, display : Text, many : Bool }
 
 in
 { doc = Some "walk a directory closure via Datalog reachability from ROOT"
+-- out: the pipeline OUTPUT rows type.  SINGLE SOURCE: fx-clijson renders this
+-- (in DECLARED field order — it pins the canonical wire JSON key order) into
+-- the generated cli_find.zig `out_type_src`, which BOTH the wire encoder and
+-- the fx-pipeline registry's builtin("find") parse — so the type compose()
+-- type-checks against and the type the encoder enforces cannot drift.  Matches
+-- the native producer's rows exactly (fx-eval's nativeFind).
+, out =
+    { path : Text
+    , kind : < File | Dir >
+    , size : Natural
+    , mtime : Natural
+    }
 , ty =
     { root : Text
     , name_glob : Optional Text
