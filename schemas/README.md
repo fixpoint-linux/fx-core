@@ -98,3 +98,78 @@ rm -rf "$FXD" /tmp/a.out /tmp/b.out
   every positional is optional-or-many via its dflt default
 - `--`-ed operands after a many list has begun append to the many list
   (GNU parity, accepted)
+
+## The v1 flag vocabulary, and what it cannot express
+
+The `posix.flags` vocabulary admits exactly three shapes:
+
+| `kind` | token forms | example |
+| --- | --- | --- |
+| `.Flag` | `-x` and/or `--long` (no value) | `-l`, `--long` |
+| `.Value` | `-x V` / `--long V` / `--long=V` | `-n 3` |
+| `.Enum` | `-x` / `--long` selecting a union ctor | `-S` → `<…>.Size` |
+
+A short is EXACTLY `-<one char>` and a long is EXACTLY `--<word>`.  Two things
+therefore have no spelling, and they are the reason some commands are only
+partly expressible:
+
+### 1. Single-dash multi-char flags — the real gap
+
+`-name GLOB`, `-maxdepth N`, `-type f` (fx-find / fx-grep) are neither a short
+(too long) nor a long (single dash).  **They cannot be declared in a schema**, so
+those commands' schemas carry only their expressible flags and the single-dash
+tokens stay hand-parser territory in the command itself.
+
+Consequences to know before relying on a schema:
+
+- `fx-grep -a -b` is fine; `fx-grep -n TODO` is NOT typeable.
+- That is why `find` and `grep` are **native** pipeline stages (their
+  implementation lives in `fx-eval`, not in the binary) and why U10 gave their
+  *binaries* a `--rows` mode: the run-mode executor execs the binary, so the
+  binary had to grow a long-form flag the vocabulary CAN express in order for
+  `find | grep` and `find |> grep` to mean the same thing.
+- Closing this needs vocabulary growth (a `.SingleDashLong` kind, or a general
+  "multi-char short").  Until then, treat a `flags = []` schema as "this command
+  has NO flag surface the generated parser models", not "this command has no
+  flags" — see e.g. `schemas/find.dhall` and `schemas/grep.dhall`.
+
+### 2. Engine-synthesised stage flags (`fx-stages.zig` `synthFlag`)
+
+Four stages take a flag the ENGINE supplies, because the pipeline's stage-arg
+convention is not the command's own CLI vocabulary:
+
+| stage | synthesised | note |
+| --- | --- | --- |
+| `head` / `tail` | `-n <N>` | `head:3` ≡ `-n 3`; `-n 10` injected ONLY when absent |
+| `nl` | `-b <style>` | `nl:a` ≡ `-b a` |
+| `expand` | `-t <N>` | `expand:4` ≡ `-t 4` |
+
+These live in `fx-stages.zig` (the dispatch table), not in a schema: they are
+DERIVATION-layer facts (how the engine drives the child), not the command's
+argument surface.
+
+### 3. Role and argv-plan are deliberately NOT schema sections
+
+`fx-stages.zig` classifies each of the 31 pipeline stages by `role`
+(`file_operand` / `text_operand` / `operand_rows` / `generator` /
+`generator_rows` / `two_file` / `native`), `argv_plan`, `wire_mode` and
+`idempotent`.  None of that is in a schema, on purpose: a schema describes the
+command's ARGUMENT contract, these describe how the ENGINE drives it.  Mixing
+the two vocabularies in the one file every command shares would re-create the
+drift cmdif exists to remove.
+
+### 4. Schema commands that are NOT pipeline stages
+
+56 schemas, but only 31 registry stages.  The 7 mutators (`cp`, `mv`, `rm`,
+`mkdir`, `rmdir`, `touch`, `ln`) and their relatives are ordinary typed commands;
+they are not composable stages, because a mutation is not a pipeline value.
+`builtin()` therefore has no entry for them, and using one as a stage is a loud
+`UnknownStage`.
+
+### 5. Other engine-side validation (not schema-expressible)
+
+- `seq` takes 1–3 integer operands (or the `{…}` Dhall-record sugar); the arity
+  and integer-ness are checked by the engine before the spawn.
+- `echo` passes its stage arg as ONE verbatim operand (spaces included).
+- `paste` / `comm` take their second file as the stage arg (live-read at run AND
+  replay — the accepted live-operand caveat).

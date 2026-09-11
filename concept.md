@@ -498,6 +498,16 @@ its own output is a no-op; this is what composes with the journal's roll-forward
 
 ## Honest cut — where NOT to do this
 
+- **The flag vocabulary does not cover single-dash multi-char flags**
+  (`-name`, `-maxdepth`, `-type`): a short must be exactly `-<c>` and a long
+  exactly `--<word>`, so those tokens cannot be declared in a schema.  They stay
+  hand-parser territory in fx-find/fx-grep, which is why those two are NATIVE
+  pipeline stages and why their binaries grew a long-form `--rows` mode (U10)
+  so the run-mode executor's `find | grep` means the same thing as the record
+  path's `find |> grep`.  This is the single biggest v1 vocabulary gap; the full
+  inventory of what is NOT schema-expressible (roles, argv plans, engine-
+  synthesised stage flags, non-stage commands like the mutators) is documented
+  in [`schemas/README.md`](./schemas/README.md).
 - **Streaming transform tools** (`cat`, `head`, `tail`, `sed`, `awk`, `tr`,
   `dd`): their value-add isn't a data model — don't back a 10GB file as facts.
   Determinism is already their default when inputs are deterministic. Keep them
