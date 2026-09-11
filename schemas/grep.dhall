@@ -19,6 +19,19 @@
 --                              file.
 --         `maxdepth : ?usize = null`  Optional Natural — the depth
 --                              limit (0 = only the root).
+--         `rows : bool = false`      --rows: the Lens-3 ROW-FILTER mode
+--                              (the pipeline grep contract): read the
+--                              grep input rows type `{ path : Text }`
+--                              as JSONL on STDIN (width subtyping —
+--                              extra producer fields, e.g. find's
+--                              kind/size/mtime, are decoded against
+--                              the narrow type and IGNORED) and emit
+--                              the paths whose PATH STRING matches
+--                              PATTERN, one per line, in input row
+--                              order — byte-identical to fx-eval.zig's
+--                              nativeGrep, the pipeline's reference
+--                              grep (which never opens the files: the
+--                              pattern matches the path text itself).
 --         RENAME NOTE: the hand evalDhallArgs reads the JSON key
 --         `name` (fx-grep.zig:183-185); the struct field is
 --         `name_glob` (fx-grep.zig:55).  This schema spells the STRUCT
@@ -35,16 +48,19 @@
 --         single-slot bindings REJECT the third — the deliberate
 --         drift-killing strengthening, the fx-du precedent).
 --         The hand flags are the single-dash multi-char tokens
---         `-name GLOB` / `-maxdepth N` (fx-grep.zig:262-270).
+--         `-name GLOB` / `-maxdepth N` (fx-grep.zig:262-270), plus the
+--         long-only `--rows` (the plain long form the generated
+--         vocabulary DOES model — same token is a flags entry below so
+--         both parsers accept it, the find/tree precedent).
 --
 --   VOCABULARY GAP (reported): `-name` and `-maxdepth` are
 --   single-dash MULTI-CHAR tokens — expressible neither as a short
 --   (exactly "-<c>", fx-clijson.zig:417) nor as a long ("--<name>",
---   fx-clijson.zig:420).  flags is therefore EMPTY and the POSIX
---   surface stays hand-parser territory until the vocabulary grows a
---   single-dash long-word form; the generated parser is record-form
---   only and must not replace fx-grep's hand parser (the seq
---   precedent).
+--   fx-clijson.zig:420).  flags therefore carries ONLY `--rows`; the
+--   single-dash pair above stays hand-parser territory until the
+--   vocabulary grows a single-dash long-word form; the generated
+--   parser remains record-form-only for the rest and must not replace
+--   fx-grep's hand parser (the seq precedent).
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 
@@ -57,15 +73,18 @@ in
     , pattern : Text
     , name_glob : Optional Text
     , maxdepth : Optional Natural
+    , rows : Bool
     }
 , dflt =
     { root = "."
     , pattern = ""
     , name_glob = None Text
     , maxdepth = None Natural
+    , rows = False
     }
 , posix =
-    { flags = [] : List Flag
+    { flags =
+        [ { short = None Text, long = Some "--rows", field = "rows", kind = < Flag | Value | Enum : Text >.Flag, value = None Text } ] : List Flag
     , mutually_exclusive = [] : List (List Text)
     , positionals =
         [ { field = "pattern", display = "PATTERN", many = False }

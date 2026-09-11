@@ -17,6 +17,13 @@
 --         `maxdepth : ?usize = null`    Optional Natural — the depth
 --                              limit (0 = only the root); None walks
 --                              unbounded (the tree/du shape).
+--         `rows : bool = false`          --rows: the Lens-3 dispatch flag
+--                              (canonical wire rows — one JSON object per
+--                              line, { path, kind, size, mtime } — instead
+--                              of bare paths, the fx-ls/fx-du/fx-tree
+--                              dispatch convention; the row bytes are
+--                              byte-identical to fx-eval.zig's nativeFind,
+--                              the pipeline's reference find).
 --         RENAME NOTE: the hand evalDhallArgs reads the JSON keys
 --         `name` and `type` (fx-find.zig:189, 295); the struct fields
 --         are `name_glob` / `type_filter` (fx-find.zig:50-51).  This
@@ -40,7 +47,9 @@
 --         precedent).
 --         The hand flags are the single-dash multi-char tokens
 --         `-name GLOB` / `-type f|d` / `-maxdepth N`
---         (fx-find.zig:401-419).
+--         (fx-find.zig:401-419), plus the long-only `--rows` (the
+--         plain long form the generated vocabulary DOES model — same
+--         token is a flags entry below so both parsers accept it).
 --
 --   VOCABULARY GAP (reported): `-name` / `-type` / `-maxdepth` are
 --   single-dash MULTI-CHAR tokens — expressible neither as a short
@@ -48,11 +57,11 @@
 --   fx-clijson.zig:420); and `-type f|d` is additionally a VALUE-
 --   CONSUMING ENUM SELECTOR, which no flag kind models (Enum is
 --   argumentless, Value cannot bind a union, fx-clijson.zig:428-446 —
---   the nl gap).  flags is therefore EMPTY and the POSIX surface stays
---   hand-parser territory until the vocabulary grows a single-dash
---   long-word form (plus the nl enum-selector kind); the generated
---   parser is record-form only and must not replace fx-find's hand
---   parser (the seq precedent).
+--   the nl gap).  flags therefore carries ONLY `--rows`; the
+--   single-dash trio above stays hand-parser territory until the
+--   vocabulary grows a single-dash long-word form (plus the nl
+--   enum-selector kind), and the generated parser must not replace
+--   fx-find's hand parser (the seq precedent).
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 
@@ -65,15 +74,18 @@ in
     , name_glob : Optional Text
     , type_filter : Optional < File | Dir >
     , maxdepth : Optional Natural
+    , rows : Bool
     }
 , dflt =
     { root = "."
     , name_glob = None Text
     , type_filter = None < File | Dir >
     , maxdepth = None Natural
+    , rows = False
     }
 , posix =
-    { flags = [] : List Flag
+    { flags =
+        [ { short = None Text, long = Some "--rows", field = "rows", kind = < Flag | Value | Enum : Text >.Flag, value = None Text } ] : List Flag
     , mutually_exclusive = [] : List (List Text)
     , positionals = [ { field = "root", display = "ROOT", many = False } ] : List Positional
     }

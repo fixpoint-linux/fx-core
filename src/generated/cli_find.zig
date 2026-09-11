@@ -16,6 +16,7 @@ pub const Options = struct {
     maxdepth: ?u64 = null,
     name_glob: ?[]const u8 = null,
     root: []const u8 = ".",
+    rows: bool = false,
     type_filter: ?enum { Dir, File, } = null,
 };
 
@@ -54,11 +55,18 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             after_ddash = true;
             continue;
         }
-        if (a.len > 1 and a[0] == '-') {
-            std.debug.print("fx-find: unknown option '{s}'\n", .{ a });
-            return error.UnknownOption;
+        var matched = false;
+        if (!matched and (std.mem.eql(u8, a, "--rows"))) {
+            o.rows = true;
+            matched = true;
         }
-        try bindOperand(a, &o, &next_pos, gpa);
+        if (!matched) {
+            if (a.len > 1 and a[0] == '-') {
+                std.debug.print("fx-find: unknown option '{s}'\n", .{ a });
+                return error.UnknownOption;
+            }
+            try bindOperand(a, &o, &next_pos, gpa);
+        }
     }
     return o;
 }
@@ -74,7 +82,7 @@ fn bindOperand(arg: []const u8, o: *Options, next_pos: *usize, gpa: Allocator) P
 }
 
 pub fn usage() []const u8 {
-    return "usage: fx-find [ROOT]\n";
+    return "usage: fx-find [OPTIONS] [ROOT]\n";
 }
 
 test "cli_find: empty argv yields the dflt defaults" {
@@ -85,6 +93,16 @@ test "cli_find: empty argv yields the dflt defaults" {
     const o = try parsePosix(&argv, gpa);
     try std.testing.expect(o.name_glob == null);
     try std.testing.expectEqualStrings(".", o.root);
+    try std.testing.expectEqual(false, o.rows);
+}
+
+test "cli_find: --rows binds rows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "--rows" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expect(o.rows);
 }
 
 test "cli_find: operand binds root" {

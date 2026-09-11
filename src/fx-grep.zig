@@ -13,24 +13,42 @@
 // migration template for the RECORD form, the fx-seq precedent for the POSIX
 // form):
 //   fx-grep '{ pattern = "TODO", root = ".", name_glob = "*.zig" }'  Dhall record
-//   fx-grep [-name GLOB] [-maxdepth N] PATTERN [ROOT]                POSIX
+//   fx-grep [-name GLOB] [-maxdepth N] [--rows] PATTERN [ROOT]       POSIX
+//
+// --rows (Lens-3 dispatch, the fx-find/fx-tree convention) is the ROW-FILTER
+// mode — the pipeline's grep contract (rows { path : Text } -> lines), so
+// `fx-find --rows X | fx-grep --rows PATTERN` means exactly what the record
+// path's in-process nativeGrep means.  STDIN is read as row JSONL and decoded
+// with the SAME wire codec pair the engine uses (wire.declaredFieldKinds +
+// wire.decode(.rows) against the grep input type `{ path : Text }`; width
+// subtyping — a producer row with MORE fields, e.g. find's
+// {path,kind,size,mtime}, decodes fine and the extras are IGNORED).  Each
+// row's PATH STRING is matched against PATTERN with the same wrapped-substring
+// regex both modes use, and matching paths are emitted one per line (lines
+// shape) in INPUT ROW ORDER — byte-identical to fx-eval.zig's nativeGrep (the
+// reference; the bytes are pinned below against fx-eval's own fixture).
+// nativeGrep never opens the files — the pattern matches the path TEXT — so
+// the row filter does no file I/O either: there is no unreadable-file case to
+// mirror.  root/name_glob/maxdepth are ignored in this mode (no walk happens);
+// without --rows the directory-walk behaviour is UNCHANGED.
 //
 // The Dhall record form is evaluated by evalDhallArgs below against the
 // schema ty ({ pattern : Text, root : Text, name_glob : Optional Text,
-// maxdepth : Optional Natural }); the old record spelling `name = "..."`
-// is gone from the ty — the field converged onto the struct's `name_glob`
-// (the schema's RENAME NOTE; `{ name = "*.zig" }` is now an unknown field).
+// maxdepth : Optional Natural, rows : Bool }); the old record spelling `name =
+// "..."` is gone from the ty — the field converged onto the struct's
+// `name_glob` (the schema's RENAME NOTE; `{ name = "*.zig" }` is now an
+// unknown field).
 //
 // POSIX STAYS HAND-PARSED (the fx-seq precedent): -name/-maxdepth are
 // single-dash MULTI-CHAR tokens, inexpressible in the v1 flag vocabulary
-// (a short is exactly "-<c>", a long "--<name>"), so schemas/grep.dhall
-// leaves posix.flags EMPTY and the generated cli_grep.parsePosix binds
-// positionals only.  Replacing the hand parser with it would silently strip
-// -name/-maxdepth from the POSIX surface.  Options IS the generated
-// cli_grep.Options (the shared type), and the schema-completed RECORD form
-// is differential-tested against it below; when the vocabulary grows a
-// single-dash long-word form, the generated parser takes over and the
-// POSIX-vs-record matrix lands (the seq flip).
+// (a short is exactly "-<c>", a long "--<name>"), so schemas/grep.dhall's
+// posix.flags carries ONLY the plain long `--rows` and the generated
+// cli_grep.parsePosix binds positionals plus that one flag.  Replacing the
+// hand parser with it would silently strip -name/-maxdepth from the POSIX
+// surface.  Options IS the generated cli_grep.Options (the shared type), and
+// the schema-completed RECORD form is differential-tested against it below;
+// when the vocabulary grows a single-dash long-word form, the generated
+// parser takes over and the POSIX-vs-record matrix lands (the seq flip).
 //
 // The regex uses the datalog-dafsa subset (literals incl. \xHH, ., [..], *,
 // +, ?, |, (); NO ^ $ anchors, backrefs, {n,m}, lookaround).  Matching is
@@ -40,6 +58,11 @@ const std = @import("std");
 const dh = @import("dhall");
 const cli_grep = @import("cli-grep");
 const cli = @import("fx-cli");
+// the Lens-3 wire codec, imported by path like fx-eval/fx-shell/fx-find do
+// (fx-grep's build module table carries only dhall/cli-grep/fx-cli; fx-wire
+// imports nothing but std, so the sibling-file import resolves with no new
+// wiring).
+const wire = @import("fx-wire.zig");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -61,6 +84,7 @@ const dl = @cImport({
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn close(fd: c_int) c_int;
+extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
 
@@ -90,6 +114,8 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
                 std.debug.print("fx-grep: bad -maxdepth '{s}'\n", .{args[i]});
                 return error.BadMaxdepth;
             };
+        } else if (std.mem.eql(u8, a, "--rows")) {
+            o.rows = true;
         } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
             std.debug.print("fx-grep: unknown option '{s}'\n", .{a});
             return error.UnknownOption;
@@ -147,14 +173,16 @@ test "globMatch" {
 // ---------------------------------------------------------------------------
 
 // Minimal JSON object parser (mirrors fx-find): extracts root:Text,
-// pattern:Text, name_glob:Optional Text, maxdepth:Optional Natural.  The
-// record keys are the SCHEMA's (schemas/grep.dhall): the old hand spelling
-// `name` converged onto the struct's `name_glob` (the schema's RENAME NOTE).
+// pattern:Text, name_glob:Optional Text, maxdepth:Optional Natural,
+// rows:Bool.  The record keys are the SCHEMA's (schemas/grep.dhall): the old
+// hand spelling `name` converged onto the struct's `name_glob` (the schema's
+// RENAME NOTE).
 const JsonOpts = struct {
     root: ?[]const u8 = null,
     pattern: ?[]const u8 = null,
     name_glob: ?[]const u8 = null,
     maxdepth: ?u64 = null,
+    rows: bool = false,
 };
 
 fn jsonSkipWs(s: []const u8, i: *usize) void {
@@ -216,6 +244,19 @@ fn jsonParseNumber(s: []const u8, i: *usize) ?usize {
     return acc;
 }
 
+fn jsonParseBool(s: []const u8, i: *usize) ?bool {
+    jsonSkipWs(s, i);
+    if (std.mem.startsWith(u8, s[i.*..], "true")) {
+        i.* += 4;
+        return true;
+    }
+    if (std.mem.startsWith(u8, s[i.*..], "false")) {
+        i.* += 5;
+        return false;
+    }
+    return null;
+}
+
 fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
     var res = JsonOpts{};
     var off: usize = 0;
@@ -237,6 +278,9 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
                 res.name_glob = val;
             }
             off += val.len;
+        } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
+            const b = jsonParseBool(s, &i) orelse return null;
+            if (std.mem.eql(u8, key, "rows")) res.rows = b;
         } else if (i < s.len and s[i] == 'n' and std.mem.startsWith(u8, s[i..], "null")) {
             i += 4; // None (Optional absent)
         } else {
@@ -303,6 +347,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (opts.root) |r| o.root = try gpa.dupe(u8, r);
     if (opts.name_glob) |n| o.name_glob = try gpa.dupe(u8, n);
     o.maxdepth = opts.maxdepth;
+    o.rows = opts.rows;
     return o;
 }
 
@@ -404,6 +449,7 @@ fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void
         try std.testing.expect(record_o.name_glob == null);
     }
     try std.testing.expectEqual(expected.maxdepth, record_o.maxdepth);
+    try std.testing.expectEqual(expected.rows, record_o.rows);
 }
 
 test "DIFFERENTIAL: schema-completed record form matches the generated Options" {
@@ -430,6 +476,12 @@ test "DIFFERENTIAL: schema-completed record form matches the generated Options" 
         "{ pattern = \"y\", maxdepth = Some 0 }",
         .{ .pattern = "y", .maxdepth = 0 },
     );
+    // the rows flag is a plain Bool in the record form (Lens-3 dispatch, the
+    // fx-tree convention) and lands on Options.rows
+    try expectRecordEqualsOptions(
+        "{ pattern = \"dl_open\", rows = True }",
+        .{ .pattern = "dl_open", .rows = true },
+    );
 }
 
 test "DIFFERENTIAL: POSIX stays hand — parity with the generated flagless subset" {
@@ -454,7 +506,16 @@ test "DIFFERENTIAL: POSIX stays hand — parity with the generated flagless subs
     try std.testing.expectEqualStrings("pat", with_flags.pattern);
     try std.testing.expectEqualStrings("root", with_flags.root);
 
-    // the generated parser rejects every flag-shaped token (pins the gap)
+    // --rows is on the SHARED surface now (a plain long both parsers take):
+    // generated and hand forms agree on it, like the positionals.
+    const rows_gen_o = try cli_grep.parsePosix(&.{ "fx-grep", "--rows", "pat" }, gpa);
+    const rows_hand_o = try parsePosixArgs(&.{ "fx-grep", "--rows", "pat" }, gpa);
+    try std.testing.expect(rows_gen_o.rows);
+    try std.testing.expect(rows_hand_o.rows);
+    try std.testing.expectEqualStrings(rows_gen_o.pattern, rows_hand_o.pattern);
+
+    // the generated parser still rejects every OTHER flag-shaped token
+    // (pins the gap; --rows is asserted accepted above)
     try std.testing.expectError(error.UnknownOption, cli_grep.parsePosix(&.{ "fx-grep", "-name", "*.zig" }, gpa));
     try std.testing.expectError(error.UnknownOption, cli_grep.parsePosix(&.{ "fx-grep", "-maxdepth", "2" }, gpa));
 
@@ -471,6 +532,186 @@ test "DIFFERENTIAL: POSIX stays hand — parity with the generated flagless subs
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ pattern = \"x\", name = \"*.zig\" }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ pattern = \"x\", maxdepth = 2 }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ pattern = \"x\", maxdepth = -1 }"));
+}
+
+// ---------------------------------------------------------------------------
+// --rows: the ROW-FILTER mode (nativeGrep's contract)
+// ---------------------------------------------------------------------------
+
+// The grep input rows type — a spelled twin of fx-eval.zig's grep_rows_src,
+// the SAME literal the fx-pipeline registry and nativeGrep decode against.
+const grep_rows_src = "{ path : Text }";
+
+/// Full-key DFA walk (fx-eval.zig dfaMatchFull's twin — regexwalk.h's
+/// transparent regex_dfa contract: trans[s*256+byte], UINT32_MAX dead marker,
+/// accept[s]).  The DFA has implicit ^...$ semantics, so substring search is
+/// the caller's `.*(...).*` wrap, not this walk.  BAIL on the dead marker
+/// BEFORE re-indexing trans with it (the marker is not a state).
+fn dfaMatchFull(dfa: [*c]const dl.regex_dfa, s: []const u8) bool {
+    if (dfa == null) return false;
+    const trans = dfa.*.trans orelse return false;
+    const accept = dfa.*.accept orelse return false;
+    var state: usize = 0;
+    for (s) |b| {
+        const next = trans[state * 256 + @as(usize, b)];
+        if (next == std.math.maxInt(u32)) return false;
+        state = next;
+    }
+    return accept[state] == 1;
+}
+
+const CHUNK: usize = 65536;
+
+/// Read stdin (fd 0) to EOF (the raw extern read() loop — the fx-sort/fx-wc
+/// idiom; there is no invented std.Io stdin wrapper).  Caller owns the slice.
+fn readStdinAll(gpa: Allocator) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    var tmp: [CHUNK]u8 = undefined;
+    while (true) {
+        const n = read(0, &tmp, tmp.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try out.appendSlice(gpa, tmp[0..@intCast(n)]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The --rows ROW FILTER — nativeGrep's exact contract (fx-eval.zig:394-440,
+/// mirrored line for line): decode `input` as row JSONL against the grep
+/// input type `{ path : Text }` (width subtyping — extra producer fields are
+/// decoded against the narrow type and IGNORED), regex-match each row's PATH
+/// STRING against `pattern` with the same `.*({s}).*` substring wrap the walk
+/// mode compiles, and emit matching paths one per line in INPUT ROW ORDER (no
+/// dedup, no sort — the walk's lex sort is a different contract).  A row with
+/// no path field or an empty path never matches; an empty pattern is
+/// EmptyPattern and a compile failure is BadPattern — nativeGrep's error
+/// classes.  Like nativeGrep, NO file is ever opened: the pattern matches the
+/// path text, so there is no unreadable-file case to mirror (nativeGrep has
+/// none either).
+fn filterRows(gpa: Allocator, pattern: []const u8, input: []const u8) ![]u8 {
+    if (pattern.len == 0) return error.EmptyPattern;
+
+    const wrapped = std.fmt.allocPrint(gpa, ".*({s}).*", .{pattern}) catch return error.NoMem;
+    defer gpa.free(wrapped);
+    const wrapped_z = gpa.dupeZ(u8, wrapped) catch return error.NoMem;
+    defer gpa.free(wrapped_z);
+    const dfa = dl.regex_compile(wrapped_z.ptr);
+    if (dfa == null or dfa.*.errmsg != null) {
+        if (dfa != null and dfa.*.errmsg != null)
+            std.debug.print("fx-grep: bad pattern '{s}': {s}\n", .{ pattern, std.mem.span(dfa.*.errmsg) });
+        // free even on the error path — tests call this repeatedly (fx-eval's
+        // in-process discipline, unlike main() which exits right after)
+        dl.regex_dfa_free(dfa);
+        return error.BadPattern;
+    }
+    defer dl.regex_dfa_free(dfa);
+
+    const kk = try wire.declaredFieldKinds(gpa, grep_rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+    const dec = try wire.decode(gpa, input, .rows, kk.names, kk.kinds);
+    defer dec.deinit(gpa);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    for (dec.rows.records) |rec| {
+        var path: []const u8 = "";
+        for (rec.fields) |f| {
+            if (std.mem.eql(u8, f.name, "path") and f.value == .text) {
+                path = f.value.text;
+                break;
+            }
+        }
+        if (path.len > 0 and dfaMatchFull(dfa, path)) {
+            out.appendSlice(gpa, path) catch return error.NoMem;
+            out.append(gpa, '\n') catch return error.NoMem;
+        }
+    }
+    return out.toOwnedSlice(gpa) catch return error.NoMem;
+}
+
+test "rows: the ROW-FILTER contract — nativeGrep's fixture and bytes" {
+    const gpa = std.testing.allocator;
+    // The fixture is fx-eval.zig's own nativeGrep test fixture, VERBATIM: the
+    // find-shaped producer rows encoded through the same canonical encoder
+    // pair, and the expected bytes are fx-eval's own assertions.  That test
+    // proves nativeGrep(fixture) == the bytes below; this test proves
+    // filterRows(fixture) == the same bytes — together they pin
+    // `fx-grep --rows` == the pipeline's nativeGrep byte-for-byte (calling
+    // nativeGrep directly here would drag the whole fx-eval engine + its
+    // caslog/pipeline/stages test suites into fx-grep's test binary).
+    const rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
+    const kk = try wire.declaredFieldKinds(gpa, rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+    const rows = wire.Rows{ .records = &.{
+        .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/a/b" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
+        .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/c/d" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
+        .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/axb" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
+        .{ .fields = &.{ .{ .name = "path", .value = .{ .text = "/azzb" } }, .{ .name = "kind", .value = .{ .text = "File" } }, .{ .name = "size", .value = .{ .natural = 1 } }, .{ .name = "mtime", .value = .{ .natural = 2 } } } },
+    } };
+    const enc = try wire.encodeRowsOrdered(gpa, rows, kk.names, kk.kinds);
+    defer gpa.free(enc);
+
+    // literal 'a/' — the v1 substring behavior and the regex agree here
+    {
+        const out = try filterRows(gpa, "a/", enc);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings("/a/b\n", out);
+    }
+    // '.' is a metachar: 'a.b' matches /a/b (the '/' fills the dot) and /axb
+    {
+        const out = try filterRows(gpa, "a.b", enc);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings("/a/b\n/axb\n", out);
+    }
+    // alternation + grouping, output in input row order
+    {
+        const out = try filterRows(gpa, "a(x|zz)b", enc);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings("/axb\n/azzb\n", out);
+    }
+    // a pattern that fails to compile / an empty pattern are errors, not
+    // silent matches (nativeGrep's error classes)
+    try std.testing.expectError(error.BadPattern, filterRows(gpa, "[unclosed", enc));
+    try std.testing.expectError(error.EmptyPattern, filterRows(gpa, "", enc));
+    // undecodable input is a decode error (nativeGrep's `try wire.decode`)
+    try std.testing.expectError(error.BadWire, filterRows(gpa, "x", "not-json\n"));
+}
+
+test "rows: width subtyping — extra producer fields accepted and ignored" {
+    const gpa = std.testing.allocator;
+    // literal producer JSONL (exactly what `fx-find --rows` emits): rows
+    // carrying MORE fields than the declared `{ path : Text }` decode fine —
+    // the extras are ignored (the find |> grep case).  A row with no path
+    // field or an empty path never matches, and rows missing the declared
+    // field are dropped by the decoder (not an error).
+    const jsonl =
+        "{\"path\":\"src/a.zig\",\"kind\":\"File\",\"size\":10,\"mtime\":20}\n" ++
+        "{\"path\":\"src/b.txt\",\"kind\":\"File\",\"size\":1,\"mtime\":2}\n" ++
+        "{\"kind\":\"Dir\",\"size\":0,\"mtime\":9}\n" ++
+        "{\"path\":\"\",\"kind\":\"File\",\"size\":1,\"mtime\":1}\n";
+    const out = try filterRows(gpa, "zig", jsonl);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("src/a.zig\n", out);
+
+    // INPUT ROW ORDER preserved, duplicates kept (nativeGrep emits one line
+    // per matching input row — no sort, no dedup; the walk mode's lex sort is
+    // a different contract).
+    const dup_jsonl =
+        "{\"path\":\"z\"}\n" ++
+        "{\"path\":\"a\"}\n" ++
+        "{\"path\":\"z\"}\n";
+    const out2 = try filterRows(gpa, "z|a", dup_jsonl);
+    defer gpa.free(out2);
+    try std.testing.expectEqualStrings("z\na\nz\n", out2);
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +883,20 @@ pub fn main(init: std.process.Init) !void {
     if (opts.pattern.len == 0) {
         std.debug.print("fx-grep: empty pattern\n", .{});
         return error.EmptyPattern;
+    }
+
+    // --rows: the ROW-FILTER mode (nativeGrep's contract) — read row JSONL
+    // from stdin, match each row's path, emit matching paths as lines.  This
+    // replaces the walk entirely (root/name_glob/maxdepth are inert here);
+    // without the flag the walk below is UNCHANGED.
+    if (opts.rows) {
+        const input = try readStdinAll(gpa);
+        defer gpa.free(input);
+        const out = try filterRows(gpa, opts.pattern, input);
+        defer gpa.free(out);
+        const stdout_file = std.Io.File.stdout();
+        _ = std.Io.File.writeStreamingAll(stdout_file, init.io, out) catch return error.WriteFailed;
+        return;
     }
 
     // Transient db dir.

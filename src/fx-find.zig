@@ -8,7 +8,18 @@
 // Two arg forms, ONE source of truth for the RECORD side
 // (schemas/find.dhall):
 //   fx-find '{ root = ".", name_glob = "*.c", maxdepth = 3 }'  Dhall record literal
-//   fx-find [-name GLOB] [-type f|d] [-maxdepth N] [ROOT]      POSIX-style fallback
+//   fx-find [-name GLOB] [-type f|d] [-maxdepth N] [--rows] [ROOT]  POSIX-style fallback
+//
+// --rows (Lens-3 dispatch, the fx-ls/fx-du/fx-tree convention): instead of
+// bare paths, emit the pipeline's canonical wire ROW shape — one JSON object
+// per emitted entry, { path, kind, size, mtime }, LF-terminated, keys in the
+// DECLARED record-type order — so a shell run mode exec'ing this binary means
+// exactly what the native record-mode find stage means.  The row bytes are
+// pinned byte-identical to fx-eval.zig's nativeFind (the reference find):
+// same per-path stat semantics (children lstat/NOFOLLOW — a symlink is a
+// File row — root follow-stat, u32 clamps), same path sort, same encoder
+// pair (wire.declaredFieldKinds + wire.encodeRowsOrdered over the registry
+// record type below).
 //
 // MIGRATION STATUS (a deliberate PARTIAL, unlike ls/cp/mv — the fx-seq
 // precedent): Options is an ALIAS of the generated cli_find.Options and the
@@ -17,11 +28,12 @@
 // -name/-type/-maxdepth are single-dash MULTI-CHAR tokens (expressible
 // neither as a short "-<c>" nor a long "--<name>"), and `-type f|d` is a
 // VALUE-CONSUMING enum selector no v1 flag kind models — the vocabulary gap.
-// cli_find.parsePosix is therefore record-form only (it binds the ROOT
-// positional and rejects every flag), and replacing the hand parser would
-// break `-name`/`-type`/`-maxdepth` entirely.  The differential matrix pins
-// the SHARED surface (the root positional, `--`, defaults) and the rejection
-// class that keeps the gap explicit.
+// cli_find.parsePosix is therefore record-form-plus---rows only (it binds
+// the ROOT positional and the plain-long --rows, and rejects every other
+// flag), and replacing the hand parser would break `-name`/`-type`/
+// `-maxdepth` entirely.  The differential matrix pins the SHARED surface
+// (the root positional, --rows, `--`, defaults) and the rejection class
+// that keeps the gap explicit.
 //
 // RENAME NOTE (schemas/find.dhall, the seq "increment"->"inc" precedent):
 // the hand record form read the JSON keys `name` and `type`; the schema
@@ -37,6 +49,10 @@ const std = @import("std");
 const dh = @import("dhall");
 const cli_find = @import("cli-find");
 const cli = @import("fx-cli");
+// the Lens-3 wire codec, imported by path like fx-eval/fx-shell do (fx-find's
+// build module table carries only dhall/cli-find/fx-cli; fx-wire imports
+// nothing but std, so the sibling-file import resolves with no new wiring).
+const wire = @import("fx-wire.zig");
 
 const dhall = dh.dhall;
 const arena = dh.arena;
@@ -79,6 +95,31 @@ const TypeFilter = @typeInfo(@FieldType(Options, "type_filter")).optional.child;
 // sites readable under the schema's File/Dir spelling.
 const TypeFilter_f: TypeFilter = .File;
 const TypeFilter_d: TypeFilter = .Dir;
+
+/// The --rows wire record type: find's declared pipeline rows type.  The
+/// schema-generated literal does not exist yet (cli_find has no `out` —
+/// fx-eval's single-sourcing follow-up is peer-owned), so this is a spelled
+/// twin of fx-eval.zig's find_rows_src, the SAME literal the fx-pipeline
+/// registry and nativeFind use; the rows test below pins the bytes it pins.
+const find_rows_src = "{ path : Text, kind : < File | Dir >, size : Natural, mtime : Natural }";
+
+/// One emitted --rows entry: the path exactly as bare mode would print it,
+/// plus the nativeFind-mirroring stat facts (kind/size/mtime).
+const RowEntry = struct {
+    path: []const u8,
+    kind: []const u8, // "File" | "Dir"
+    size: u64,
+    mtime: u64,
+};
+
+// nativeFind's value clamps (fx-eval.zig clampSize/clampMtime): the wire
+// Natural is u64 but the reference clamps to 0xFFFFFFFF (negative -> 0).
+fn clampSize(sz: i64) u64 {
+    return if (sz < 0) 0 else @intCast(@min(sz, @as(i64, 0xFFFFFFFF)));
+}
+fn clampMtime(mt: i64) u64 {
+    return if (mt < 0) 0 else @intCast(@min(mt, @as(i64, 0xFFFFFFFF)));
+}
 
 // ---------------------------------------------------------------------------
 // Glob matcher (supports '*' and '?')
@@ -173,6 +214,7 @@ fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void
     } else try std.testing.expect(record_o.name_glob == null);
     try std.testing.expectEqual(expected.maxdepth, record_o.maxdepth);
     try std.testing.expectEqual(expected.type_filter, record_o.type_filter);
+    try std.testing.expectEqual(expected.rows, record_o.rows);
 }
 
 test "DIFFERENTIAL: schema-valid record form matches the generated Options" {
@@ -199,6 +241,12 @@ test "DIFFERENTIAL: schema-valid record form matches the generated Options" {
         "{ root = \"/w\", name_glob = Some \"*.c\", maxdepth = Some 3, type_filter = Some < File | Dir >.File }",
         .{ .root = "/w", .name_glob = "*.c", .maxdepth = 3, .type_filter = TypeFilter_f },
     );
+    // the rows flag is a plain Bool in the record form (Lens-3 dispatch,
+    // the fx-tree convention) and lands on Options.rows
+    try expectRecordEqualsOptions(
+        "{ root = \"/r\", rows = True }",
+        .{ .root = "/r", .name_glob = null, .maxdepth = null, .type_filter = null, .rows = true },
+    );
 }
 
 test "DIFFERENTIAL: generated parsePosix equals the record form on the SHARED surface" {
@@ -224,6 +272,15 @@ test "DIFFERENTIAL: generated parsePosix equals the record form on the SHARED su
     try std.testing.expectEqual(dflt_o.name_glob, empty_o.name_glob);
     try std.testing.expectEqual(dflt_o.maxdepth, empty_o.maxdepth);
     try std.testing.expectEqual(dflt_o.type_filter, empty_o.type_filter);
+    try std.testing.expectEqual(dflt_o.rows, empty_o.rows);
+
+    // --rows is on the SHARED surface now (a plain long both parsers take):
+    // generated and hand+record forms agree on it, like the root positional.
+    const rows_gen_o = try cli_find.parsePosix(&.{ "fx-find", "--rows", "/tmp" }, gpa);
+    const rows_hand_o = try parsePosixArgs(&.{ "fx-find", "--rows", "/tmp" }, gpa);
+    try std.testing.expect(rows_gen_o.rows);
+    try std.testing.expect(rows_hand_o.rows);
+    try std.testing.expectEqualStrings(rows_gen_o.root, rows_hand_o.root);
 }
 
 test "DIFFERENTIAL: the vocabulary-gap flags are generated-rejected (the gap pinned)" {
@@ -236,7 +293,9 @@ test "DIFFERENTIAL: the vocabulary-gap flags are generated-rejected (the gap pin
     // -name/-type/-maxdepth are single-dash multi-char tokens: the generated
     // parser has no vocabulary for them (UnknownOption), while the HAND
     // parser — the one main() keeps using — accepts them.  Both sides of this
-    // pin are asserted so the gap cannot silently close or widen.
+    // pin are asserted so the gap cannot silently close or widen.  (--rows is
+    // the ONE flag on the shared surface — a plain long — and is asserted in
+    // the SHARED-surface differential above.)
     try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-name", "*.c" }, gpa));
     try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-type", "f" }, gpa));
     try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-maxdepth", "3" }, gpa));
@@ -342,6 +401,17 @@ test "jsonParseOpts nullary type_filter Dir" {
     try std.testing.expectEqual(@as(?JsonOpts.TypeTag, .Dir), o.type_filter);
 }
 
+test "jsonParseOpts rows bool" {
+    var buf: [1024]u8 = undefined;
+    const o = jsonParseOpts("{\"rows\":true}", &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(o.rows);
+    var buf2: [1024]u8 = undefined;
+    const o2 = jsonParseOpts("{\"rows\":false}", &buf2) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(!o2.rows);
+}
+
 test "evalDhallArgs record (schema key names)" {
     if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
     const o = try evalDhallArgs("{ root = \"/tmp\", name_glob = \"*.c\", maxdepth = 2 }", std.testing.allocator);
@@ -393,12 +463,14 @@ test "evalDhallArgs type_filter union unknown alt rejected" {
 // fields from the JSON produced by dhall serialize.term_to_json for our
 // record.  Keys are the SCHEMA struct names (schemas/find.dhall RENAME NOTE,
 // the seq "increment"->"inc" precedent): root:Text, name_glob:Optional Text,
-// maxdepth:Optional Natural, type_filter:Optional < File | Dir >.
+// maxdepth:Optional Natural, type_filter:Optional < File | Dir >,
+// rows:Bool.
 const JsonOpts = struct {
     root: ?[]const u8 = null,
     name_glob: ?[]const u8 = null,
     maxdepth: ?u64 = null,
     type_filter: ?TypeTag = null,
+    rows: bool = false,
 
     const TypeTag = enum { File, Dir };
 };
@@ -461,6 +533,19 @@ fn jsonParseNumber(s: []const u8, i: *usize) ?u64 {
     return std.fmt.parseInt(u64, s[start..i.*], 10) catch null;
 }
 
+fn jsonParseBool(s: []const u8, i: *usize) ?bool {
+    jsonSkipWs(s, i);
+    if (std.mem.startsWith(u8, s[i.*..], "true")) {
+        i.* += 4;
+        return true;
+    }
+    if (std.mem.startsWith(u8, s[i.*..], "false")) {
+        i.* += 5;
+        return false;
+    }
+    return null;
+}
+
 // Parses an object like {"root":".","name_glob":"*.c","maxdepth":3}.
 // name_glob may be null (None); maxdepth may be null (None) or a number.
 // Parsed string values are copied into `buf` at non-overlapping offsets so the
@@ -486,6 +571,9 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
                 res.name_glob = val;
             }
             off += val.len;
+        } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
+            const b = jsonParseBool(s, &i) orelse return null;
+            if (std.mem.eql(u8, key, "rows")) res.rows = b;
         } else if (i < s.len and s[i] == 'n' and (std.mem.startsWith(u8, s[i..], "null") or std.mem.eql(u8, s[i..i + 4], "None"))) {
             i += 4; // None (Optional absent) — term_to_json's `null`, or the
             // completed-record render's bare `None` (the annotation
@@ -580,6 +668,7 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
     if (opts.root) |r| o.root = try gpa.dupe(u8, r);
     if (opts.name_glob) |n| o.name_glob = try gpa.dupe(u8, n);
     o.maxdepth = opts.maxdepth;
+    o.rows = opts.rows;
     if (opts.type_filter) |tt| o.type_filter = switch (tt) {
         .File => .File,
         .Dir => .Dir,
@@ -617,6 +706,8 @@ fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
                 return error.BadMaxdepth;
             };
             o.maxdepth = n;
+        } else if (std.mem.eql(u8, a, "--rows")) {
+            o.rows = true;
         } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
             std.debug.print("fx-find: unknown option '{s}'\n", .{a});
             return error.UnknownOption;
@@ -721,6 +812,180 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
 }
 
 // ---------------------------------------------------------------------------
+// --rows walk: nativeFind's semantics over the SAME filtered entry set
+// ---------------------------------------------------------------------------
+
+const RowsWalkCtx = struct {
+    gpa: Allocator,
+    entries: *std.ArrayList(RowEntry),
+};
+
+/// --rows walk: recurse the tree in nativeFind's EXACT footsteps so the
+/// bytes match the reference for the same root — children lstat'ed with
+/// AT_SYMLINK_NOFOLLOW (a symlink-to-dir is a File row and never descended,
+/// which also rules out cycles), paths displayed ROOT-RELATIVE (the root
+/// itself as "." — findWalkDir's spelling, not bare mode's as-given join),
+/// 0xFFFFFFFF size/mtime clamps — while keeping fx-find's OWN entry
+/// predicates (name_glob/type_filter/maxdepth, applied per entry, root
+/// included).  With no predicates the row set is exactly nativeFind's.
+fn rowsWalkDir(ctx: *RowsWalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, rel_path: []const u8, depth: usize, opts: Options) anyerror!void {
+    if (opts.maxdepth) |md| {
+        if (depth > md) return;
+    }
+
+    const it = dl.fdopendir(dir_fd) orelse {
+        _ = close(dir_fd);
+        return;
+    };
+    defer _ = dl.closedir(it);
+
+    while (dl.readdir(it)) |entry| {
+        const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+
+        const child_path = std.fs.path.join(ctx.gpa, &.{ dir_path, name }) catch return error.Oom;
+        defer ctx.gpa.free(child_path);
+        // the ROW path column is root-relative (nativeFind's spelling):
+        // depth-1 children are the bare name, deeper ones name-joined
+        const child_rel = if (rel_path.len == 0)
+            ctx.gpa.dupe(u8, name) catch return error.Oom
+        else
+            std.fs.path.join(ctx.gpa, &.{ rel_path, name }) catch return error.Oom;
+        defer ctx.gpa.free(child_rel);
+
+        var st: dl.struct_stat = undefined;
+        // nativeFind semantics: lstat the child (NOFOLLOW) — a symlink
+        // classifies as a non-dir (File row), which also rules out cycles.
+        if (fstatat(dir_fd, @as([*:0]const u8, @ptrCast(&entry.*.d_name)), &st, std.posix.AT.SYMLINK_NOFOLLOW) != 0) continue;
+
+        const is_dir = (st.st_mode & dl.S_IFMT) == dl.S_IFDIR;
+        const is_file = (st.st_mode & dl.S_IFMT) == dl.S_IFREG;
+
+        const child_depth = depth + 1;
+        if (opts.maxdepth) |md| {
+            if (child_depth > md) continue;
+        }
+
+        var emit = true;
+        if (opts.name_glob) |g| {
+            if (!globMatch(g, name)) emit = false;
+        }
+        if (emit) {
+            if (opts.type_filter) |tf| {
+                const ok = switch (tf) {
+                    .File => is_file,
+                    .Dir => is_dir,
+                };
+                if (!ok) emit = false;
+            }
+        }
+
+        if (emit) {
+            const dup = ctx.gpa.dupe(u8, child_rel) catch return error.Oom;
+            ctx.entries.append(ctx.gpa, .{
+                .path = dup,
+                .kind = if (is_dir) "Dir" else "File",
+                .size = clampSize(st.st_size),
+                .mtime = clampMtime(st.st_mtim.tv_sec),
+            }) catch {
+                ctx.gpa.free(dup);
+                return error.Oom;
+            };
+        }
+
+        if (is_dir) {
+            const sub = posix.openat(dir_fd, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true }, 0) catch {
+                continue;
+            };
+            try rowsWalkDir(ctx, sub, child_path, child_rel, child_depth, opts);
+        }
+    }
+}
+
+/// Collect --rows entries: the filtered entry set (rowsWalkDir) plus the
+/// root row when the root passes the same predicates (bare mode's root
+/// rule; the root itself is always a Dir — its stat follows the opened root,
+/// mirroring nativeFind's root fstatat(fd, ".")).  Lex-sorted by path.
+fn collectRowsEntries(gpa: Allocator, opts: Options) !std.ArrayList(RowEntry) {
+    var entries = std.ArrayList(RowEntry).empty;
+    errdefer {
+        for (entries.items) |e| gpa.free(e.path);
+        entries.deinit(gpa);
+    }
+
+    const root_fd = posix.openat(posix.AT.FDCWD, opts.root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch {
+        return error.OpenRoot;
+    };
+
+    var ctx = RowsWalkCtx{ .gpa = gpa, .entries = &entries };
+    // rowsWalkDir consumes root_fd via fdopendir (closedir closes it) — no
+    // extra close here (the B2 double-close idiom).
+    try rowsWalkDir(&ctx, root_fd, opts.root, "", 0, opts);
+
+    // Emit the root only if it passes the same predicates (bare-mode rule).
+    // The root fd is consumed; re-stat via the root path (follow — the walk
+    // opened it as a dir).
+    var root_emit = true;
+    if (opts.name_glob) |g| {
+        if (!globMatch(g, std.fs.path.basename(opts.root))) root_emit = false;
+    }
+    if (opts.type_filter) |tf| {
+        if (tf != .Dir) root_emit = false;
+    }
+    if (root_emit) {
+        var rst: dl.struct_stat = undefined;
+        const root_z = try gpa.dupeZ(u8, opts.root);
+        defer gpa.free(root_z);
+        if (fstatat(std.posix.AT.FDCWD, root_z.ptr, &rst, 0) == 0) {
+            const dup = try gpa.dupe(u8, ".");
+            try entries.append(gpa, .{
+                .path = dup,
+                .kind = "Dir",
+                .size = clampSize(rst.st_size),
+                .mtime = clampMtime(rst.st_mtim.tv_sec),
+            });
+        }
+    }
+
+    std.mem.sort(RowEntry, entries.items, {}, struct {
+        fn lt(_: void, a: RowEntry, b: RowEntry) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+
+    return entries;
+}
+
+/// Encode the collected entries as canonical wire rows via the SAME encoder
+/// pair nativeFind uses (wire.declaredFieldKinds + wire.encodeRowsOrdered on
+/// the registry record type) — never hand-rolled JSON, which is how field
+/// order silently drifts.
+fn encodeRowsWire(gpa: Allocator, entries: []const RowEntry) ![]u8 {
+    const kk = try wire.declaredFieldKinds(gpa, find_rows_src);
+    defer {
+        for (kk.names) |n| gpa.free(n);
+        gpa.free(kk.names);
+        gpa.free(kk.kinds);
+    }
+
+    var rows = std.ArrayList(wire.Row).empty;
+    defer {
+        for (rows.items) |r| gpa.free(r.fields);
+        rows.deinit(gpa);
+    }
+    for (entries) |e| {
+        const fields = gpa.alloc(wire.Field, 4) catch return error.Oom;
+        fields[0] = .{ .name = "path", .value = .{ .text = e.path } };
+        fields[1] = .{ .name = "kind", .value = .{ .text = e.kind } };
+        fields[2] = .{ .name = "size", .value = .{ .natural = e.size } };
+        fields[3] = .{ .name = "mtime", .value = .{ .natural = e.mtime } };
+        rows.append(gpa, .{ .fields = fields }) catch return error.Oom;
+    }
+
+    return wire.encodeRowsOrdered(gpa, .{ .records = rows.items }, kk.names, kk.kinds);
+}
+
+// ---------------------------------------------------------------------------
 // Output collection via dl_query callback
 // ---------------------------------------------------------------------------
 
@@ -745,6 +1010,251 @@ fn collectCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_i
 }
 
 // ---------------------------------------------------------------------------
+// tests: --rows (the ROW-shape contract; the pipeline's nativeFind is the
+// reference — these pins are the binary-side half of the record/run parity)
+// ---------------------------------------------------------------------------
+
+// Local timespec shape (C ABI: two isize fields) — do NOT @cInclude time.h
+// (the fx-touch idiom).
+const Timespec = extern struct {
+    sec: isize,
+    nsec: isize,
+};
+extern fn utimensat(dirfd: c_int, pathname: [*:0]const u8, times: ?[*]const Timespec, flags: c_int) c_int;
+extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+
+fn setMtime(path_z: [:0]const u8, sec: isize) !void {
+    const ts = [_]Timespec{ .{ .sec = sec, .nsec = 0 }, .{ .sec = sec, .nsec = 0 } };
+    if (utimensat(std.posix.AT.FDCWD, path_z.ptr, &ts, 0) != 0) return error.UtimeFailed;
+}
+
+fn writeFixtureFile(path_z: [:0]const u8, content: []const u8, mtime: isize) !void {
+    const fd = open(path_z.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if (fd < 0) return error.FixtureFail;
+    _ = write(fd, content.ptr, content.len);
+    _ = close(fd);
+    try setMtime(path_z, mtime);
+}
+
+const O_WRONLY: c_int = 1;
+const O_CREAT: c_int = 0o100;
+const O_TRUNC: c_int = 0o1000;
+
+var zpaths_buf: [16][std.posix.PATH_MAX]u8 = undefined;
+var zpaths_n: usize = 0;
+
+/// bufPrintZ into a rotating pool so a test can hold several NUL-terminated
+/// paths alive at once without per-call buffers.
+fn pz(comptime fmt: []const u8, args: anytype) [:0]u8 {
+    const slot = &zpaths_buf[zpaths_n % zpaths_buf.len];
+    zpaths_n += 1;
+    return std.fmt.bufPrintZ(slot, fmt, args) catch unreachable;
+}
+
+extern fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
+
+/// Best-effort recursive unlink of a test fixture dir (libc dirent, the
+/// fx-eval testRmTree idiom, inlined — fx-eval is importable from tests but
+/// its helper is private).
+fn rmTree(zpath: [:0]const u8) void {
+    const it = dl.opendir(zpath.ptr) orelse {
+        _ = std.c.unlink(zpath.ptr);
+        _ = rmdir(zpath.ptr);
+        return;
+    };
+    defer _ = dl.closedir(it);
+    while (dl.readdir(it)) |entry| {
+        const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        const child = pz("{s}/{s}", .{ zpath, name });
+        if (rmdir(child.ptr) == 0) continue;
+        if (std.c.unlink(child.ptr) == 0) continue;
+        rmTree(child);
+    }
+    _ = rmdir(zpath.ptr);
+}
+
+test "rows: exact canonical JSONL for a fixture tree (declared key order, escaping, sort)" {
+    const gpa = std.testing.allocator;
+    var tpl = "/tmp/ffrowsXXXXXX".*;
+    const t = mkdtemp(&tpl) orelse return error.TmpDirFail;
+    const tpath = std.mem.span(t);
+    defer rmTree(tpath);
+
+    // t/a.txt (5 bytes, mtime 1600000000)
+    try writeFixtureFile(pz("{s}/a.txt", .{tpath}), "hello", 1600000000);
+    // t/b/ (dir, mtime 1600000100) containing b/c.txt (4 bytes, mtime 1600000200)
+    // — b's mtime is pinned AFTER its child exists (writing c.txt touches b)
+    const b_z = pz("{s}/b", .{tpath});
+    if (mkdir(b_z.ptr, 0o755) != 0) return error.MkdirFail;
+    try writeFixtureFile(pz("{s}/b/c.txt", .{tpath}), "abcd", 1600000200);
+    try setMtime(b_z, 1600000100);
+    // t/d\"q (2 bytes, mtime 1600000300): a filename whose row value must be
+    // JSON-escaped (\" in the wire bytes)
+    try writeFixtureFile(pz("{s}/d\"q", .{tpath}), "xy", 1600000300);
+    // t/sub -> b: a symlink-to-dir; NOFOLLOW classifies it File (nativeFind
+    // semantics) and it is not descended.
+    const sub_link = pz("{s}/sub", .{tpath});
+    if (symlink(b_z.ptr, sub_link.ptr) != 0) return error.SymlinkFail;
+    // pin the ROOT's mtime (the walk stats the root; mkdtemp's is now)
+    try setMtime(pz("{s}", .{tpath}), 1600000400);
+
+    var entries = try collectRowsEntries(gpa, .{ .root = tpath });
+    defer {
+        for (entries.items) |e| gpa.free(e.path);
+        entries.deinit(gpa);
+    }
+    const bytes = try encodeRowsWire(gpa, entries.items);
+    defer gpa.free(bytes);
+
+    // Root-relative row paths (nativeFind's spelling): the root row is "."
+    // and sorts BEFORE every name; then a.txt, b, b/c.txt, d"q, sub.  Dir
+    // sizes are fs-dependent, so those two rows borrow the walk's own values
+    // — everything else is byte-pinned (declared key order, escaping, sort).
+    var want = std.ArrayList(u8).empty;
+    defer want.deinit(gpa);
+    try want.print(gpa, "{{\"path\":\".\",\"kind\":\"Dir\",\"size\":{d},\"mtime\":1600000400}}\n", .{entries.items[0].size});
+    try want.print(gpa, "{{\"path\":\"a.txt\",\"kind\":\"File\",\"size\":5,\"mtime\":1600000000}}\n", .{});
+    try want.print(gpa, "{{\"path\":\"b\",\"kind\":\"Dir\",\"size\":{d},\"mtime\":1600000100}}\n", .{entries.items[2].size});
+    try want.print(gpa, "{{\"path\":\"b/c.txt\",\"kind\":\"File\",\"size\":4,\"mtime\":1600000200}}\n", .{});
+    try want.print(gpa, "{{\"path\":\"d\\\"q\",\"kind\":\"File\",\"size\":2,\"mtime\":1600000300}}\n", .{});
+    // the symlink's own lstat size = len(target path) — the target is the
+    // ABSOLUTE b_z, so borrow the walk's value (fs-dependent spelling)
+    try want.print(gpa, "{{\"path\":\"sub\",\"kind\":\"File\",\"size\":{d},\"mtime\":{d}}}\n", .{ entries.items[5].size, entries.items[5].mtime });
+    try std.testing.expectEqualStrings(want.items, bytes);
+
+    // The symlink row pins the NOFOLLOW decision: a LINK, not the target
+    // (its own lstat size = the target-path length), and the target's child
+    // (b/c.txt) appears exactly once (no descent through the symlink).
+    try std.testing.expectEqualStrings("File", entries.items[5].kind);
+    try std.testing.expectEqual(@as(u64, b_z.len), entries.items[5].size);
+}
+
+test "rows: root passes the predicates (GNU-find root rule), maxdepth bounds" {
+    const gpa = std.testing.allocator;
+    var tpl = "/tmp/zzrootXXXXXX".*;
+    const t = mkdtemp(&tpl) orelse return error.TmpDirFail;
+    const tpath = std.mem.span(t);
+    defer rmTree(tpath);
+    try writeFixtureFile(pz("{s}/f.txt", .{tpath}), "z", 1600000000);
+
+    // default: the root is emitted (always a Dir row), children follow
+    {
+        var entries = try collectRowsEntries(gpa, .{ .root = tpath });
+        defer {
+            for (entries.items) |e| gpa.free(e.path);
+            entries.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 2), entries.items.len);
+        // the root row is "." and sorts FIRST ("." < any name byte)
+        try std.testing.expectEqualStrings(".", entries.items[0].path);
+        try std.testing.expectEqualStrings("Dir", entries.items[0].kind);
+        try std.testing.expectEqualStrings("File", entries.items[1].kind);
+    }
+    // type_filter = File rejects the root (it is always a Dir)
+    {
+        var entries = try collectRowsEntries(gpa, .{ .root = tpath, .type_filter = TypeFilter_f });
+        defer {
+            for (entries.items) |e| gpa.free(e.path);
+            entries.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+        try std.testing.expectEqualStrings("File", entries.items[0].kind);
+    }
+    // maxdepth = 0: only the root row
+    {
+        var entries = try collectRowsEntries(gpa, .{ .root = tpath, .maxdepth = 0 });
+        defer {
+            for (entries.items) |e| gpa.free(e.path);
+            entries.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+        try std.testing.expectEqualStrings(".", entries.items[0].path);
+    }
+    // name_glob matches the root's basename but NOT the child's -> only the
+    // root row survives (the glob applies to every entry, root included)
+    {
+        var entries = try collectRowsEntries(gpa, .{ .root = tpath, .name_glob = "zzroot*" });
+        defer {
+            for (entries.items) |e| gpa.free(e.path);
+            entries.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+        try std.testing.expectEqualStrings("Dir", entries.items[0].kind);
+        try std.testing.expectEqualStrings(".", entries.items[0].path);
+    }
+    // name_glob that misses the root's basename -> only matching children
+    {
+        var entries = try collectRowsEntries(gpa, .{ .root = tpath, .name_glob = "f*" });
+        defer {
+            for (entries.items) |e| gpa.free(e.path);
+            entries.deinit(gpa);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+        try std.testing.expectEqualStrings("File", entries.items[0].kind);
+    }
+}
+
+// The reference half: fx-eval's nativeFind is importable from this file's
+// TEST blocks only (its module graph — caslog/fx-pipeline/fx-wire named
+// imports + the libdatalog externs — resolves inside `zig build test`, where
+// the whole graph is linked; the binary's own module table stays untouched,
+// so the non-test build never links fx-eval).
+const eval_ref = if (@import("builtin").is_test) struct {
+    const eval = @import("fx-eval.zig");
+    pub const Stage = eval.Stage;
+    pub const nativeFind = eval.nativeFind;
+} else struct {};
+
+test "rows: byte-identical to the pipeline's nativeFind for the same tree" {
+    const gpa = std.testing.allocator;
+    var tpl = "/tmp/ffnvXXXXXX".*;
+    const t = mkdtemp(&tpl) orelse return error.TmpDirFail;
+    const tpath = std.mem.span(t);
+    defer rmTree(tpath);
+    // The fixture uses ONLY relative-shape-identical content under a root
+    // both walks spell identically: same files, same sizes, same mtimes.
+    try writeFixtureFile(pz("{s}/a.txt", .{tpath}), "hello", 1600000000);
+    const b_z = pz("{s}/b", .{tpath});
+    if (mkdir(b_z.ptr, 0o755) != 0) return error.MkdirFail;
+    try setMtime(b_z, 1600000100);
+    try writeFixtureFile(pz("{s}/b/c.txt", .{tpath}), "abcd", 1600000200);
+    try writeFixtureFile(pz("{s}/d\"q", .{tpath}), "xy", 1600000300);
+    const sub_link = pz("{s}/sub", .{tpath});
+    if (symlink(b_z.ptr, sub_link.ptr) != 0) return error.SymlinkFail;
+    // pin the ROOT's mtime too (both walks stat the root; mkdtemp's is now)
+    try setMtime(tpath, 1600000400);
+
+    // --rows bytes via this file's code path (main()'s exact calls).
+    var entries = try collectRowsEntries(gpa, .{ .root = tpath });
+    defer {
+        for (entries.items) |e| gpa.free(e.path);
+        entries.deinit(gpa);
+    }
+    const ours = try encodeRowsWire(gpa, entries.items);
+    defer gpa.free(ours);
+
+    // nativeFind's bytes for the same root (Stage argv[0] = root; empty
+    // state_dir -> no CAS-subtree skip).
+    const stage = eval_ref.Stage{
+        .name = "find",
+        .argv = &.{tpath},
+        .shape_in = .{ .tag = .single },
+        .shape_out = .{ .tag = .rows },
+    };
+    const ref = try eval_ref.nativeFind(&stage, "", "", gpa);
+    defer gpa.free(ref);
+
+    // THE CONTRACT: byte-identical output for the same tree — the same
+    // JSONL, field order, escaping, sort.  A plain full-buffer compare, no
+    // normalization: the rows walk spells paths root-relative exactly like
+    // the reference does, so any divergence in kind/size/mtime, key order,
+    // escaping, or sort order fails here.
+    try std.testing.expectEqualStrings(ref, ours);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -761,6 +1271,24 @@ pub fn main(init: std.process.Init) !void {
         opts = try evalDhallArgs(src, opt_alloc);
     } else {
         opts = try parsePosixArgs(args, opt_alloc);
+    }
+
+    const stdout_file = std.Io.File.stdout();
+    if (opts.rows) {
+        // --rows: the pipeline's ROW shape — the same filtered, lex-sorted
+        // entry set bare mode would print, one canonical JSON object per
+        // entry, encoded through nativeFind's encoder pair.  No datalog db is
+        // needed (the rows walk is a direct recursion, the fx-eval
+        // reference's own shape).
+        var row_entries = try collectRowsEntries(gpa, opts);
+        defer {
+            for (row_entries.items) |e| gpa.free(e.path);
+            row_entries.deinit(gpa);
+        }
+        const bytes = try encodeRowsWire(gpa, row_entries.items);
+        defer gpa.free(bytes);
+        try std.Io.File.writeStreamingAll(stdout_file, init.io, bytes);
+        return;
     }
 
     // Create a unique transient db directory for the datalog core.  We use
@@ -856,7 +1384,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }.lt);
 
-    const stdout_file = std.Io.File.stdout();
     for (collect.list.items) |p| {
         try std.Io.File.writeStreamingAll(stdout_file, init.io, p);
         try std.Io.File.writeStreamingAll(stdout_file, init.io, "\n");

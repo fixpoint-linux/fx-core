@@ -17,6 +17,7 @@ pub const Options = struct {
     name_glob: ?[]const u8 = null,
     pattern: []const u8 = "",
     root: []const u8 = ".",
+    rows: bool = false,
 };
 
 /// Errors the parser can fail with.  (No MissingOperand in v1: every
@@ -54,11 +55,18 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             after_ddash = true;
             continue;
         }
-        if (a.len > 1 and a[0] == '-') {
-            std.debug.print("fx-grep: unknown option '{s}'\n", .{ a });
-            return error.UnknownOption;
+        var matched = false;
+        if (!matched and (std.mem.eql(u8, a, "--rows"))) {
+            o.rows = true;
+            matched = true;
         }
-        try bindOperand(a, &o, &next_pos, gpa);
+        if (!matched) {
+            if (a.len > 1 and a[0] == '-') {
+                std.debug.print("fx-grep: unknown option '{s}'\n", .{ a });
+                return error.UnknownOption;
+            }
+            try bindOperand(a, &o, &next_pos, gpa);
+        }
     }
     return o;
 }
@@ -79,7 +87,7 @@ fn bindOperand(arg: []const u8, o: *Options, next_pos: *usize, gpa: Allocator) P
 }
 
 pub fn usage() []const u8 {
-    return "usage: fx-grep [PATTERN] [ROOT]\n";
+    return "usage: fx-grep [OPTIONS] [PATTERN] [ROOT]\n";
 }
 
 test "cli_grep: empty argv yields the dflt defaults" {
@@ -91,6 +99,16 @@ test "cli_grep: empty argv yields the dflt defaults" {
     try std.testing.expect(o.name_glob == null);
     try std.testing.expectEqualStrings("", o.pattern);
     try std.testing.expectEqualStrings(".", o.root);
+    try std.testing.expectEqual(false, o.rows);
+}
+
+test "cli_grep: --rows binds rows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-grep", "--rows" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expect(o.rows);
 }
 
 test "cli_grep: operand binds pattern" {
