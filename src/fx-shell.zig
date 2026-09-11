@@ -769,6 +769,17 @@ pub const Outcome = union(enum) {
     streamed: u8,
 };
 
+/// Free an Outcome's owned parts.  A `.recorded` Outcome owns the derivation
+/// report (the stage records, the per-stage hashes, the final/input hashes) —
+/// the CALLER owns it and must release it, exactly as fx-compose does inline
+/// for its own report.  A `.streamed` Outcome owns nothing.
+pub fn freeOutcome(gpa: Allocator, out: *Outcome) void {
+    switch (out.*) {
+        .recorded => |*rep| eval.freeRunReport(gpa, rep),
+        .streamed => {},
+    }
+}
+
 /// The single dispatcher: pick the executor from the line's MODE.  record keeps
 /// the CAS path (unchanged); pipe is the streaming executor above.
 pub fn runByMode(
@@ -822,7 +833,10 @@ pub fn runLine(
     // buildPlan re-tokenizes internally; it is cheap and keeps one code path
     // for the typecheck (the plan must be identical in both modes).
     const plan = try buildPlan(gpa, line);
-    defer for (plan) |*st| freeStage(gpa, st);
+    defer {
+        for (plan) |*st| freeStage(gpa, st);
+        gpa.free(plan); // freeStage frees each stage's argv, not the slice
+    }
     return runByMode(mode, plan, input, state_dir, bin_dir, gpa, io);
 }
 

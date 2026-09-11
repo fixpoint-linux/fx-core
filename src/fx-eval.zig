@@ -1221,7 +1221,7 @@ fn writeFakeBin(bin_dir: []const u8, name: []const u8, script: []const u8) !void
 }
 
 /// Free a RunReport's gpa-owned slices (every run() caller owes these).
-fn freeRunReport(gpa: Allocator, rep: *const RunReport) void {
+pub fn freeRunReport(gpa: Allocator, rep: *const RunReport) void {
     for (rep.stages) |s| {
         gpa.free(s.in_hash);
         gpa.free(s.out_hash);

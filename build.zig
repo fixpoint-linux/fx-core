@@ -515,6 +515,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_shell_tests.step);
     compose_test_step.dependOn(&run_shell_tests.step);
 
+    // fxsh — the fixpoint shell (fxsh U5b): a thin CLI over the seam above.
+    // Its two pipeline operators are the product: `|` streams (fork/exec +
+    // pipes, nothing recorded), `|>` records (CAS-interned, replayable).
+    // Links libdatalog because the record path's native stages (find/grep)
+    // walk with the DFA engine in-process.
+    const fxsh_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-sh.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "fx-eval", .module = eval_mod },
+            .{ .name = "fx-pipeline", .module = pipeline_mod },
+            .{ .name = "fx-caslog", .module = caslog_mod },
+        },
+    });
+    const fxsh_exe = b.addExecutable(.{ .name = "fxsh", .root_module = fxsh_mod });
+    fxsh_exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
+    fxsh_exe.root_module.linkSystemLibrary("datalog", .{});
+    fxsh_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+    b.installArtifact(fxsh_exe);
+    // fxsh's own test blocks (the usage surface + the mode dispatch).
+    const fxsh_tests = b.addTest(.{ .root_module = fxsh_mod });
+    const run_fxsh_tests = b.addRunArtifact(fxsh_tests);
+    test_step.dependOn(&run_fxsh_tests.step);
+    const fxsh_run_step = b.step("run-fxsh", "Run the fxsh shell");
+    const fxsh_run = b.addRunArtifact(fxsh_exe);
+    fxsh_run_step.dependOn(&fxsh_run.step);
+    fxsh_run.step.dependOn(b.getInstallStep());
+    if (b.args) |as| fxsh_run.addArgs(as);
+
     // fx-compose: the typed pipeline ENGINE frontend executable.  Imports all of
     // dhall + caslog + pipeline + wire + eval; links libc (exec dispatch shells
     // to real fx-* binaries) plus libdatalog inherited transitively from
