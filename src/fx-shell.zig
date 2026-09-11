@@ -415,10 +415,29 @@ pub const ShellError = TokenizeError || error{
     FieldTypeMismatch,
     SingleMismatch,
     NoMem,
+    /// std allocator OOM from the line parser (the rest of the seam spells it
+    /// NoMem; the parser goes through std.ArrayList directly).
+    OutOfMemory,
     // pipeline.builtin's parseType failures
     DhallParse,
     DhallType,
     DhallNormalize,
+    // line-grammar (U10) failures
+    /// `(` with no matching `)`.
+    UnclosedParen,
+    /// a `|` / `&&` with no command on one side.
+    EmptyCommand,
+    /// tokens left over after a complete line (a parser bug, not user error).
+    TrailingGarbage,
+    /// control flow (&&/||/group) on a `|>` line — recording has no status.
+    ControlInRecordMode,
+    /// a redirect on a `|>` line (undecided semantics).
+    RedirectInRecordMode,
+    /// a malformed redirect: no target token, or a redirect in a position that
+    /// is neither the first command (for `<`) nor the last (`>` and friends).
+    BadRedirect,
+    PipeFailed,
+    ForkFailed,
 };
 
 /// Free a Stage built by buildStage/buildPlan (its argv tokens, the argv
@@ -675,6 +694,16 @@ pub const Redirs = struct {
 };
 
 pub const RedirError = error{BadRedirect} || TokenizeError;
+
+/// Free the target strings a Redirs OWNS.  The token-based parseRedirs borrows
+/// from the caller's token lists (nothing to free); stripRedirsFromChain REMOVES
+/// the targets from the command's argv, so that form owns them and the caller
+/// must release them or they leak.
+pub fn freeRedirs(gpa: Allocator, r: *const Redirs) void {
+    if (r.stdin) |p| gpa.free(p);
+    if (r.stdout) |p| gpa.free(p);
+    if (r.stderr) |p| gpa.free(p);
+}
 
 /// Split redirect tokens OUT of the stage token lists.  Returns the remaining
 /// tokens (still one list per stage) plus the line's Redirs.  The caller owns
@@ -1006,6 +1035,72 @@ pub fn runLine(
     bin_dir: []const u8,
     io: std.Io,
 ) !Outcome {
+    // The full LINE grammar (control flow + subshells).  tokenizeStages is the
+    // pipeline-only view; parseLine is the line view the shell actually runs.
+    {
+        // A line's parse tree is transient and a FAILED parse can leave a
+        // partially-built chain behind — exactly the shape an arena exists for
+        // (the same discipline fx-compose uses for Dhall terms).  Everything
+        // the parse allocates, including the error paths, is reclaimed
+        // wholesale, so a malformed line cannot leak.
+        var line_arena = std.heap.ArenaAllocator.init(gpa);
+        defer line_arena.deinit();
+        const la = line_arena.allocator();
+
+        var chain = parseLine(la, line) catch |e| return e;
+        defer freeChain(la, &chain);
+
+        // Redirects are stripped from the PARSED CHAIN: tokenizeStages is the
+        // pipeline-only view and would reject the control operators this line
+        // legitimately uses.
+        // Everything here is line-transient, so it all comes from the SAME
+        // arena as the parse tree.  Mixing allocators is what caused an
+        // "Invalid free": the stripped commands' token slices were allocated
+        // with gpa while the tokens themselves (and the redirect targets, which
+        // stay borrowed from them) belonged to the arena.
+        const redirs = la.alloc(Redirs, chain.pipes.len) catch return error.NoMem;
+        @memset(redirs, .{});
+        try stripRedirsFromChain(la, &chain, redirs);
+
+        const has_record = chainHasRecord(&chain);
+        const has_control = chainHasControl(&chain);
+
+        if (has_record and has_control) {
+            std.debug.print(
+                "fx-shell: control flow (&& / || / a subshell) is not supported on a '|>' line — recording has no exit status to branch on; split the line or use '|'\n",
+                .{},
+            );
+            return error.ControlInRecordMode;
+        }
+        if (anyRedirs(redirs) and has_record) {
+            std.debug.print(
+                "fx-shell: a redirect is not supported on a '|>' (record) line — what a redirected derivation means is undecided; use '|' to just run it\n",
+                .{},
+            );
+            return error.RedirectInRecordMode;
+        }
+
+        if (has_record) {
+            // A single recorded pipeline.  chainHasControl just proved there is
+            // no && / || / group here, so the pipeline-only token view IS valid
+            // for this line — that is the form buildPlanTokens needs (it carries
+            // the per-stage | / |> operator).
+            const orig = try tokenizeStages(gpa, line);
+            defer freeStageTokens(gpa, orig);
+            const rec = try parseRedirs(gpa, orig);
+            defer freeRedirStages(gpa, rec.stages);
+            const plan = try buildPlanTokens(gpa, rec.stages);
+            defer {
+                for (plan) |*st| freeStage(gpa, st);
+                gpa.free(plan);
+            }
+            return runByMode(.record, plan, input, state_dir, bin_dir, redirs[0], gpa, io);
+        }
+
+        // RUN mode: the chain executor (pipes, &&, ||, subshells, redirects)
+        return .{ .streamed = try runChain(gpa, &chain, bin_dir, redirs) };
+    }
+
     const stage_toks = try tokenizeStages(gpa, line);
     defer freeStageTokens(gpa, stage_toks);
     const mode = lineMode(stage_toks);
@@ -1628,4 +1723,743 @@ test "redirects: a dangling operator is a loud error" {
     const toks = try tokenizeStages(gpa, "sort >");
     defer freeStageTokens(gpa, toks);
     try testing.expectError(error.BadRedirect, parseRedirs(gpa, toks));
+}
+
+// ---------------------------------------------------------------------------
+// U10 — control flow: && , || , and ( ) subshells
+// ---------------------------------------------------------------------------
+//
+// The line grammar above the pipeline:
+//
+//   line     := pipeline (('&&' | '||') pipeline)*
+//   pipeline := cmd (('|' | '|>') cmd)*
+//   cmd      := WORD+ | '(' line ')'
+//
+// `&&` / `||` are about EXIT STATUS, which only run mode has (a record line
+// produces a derivation, not a status), so a line mixing them with `|>` is
+// rejected loudly rather than inventing an answer.  `( )` groups a whole line,
+// so it nests.
+//
+// The tree is FLATTENED before any fork: every child argv is built in the
+// parent.  A subshell child then only forks/dup2s/waits — it never allocates,
+// which is the async-signal-safety discipline the redirect path documents too
+// (and why this is a separate pre-built representation rather than running the
+// parser in the child).
+
+/// One token of the LINE lexer.  Words carry their quotes already resolved;
+/// the operators are structural.
+pub const Tok = union(enum) {
+    word: []const u8,
+    pipe,
+    record,
+    andand,
+    oror,
+    lparen,
+    rparen,
+};
+
+pub const ChainOp = enum { and_, or_ };
+
+/// A command: either a real argv, or a `( … )` group.  `group` is a pointer
+/// into the heap so a subshell nests arbitrarily.
+pub const Cmd = union(enum) {
+    words: []const []const u8,
+    group: *Chain,
+};
+
+pub const Pipeline = struct {
+    cmds: []Cmd,
+    ops: []const Op, // `|` / `|>` between cmds; len == cmds.len - 1
+};
+
+pub const Chain = struct {
+    pipes: []Pipeline,
+    ops: []const ChainOp, // `&&` / `||`; len == pipes.len - 1
+};
+
+pub fn freeChain(gpa: Allocator, c: *const Chain) void {
+    for (c.pipes) |p| {
+        for (p.cmds) |cmd| switch (cmd) {
+            .words => |ws| {
+                for (ws) |w| gpa.free(w);
+                gpa.free(ws);
+            },
+            .group => |g| {
+                freeChain(gpa, g);
+                gpa.destroy(g);
+            },
+        };
+        gpa.free(p.cmds);
+        gpa.free(p.ops);
+    }
+    gpa.free(c.pipes);
+    gpa.free(c.ops);
+}
+
+
+/// Any redirection anywhere in the line?  (record mode rejects a redirect)
+fn anyRedirs(rs: []const Redirs) bool {
+    for (rs) |r| if (r.any()) return true;
+    return false;
+}
+
+/// Strip redirect tokens out of a PARSED chain's word commands, collecting
+/// them into `redirs`.  Operates on the chain (not the pipeline-only token
+/// view) so a line using && / || / a subshell still gets its redirects
+/// recognised.  v1 keeps the classic simple-shell reading: `<` binds the first
+/// command of the first pipeline, `>`/`>>`/`2>`/`2>&1` the last command of the
+/// LAST pipeline.  A redirect INSIDE a `( … )` group is rejected — the
+/// grouping/redirect interaction is undecided in v1.
+pub fn stripRedirsFromChain(gpa: Allocator, c: *Chain, redirs: []Redirs) ShellError!void {
+    if (c.pipes.len == 0) return;
+    for (c.pipes, 0..) |_, pi| {
+        const p = c.pipes[pi];
+        for (p.cmds, 0..) |cmd, ci| {
+            switch (cmd) {
+                .words => |ws| {
+                    const is_first_cmd = ci == 0;
+                    const is_last_cmd = ci + 1 == p.cmds.len;
+                    var kept = std.ArrayList([]const u8).empty;
+                    errdefer kept.deinit(gpa);
+                    var i: usize = 0;
+                    while (i < ws.len) : (i += 1) {
+                        const t = ws[i];
+                        const is_op = std.mem.eql(u8, t, ">") or std.mem.eql(u8, t, ">>") or
+                            std.mem.eql(u8, t, "<") or std.mem.eql(u8, t, "2>") or
+                            std.mem.eql(u8, t, "2>>") or std.mem.eql(u8, t, "2>&1");
+                        if (!is_op) {
+                            kept.append(gpa, t) catch return error.NoMem;
+                            continue;
+                        }
+                        if (!is_first_cmd and !is_last_cmd) return error.BadRedirect;
+                        if (std.mem.eql(u8, t, "2>&1")) {
+                            if (!is_last_cmd) return error.BadRedirect;
+                            redirs[pi].stderr_to_stdout = true;
+                            gpa.free(t);
+                            continue;
+                        }
+                        if (i + 1 >= ws.len) return error.BadRedirect;
+                        const target = ws[i + 1];
+                        i += 1;
+                        if (std.mem.eql(u8, t, "<")) {
+                            if (!is_first_cmd) return error.BadRedirect;
+                            redirs[pi].stdin = target;
+                        } else if (std.mem.eql(u8, t, ">") or std.mem.eql(u8, t, ">>")) {
+                            if (!is_last_cmd) return error.BadRedirect;
+                            redirs[pi].stdout = target;
+                            redirs[pi].stdout_append = std.mem.eql(u8, t, ">>");
+                        } else {
+                            if (!is_last_cmd) return error.BadRedirect;
+                            redirs[pi].stderr = target;
+                        }
+                        gpa.free(t);
+                    }
+                    // the leftover slice becomes the command's argv
+                    const kept_slice = kept.toOwnedSlice(gpa) catch return error.NoMem;
+                    // free the OLD slice array only: the surviving tokens are
+                    // the same pointers (now owned by kept_slice) and the
+                    // redirect tokens + their targets were freed above.
+                    gpa.free(ws);
+                    // mutate the cmd in place (the chain owns the slice)
+                    const cmds_mut = @constCast(p.cmds);
+                    cmds_mut[ci] = .{ .words = kept_slice };
+                },
+                .group => {
+                    // a redirect inside a group is out of scope in v1
+                    const inner = cmd.group;
+                    for (inner.pipes) |ip| {
+                        for (ip.cmds) |ic| switch (ic) {
+                            .words => |iws| for (iws) |iw| {
+                                if (std.mem.eql(u8, iw, ">") or std.mem.eql(u8, iw, ">>") or
+                                    std.mem.eql(u8, iw, "<") or std.mem.eql(u8, iw, "2>") or
+                                    std.mem.eql(u8, iw, "2>&1")) return error.BadRedirect;
+                            },
+                            else => {},
+                        };
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// The LINE lexer: like tokenizeStages but emitting the control operators too.
+pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
+    var out = std.ArrayList(Tok).empty;
+    errdefer {
+        for (out.items) |t| switch (t) {
+            .word => |w| gpa.free(w),
+            else => {},
+        };
+        out.deinit(gpa);
+    }
+    var cur = std.ArrayList(u8).empty;
+    errdefer cur.deinit(gpa);
+    var has_cur = false;
+    var quote_off: usize = 0;
+    var state: ScanState = .between;
+
+    // flush the open word (if any) as a token
+    const flush = struct {
+        fn f(g: Allocator, list: *std.ArrayList(Tok), buf: *std.ArrayList(u8), has: *bool) error{NoMem}!void {
+            if (!has.*) return;
+            const w = buf.toOwnedSlice(g) catch return error.NoMem;
+            list.append(g, .{ .word = w }) catch {
+                g.free(w);
+                return error.NoMem;
+            };
+            has.* = false;
+        }
+    }.f;
+
+    var i: usize = 0;
+    scan: while (i < line.len) {
+        const c = line[i];
+        switch (state) {
+            .between, .unquoted => {
+                // the operators terminate an open word (POSIX: they are
+                // operator characters; quote them to use them literally)
+                var emit: ?Tok = null;
+                var step: usize = 1;
+                if (c == '|') {
+                    if (i + 1 < line.len and line[i + 1] == '|') {
+                        emit = .oror;
+                        step = 2;
+                    } else if (i + 1 < line.len and line[i + 1] == '>') {
+                        emit = .record;
+                        step = 2;
+                    } else emit = .pipe;
+                } else if (c == '&' and i + 1 < line.len and line[i + 1] == '&') {
+                    emit = .andand;
+                    step = 2;
+                } else if (c == '(') {
+                    emit = .lparen;
+                } else if (c == ')') {
+                    emit = .rparen;
+                }
+                if (emit) |e| {
+                    try flush(gpa, &out, &cur, &has_cur);
+                    out.append(gpa, e) catch return error.NoMem;
+                    state = .between;
+                    i += step;
+                    continue :scan;
+                }
+                switch (c) {
+                    ' ', '\t', '\r', '\n' => {
+                        if (state == .unquoted) try flush(gpa, &out, &cur, &has_cur);
+                        state = .between;
+                        i += 1;
+                    },
+                    '#' => {
+                        if (state == .between) break :scan; // comment at token start
+                        cur.append(gpa, c) catch return error.NoMem;
+                        i += 1;
+                    },
+                    '\'', '"' => {
+                        quote_off = i;
+                        state = if (c == '\'') .single else .double;
+                        has_cur = true; // the empty quoted arg IS a token
+                        i += 1;
+                    },
+                    '\\' => {
+                        if (i + 1 >= line.len)
+                            return fail(error.UnbalancedQuote, "dangling backslash at end of input", i);
+                        has_cur = true;
+                        state = .unquoted;
+                        cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                        i += 2;
+                    },
+                    '$' => return fail(error.Dollar, "'$' interpolation is not in v1 — single-quote it or escape it as \\$", i),
+                    else => {
+                        has_cur = true;
+                        state = .unquoted;
+                        cur.append(gpa, c) catch return error.NoMem;
+                        i += 1;
+                    },
+                }
+            },
+            .single => switch (c) {
+                '\'' => {
+                    state = .unquoted;
+                    i += 1;
+                },
+                else => {
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
+            },
+            .double => switch (c) {
+                '"' => {
+                    state = .unquoted;
+                    i += 1;
+                },
+                '\\' => {
+                    if (i + 1 >= line.len)
+                        return fail(error.UnbalancedQuote, "dangling backslash at end of input (inside double quotes)", i);
+                    const n = line[i + 1];
+                    if (n == '"' or n == '\\') {
+                        cur.append(gpa, n) catch return error.NoMem;
+                    } else {
+                        cur.append(gpa, '\\') catch return error.NoMem;
+                        cur.append(gpa, n) catch return error.NoMem;
+                    }
+                    i += 2;
+                },
+                '$' => return fail(error.Dollar, "'$' inside double quotes would interpolate in POSIX shells — v1 has no variables; single-quote it or escape it", i),
+                else => {
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
+            },
+        }
+    }
+    if (state == .single or state == .double)
+        return fail(error.UnbalancedQuote, "unterminated quote (opened here; no matching close before end of input)", quote_off);
+    try flush(gpa, &out, &cur, &has_cur);
+    cur.deinit(gpa);
+    return out.toOwnedSlice(gpa) catch return error.NoMem;
+}
+
+pub fn freeToks(gpa: Allocator, toks: []Tok) void {
+    for (toks) |t| switch (t) {
+        .word => |w| gpa.free(w),
+        else => {},
+    };
+    gpa.free(toks);
+}
+
+/// Parse a LINE (already lexed) into a Chain.  Recursive descent:
+///   line := pipeline (('&&'|'||') pipeline)*
+///   pipeline := cmd (('|'|'|>') cmd)*
+///   cmd := WORD+ | '(' line ')'
+const Parser = struct {
+    gpa: Allocator,
+    toks: []const Tok,
+    i: usize = 0,
+
+    fn peek(self: *Parser) ?Tok {
+        if (self.i >= self.toks.len) return null;
+        return self.toks[self.i];
+    }
+
+    fn parseLine(self: *Parser) ShellError!Chain {
+        var pipes = std.ArrayList(Pipeline).empty;
+        errdefer {
+            for (pipes.items) |p| {
+                freePipeline(self.gpa, p);
+            }
+            pipes.deinit(self.gpa);
+        }
+        var ops = std.ArrayList(ChainOp).empty;
+        errdefer ops.deinit(self.gpa);
+
+        try pipes.append(self.gpa, try self.parsePipeline());
+        while (self.peek()) |t| {
+            const op: ChainOp = switch (t) {
+                .andand => .and_,
+                .oror => .or_,
+                else => break,
+            };
+            self.i += 1;
+            try ops.append(self.gpa, op);
+            try pipes.append(self.gpa, try self.parsePipeline());
+        }
+        return .{
+            .pipes = pipes.toOwnedSlice(self.gpa) catch return error.NoMem,
+            .ops = ops.toOwnedSlice(self.gpa) catch return error.NoMem,
+        };
+    }
+
+    fn parsePipeline(self: *Parser) ShellError!Pipeline {
+        var cmds = std.ArrayList(Cmd).empty;
+        errdefer {
+            for (cmds.items) |c| freeCmd(self.gpa, c);
+            cmds.deinit(self.gpa);
+        }
+        var ops = std.ArrayList(Op).empty;
+        errdefer ops.deinit(self.gpa);
+
+        try cmds.append(self.gpa, try self.parseCmd());
+        while (self.peek()) |t| {
+            const op: Op = switch (t) {
+                .pipe => .pipe,
+                .record => .record,
+                else => break,
+            };
+            self.i += 1;
+            try ops.append(self.gpa, op);
+            try cmds.append(self.gpa, try self.parseCmd());
+        }
+        return .{
+            .cmds = cmds.toOwnedSlice(self.gpa) catch return error.NoMem,
+            .ops = ops.toOwnedSlice(self.gpa) catch return error.NoMem,
+        };
+    }
+
+    fn parseCmd(self: *Parser) ShellError!Cmd {
+        const t = self.peek() orelse return error.EmptyCommand;
+        if (t == .lparen) {
+            self.i += 1;
+            const inner = self.gpa.create(Chain) catch return error.NoMem;
+            // no errdefer: each failure below releases `inner` itself, and an
+            // errdefer here would free it a SECOND time on our own error return
+            // (Zig runs errdefers on any `return error`).
+            inner.* = self.parseLine() catch |e| {
+                self.gpa.destroy(inner);
+                return e;
+            };
+            // a missing `)` releases the WHOLE inner chain, not just the
+            // pointer: the parse succeeded, so nothing else would free its
+            // pipelines (this leaked before the grammar tests).
+            if (self.peek() == null or self.peek().? != .rparen) {
+                freeChain(self.gpa, inner);
+                self.gpa.destroy(inner);
+                return error.UnclosedParen;
+            }
+            self.i += 1;
+            return .{ .group = inner };
+        }
+        var words = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (words.items) |w| self.gpa.free(w);
+            words.deinit(self.gpa);
+        }
+        while (self.peek()) |tt| {
+            switch (tt) {
+                .word => |w| {
+                    self.i += 1;
+                    const dup = self.gpa.dupe(u8, w) catch return error.NoMem;
+                    words.append(self.gpa, dup) catch {
+                        self.gpa.free(dup);
+                        return error.NoMem;
+                    };
+                },
+                else => break,
+            }
+        }
+        if (words.items.len == 0) return error.EmptyCommand;
+        return .{ .words = words.toOwnedSlice(self.gpa) catch return error.NoMem };
+    }
+};
+
+fn freeCmd(gpa: Allocator, c: Cmd) void {
+    switch (c) {
+        .words => |ws| {
+            for (ws) |w| gpa.free(w);
+            gpa.free(ws);
+        },
+        .group => |g| {
+            freeChain(gpa, g);
+            gpa.destroy(g);
+        },
+    }
+}
+
+fn freePipeline(gpa: Allocator, p: Pipeline) void {
+    for (p.cmds) |c| freeCmd(gpa, c);
+    gpa.free(p.cmds);
+    gpa.free(p.ops);
+}
+
+/// Lex + parse a LINE into a Chain.  The caller frees it with freeChain.
+pub fn parseLine(gpa: Allocator, line: []const u8) ShellError!Chain {
+    const toks = try tokLine(gpa, line);
+    defer freeToks(gpa, toks);
+    var p = Parser{ .gpa = gpa, .toks = toks };
+    const c = try p.parseLine();
+    if (p.i != toks.len) return error.TrailingGarbage;
+    return c;
+}
+
+/// Does the chain contain a `|>` anywhere?  (Record mode is a whole-line
+/// property, so a nested group's `|>` counts.)
+fn chainHasRecord(c: *const Chain) bool {
+    for (c.pipes) |p| {
+        for (p.ops) |op| if (op == .record) return true;
+        for (p.cmds) |cmd| switch (cmd) {
+            .group => |g| if (chainHasRecord(g)) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+/// Does the chain contain control flow (&& / || / a group)?  Record mode has
+/// no exit status, so a line that mixes control flow with `|>` is rejected.
+fn chainHasControl(c: *const Chain) bool {
+    if (c.ops.len > 0) return true;
+    for (c.pipes) |p| {
+        for (p.cmds) |cmd| switch (cmd) {
+            .group => return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+// --- flattening: build EVERY argv before any fork -------------------------
+
+const FlatCmd = struct {
+    /// the child argv (null-terminated), or null for a group
+    argv: ?[]?[*:0]const u8 = null,
+    /// a `( … )` subshell: the INNER CHAIN (it may itself contain && / ||)
+    inner: ?*FlatChain = null,
+};
+
+const FlatPipeline = struct {
+    cmds: []FlatCmd,
+    ops: []const Op,
+    /// this pipeline's own redirections (per-pipeline, like a real shell:
+    /// `a 2> f && b` redirects only the first pipeline)
+    redirs: Redirs = .{},
+};
+
+const FlatChain = struct {
+    pipes: []FlatPipeline,
+    ops: []const ChainOp,
+};
+
+fn flattenChain(gpa: Allocator, c: *const Chain, bin_dir: []const u8, redirs: []const Redirs) anyerror!FlatChain {
+    var pipes = try gpa.alloc(FlatPipeline, c.pipes.len);
+    var built: usize = 0;
+    errdefer for (pipes[0..built]) |p| freeFlatPipeline(gpa, p);
+    for (c.pipes, 0..) |p, i| {
+        pipes[i] = try flattenPipeline(gpa, p, bin_dir, redirs[i]);
+        built = i + 1;
+    }
+    return .{
+        .pipes = pipes,
+        .ops = c.ops,
+    };
+}
+
+fn flattenPipeline(gpa: Allocator, p: Pipeline, bin_dir: []const u8, redirs: Redirs) anyerror!FlatPipeline {
+    var cmds = try gpa.alloc(FlatCmd, p.cmds.len);
+    var built: usize = 0;
+    errdefer for (cmds[0..built]) |c| freeFlatCmd(gpa, c);
+    for (p.cmds, 0..) |cmd, i| {
+        cmds[i] = switch (cmd) {
+            .words => |ws| blk: {
+                const st = eval.Stage{
+                    .name = ws[0],
+                    .argv = ws[1..],
+                    .shape_in = .{ .tag = .lines },
+                    .shape_out = .{ .tag = .lines },
+                };
+                break :blk .{ .argv = try buildRunArgv(gpa, &st, bin_dir) };
+            },
+            .group => |g| blk: {
+                const inner = try gpa.create(FlatChain);
+                errdefer gpa.destroy(inner);
+                const none = try gpa.alloc(Redirs, g.pipes.len);
+                @memset(none, .{});
+                defer gpa.free(none);
+                inner.* = try flattenChain(gpa, g, bin_dir, none);
+                break :blk .{ .inner = inner };
+            },
+        };
+        built = i + 1;
+    }
+    return .{ .cmds = cmds, .ops = p.ops, .redirs = redirs };
+}
+
+fn freeFlatCmd(gpa: Allocator, c: FlatCmd) void {
+    if (c.argv) |a| freeRunArgv(gpa, a);
+    if (c.inner) |i| {
+        freeFlatChain(gpa, i.*);
+        gpa.destroy(i);
+    }
+}
+
+fn freeFlatPipeline(gpa: Allocator, p: FlatPipeline) void {
+    for (p.cmds) |c| freeFlatCmd(gpa, c);
+    gpa.free(p.cmds);
+}
+
+fn freeFlatChain(gpa: Allocator, c: FlatChain) void {
+    for (c.pipes) |p| freeFlatPipeline(gpa, p);
+    gpa.free(c.pipes);
+}
+
+// --- execution -----------------------------------------------------------
+
+/// Run ONE flattened pipeline: fork the cmds together, wait for all, return
+/// the LAST cmd's status.  A group cmd's child re-enters this fn for its inner
+/// pipeline (fork/dup2/wait only — the argvs were built pre-fork).
+fn runFlatPipeline(gpa: Allocator, p: *const FlatPipeline) anyerror!u8 {
+    const n = p.cmds.len;
+    const npipes = if (n > 1) n - 1 else 0;
+    const pipes = try gpa.alloc([2]std.c.fd_t, npipes);
+    defer gpa.free(pipes);
+    for (pipes) |*pp| {
+        if (std.c.pipe(pp) != 0) {
+            for (pipes) |q| {
+                _ = std.c.close(q[0]);
+                _ = std.c.close(q[1]);
+            }
+            return error.PipeFailed;
+        }
+    }
+    const pids = try gpa.alloc(std.c.pid_t, n);
+    defer gpa.free(pids);
+
+    for (p.cmds, 0..) |_, i| {
+        const stdin_fd: std.c.fd_t = if (i == 0) 0 else pipes[i - 1][0];
+        const stdout_fd: std.c.fd_t = if (i == n - 1) 1 else pipes[i][1];
+        const pid = fork();
+        if (pid < 0) return error.ForkFailed;
+        if (pid == 0) {
+            // child: resolve THIS pipeline's redirects (opened here so a bad
+            // path is this stage's status, not the parent's), then close the
+            // pipe ends we do not keep, then either exec or (for a group) run
+            // the inner pipeline and exit with its status.
+            var zscratch: [3][4096:0]u8 = undefined;
+            const zs: [][4096:0]u8 = &zscratch;
+            var zn: usize = 0;
+            var eff_stdin = stdin_fd;
+            var eff_stdout = stdout_fd;
+            if (i == 0) {
+                if (p.redirs.stdin) |path| {
+                    const fd = openRedirTarget(path, false, true, zs, &zn);
+                    if (fd < 0) _exit(1);
+                    eff_stdin = fd;
+                }
+            }
+            if (i == n - 1) {
+                if (p.redirs.stdout) |path| {
+                    const fd = openRedirTarget(path, p.redirs.stdout_append, false, zs, &zn);
+                    if (fd < 0) _exit(1);
+                    eff_stdout = fd;
+                }
+            }
+            for (pipes) |qq| {
+                if (qq[0] != eff_stdin and qq[0] != eff_stdout and qq[0] != 2) _ = std.c.close(qq[0]);
+                if (qq[1] != eff_stdin and qq[1] != eff_stdout and qq[1] != 2) _ = std.c.close(qq[1]);
+            }
+            if (eff_stdin != 0) {
+                if (std.c.dup2(eff_stdin, 0) < 0) _exit(127);
+                _ = std.c.close(eff_stdin);
+            }
+            if (eff_stdout != 1) {
+                if (std.c.dup2(eff_stdout, 1) < 0) _exit(127);
+                _ = std.c.close(eff_stdout);
+            }
+            if (i == n - 1) {
+                if (p.redirs.stderr) |path| {
+                    const fd = openRedirTarget(path, false, false, zs, &zn);
+                    if (fd < 0) _exit(1);
+                    _ = std.c.dup2(fd, 2);
+                } else if (p.redirs.stderr_to_stdout) {
+                    _ = std.c.dup2(1, 2);
+                }
+            }
+            if (p.cmds[i].inner) |inner| {
+                // a subshell: run the inner pipeline (it inherits the fds we
+                // just bound) and exit with its status.  No allocation: the
+                // grandchildren's argvs were built pre-fork.
+                const st = runFlatChain(gpa, inner) catch 1;
+                _exit(st);
+            }
+            _ = execvp(p.cmds[i].argv.?[0].?, @ptrCast(p.cmds[i].argv.?.ptr));
+            _exit(127);
+        }
+        pids[i] = pid;
+    }
+
+    for (pipes) |qq| {
+        _ = std.c.close(qq[0]);
+        _ = std.c.close(qq[1]);
+    }
+    var last: u8 = 0;
+    for (pids, 0..) |pid, i| {
+        var st: c_int = 0;
+        while (std.c.waitpid(pid, &st, 0) < 0) {}
+        if (i == n - 1) {
+            const u: u32 = @bitCast(st);
+            last = if (std.posix.W.IFEXITED(u)) std.posix.W.EXITSTATUS(u) else 128;
+        }
+    }
+    return last;
+}
+
+/// Run a whole CHAIN: pipelines joined by && / ||, short-circuiting on status.
+fn runFlatChain(gpa: Allocator, c: *const FlatChain) anyerror!u8 {
+    var status: u8 = 0;
+    for (c.pipes, 0..) |*p, i| {
+        if (i > 0) {
+            const op = c.ops[i - 1];
+            // short-circuit: && skips on failure, || skips on success
+            if (op == .and_ and status != 0) continue;
+            if (op == .or_ and status == 0) continue;
+        }
+        status = try runFlatPipeline(gpa, p);
+    }
+    return status;
+}
+
+/// Run a whole CHAIN: flatten first so EVERY argv exists before any fork, then
+/// execute.  Returns the last executed pipeline's status.  ALLOCATES NOTHING
+/// during execution — a subshell child re-enters runFlatChain, and allocation
+/// after fork is forbidden by the async-signal-safety rule the redirect path
+/// documents.
+pub fn runChain(gpa: Allocator, c: *const Chain, bin_dir: []const u8, redirs: []const Redirs) anyerror!u8 {
+    const flat = try flattenChain(gpa, c, bin_dir, redirs);
+    defer freeFlatChain(gpa, flat);
+    return runFlatChain(gpa, &flat);
+}
+
+test "line grammar: && / || / subshells parse into a Chain" {
+    const gpa = testing.allocator;
+    // shape assertions: pipelines count, ops, and a group's nesting
+    {
+        var c = try parseLine(gpa, "a | b && c");
+        defer freeChain(gpa, &c);
+        try testing.expectEqual(@as(usize, 2), c.pipes.len);
+        try testing.expectEqual(ChainOp.and_, c.ops[0]);
+        try testing.expectEqual(@as(usize, 2), c.pipes[0].cmds.len);
+        try testing.expectEqual(Op.pipe, c.pipes[0].ops[0]);
+    }
+    {
+        var c = try parseLine(gpa, "a || b");
+        defer freeChain(gpa, &c);
+        try testing.expectEqual(ChainOp.or_, c.ops[0]);
+    }
+    {
+        // a subshell is a group cmd; `( a && b ) | c` has an INNER chain
+        var c = try parseLine(gpa, "( a && b ) | c");
+        defer freeChain(gpa, &c);
+        try testing.expectEqual(@as(usize, 1), c.pipes.len);
+        try testing.expectEqual(@as(usize, 2), c.pipes[0].cmds.len);
+        const g = c.pipes[0].cmds[0].group;
+        try testing.expectEqual(@as(usize, 2), g.pipes.len);
+        try testing.expectEqual(ChainOp.and_, g.ops[0]);
+    }
+}
+
+test "line grammar: malformed input is a loud error" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.UnclosedParen, parseLine(gpa, "( a | b"));
+    try testing.expectError(error.EmptyCommand, parseLine(gpa, "a &&"));
+    try testing.expectError(error.EmptyCommand, parseLine(gpa, "&& a"));
+}
+
+test "record mode is rejected when the line has control flow" {
+    // `|>` has no exit status, so && / || / a subshell cannot branch on it.
+    // Whole-line rule: one `|>` plus any control operator is an error.
+    const gpa = testing.allocator;
+    const reject = struct {
+        fn f(g: Allocator, line: []const u8) !void {
+            var c = try parseLine(g, line);
+            defer freeChain(g, &c);
+            try testing.expect(chainHasControl(&c));
+            try testing.expect(chainHasRecord(&c));
+        }
+    }.f;
+    try reject(gpa, "a |> b && c");
+    try reject(gpa, "( a |> b )");
+    // and a pure record line is NOT control flow
+    var ok = try parseLine(gpa, "a |> b");
+    defer freeChain(gpa, &ok);
+    try testing.expect(!chainHasControl(&ok));
+    try testing.expect(chainHasRecord(&ok));
 }
