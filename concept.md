@@ -323,8 +323,26 @@ therefore REJECTED loudly rather than guessing what a redirected derivation
 means; the natural future landing spot is "a redirect inside a record line
 becomes part of the derivation" (not implemented).
 
-v1 deliberately has NO variables, NO env interpolation, NO globbing, no
-subshells and no `&&`/`||` (each is a loud error, never a silent mis-parse).
+**Control flow** (U10).  Above the pipeline there is a small line grammar:
+
+    line     := pipeline (('&&' | '||') pipeline)*
+    pipeline := cmd (('|' | '|>') cmd)*
+    cmd      := WORD+ | '(' line ')'
+
+`&&` / `||` short-circuit on exit status; `( … )` groups a whole line and nests,
+so `( a | b ) | c` works and a group's status propagates to a following `&&`.
+A redirect is **per-pipeline** (`a 2> f && b` redirects only the first).
+
+Control flow is a **run-mode** construct: `|>` yields a derivation, not an exit
+status, so nothing exists for `&&` / `||` to branch on — a line mixing them with
+`|>` is rejected loudly rather than inventing an answer.
+
+The tree is FLATTENED before any fork (every child argv is built in the parent),
+so a subshell child only forks/dup2s/waits and never allocates — the same
+async-signal-safety rule the redirect path documents.
+
+v1 deliberately has NO variables, NO env interpolation and NO globbing (a `$` is
+a loud error, never a silent pass-through).
 
 ### fx-compose — concrete design (what it actually is)
 
