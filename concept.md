@@ -299,6 +299,33 @@ whole command-and-pipeline model.
   existing dir, `rm` on missing, and `cp` same-content converge to no-op with
   NO log entry; see the idempotence table.)*
 
+### fxsh — the shell (the two operators)
+
+`fxsh` is the shell: every stage is parsed by its command's GENERATED parser and
+the chain is typechecked by `fx-pipeline.compose` **before anything runs**.  Its
+semantic core is the operator, which IS the declaration of intent:
+
+    a | b     RUN     kernel pipes; streaming; nothing interned or recorded.
+    a |> b    RECORD  CAS-interns every intermediate — the line becomes a
+                      REPLAYABLE DERIVATION (what fx-compose does).
+
+Both modes typecheck identically: the operator changes HOW a line runs, never
+WHAT is accepted (`ls | wc` and `ls |> wc` are both rejected).  Recording is a
+WHOLE-LINE property — you cannot hash an intermediate that never materialised,
+so one `|>` puts the line in record mode.
+
+**Known provenance hole (deliberate).** Redirects (`<`, `>`, `>>`, `2>`, `2>&1`)
+are RAW: they write files **without** a derivation-log entry, so a file created
+by `fxsh -c 'seq 1 3 > f'` has no `fx-why` record, unlike the same file created
+by `fx-cp`.  This keeps `|` honest — if a `|`-line sometimes mutated the global
+effect log, it would not be "just run" any more.  A redirect on a `|>` line is
+therefore REJECTED loudly rather than guessing what a redirected derivation
+means; the natural future landing spot is "a redirect inside a record line
+becomes part of the derivation" (not implemented).
+
+v1 deliberately has NO variables, NO env interpolation, NO globbing, no
+subshells and no `&&`/`||` (each is a loud error, never a silent mis-parse).
+
 ### fx-compose — concrete design (what it actually is)
 
 **A pipeline is a typed derivation.** The unit of composition is the *pipeline

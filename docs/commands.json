@@ -170,11 +170,12 @@
 {
   "name": "find",
   "doc": "walk a directory closure via Datalog reachability from ROOT",
-  "usage": "usage: fx-find [ROOT]",
+  "usage": "usage: fx-find [OPTIONS] [ROOT]",
   "args": [
     {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": []},
     {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": []},
     {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]},
     {"field": "type_filter", "type": "Optional < Dir | File >", "default": "None < Dir | File >", "positional": null, "flags": []}
   ],
   "mutually_exclusive": []
@@ -182,12 +183,13 @@
 {
   "name": "grep",
   "doc": "print lines of files under ROOT matching a regex PATTERN",
-  "usage": "usage: fx-grep [PATTERN] [ROOT]",
+  "usage": "usage: fx-grep [OPTIONS] [PATTERN] [ROOT]",
   "args": [
     {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": []},
     {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": []},
     {"field": "pattern", "type": "Text", "default": "\"\"", "positional": { "display":"PATTERN", "many":false }, "flags": []},
-    {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []}
+    {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []},
+    {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]}
   ],
   "mutually_exclusive": []
 },

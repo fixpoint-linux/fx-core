@@ -576,7 +576,14 @@ fn buildStageInner(
 pub fn buildPlan(gpa: Allocator, line: []const u8) ShellError![]eval.Stage {
     const stage_tokens = try tokenizeStages(gpa, line);
     defer freeStageTokens(gpa, stage_tokens);
+    return buildPlanTokens(gpa, stage_tokens);
+}
 
+/// buildPlan over ALREADY-TOKENIZED stage token lists.  The redirect-aware
+/// caller needs this: it strips the redirect tokens first (parseRedirs), so
+/// re-tokenizing the raw line would re-introduce `>` and `>>` as if they were
+/// stage names.
+pub fn buildPlanTokens(gpa: Allocator, stage_tokens: []const StageTok) ShellError![]eval.Stage {
     if (stage_tokens.len == 0) {
         std.debug.print("fx-shell: no stages in line (empty or comment-only)\n", .{});
         return error.NoStages;
@@ -628,6 +635,141 @@ pub fn buildPlan(gpa: Allocator, line: []const u8) ShellError![]eval.Stage {
 extern "c" fn fork() std.c.pid_t;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn _exit(status: c_int) noreturn;
+
+
+// ---------------------------------------------------------------------------
+// U9 — redirects (RUN mode only)
+// ---------------------------------------------------------------------------
+//
+// REDIRECTS ARE RAW: they write files WITHOUT a derivation-log entry.  A shell
+// writes files, full stop.  So `fx-ls /tmp > listing.txt` creates a file that
+// `fx-why listing.txt` knows NOTHING about (unlike `fx-cp`, which logs an
+// effect).  That is deliberate: it keeps the operator semantics honest — `|`
+// means "just run", and if a `|`-line sometimes mutated the global effect log
+// it would not be "just run" any more.  KNOWN PROVENANCE HOLE, documented in
+// concept.md; the natural future landing spot is "a redirect inside a `|>`
+// record line becomes part of the derivation" — NOT implemented.
+//
+// v1 grammar, on the LINE (the classic simple-shell reading):
+//   < FILE   the FIRST stage's stdin
+//   > FILE   the LAST stage's stdout (truncate-create)
+//   >> FILE  the LAST stage's stdout (append)
+//   2> FILE  the LAST stage's stderr
+//   2>&1     the LAST stage's stderr onto its stdout
+// A redirect is recognised only as a WHOLE token (`>` alone), so a filename or
+// pattern containing '>' is unaffected.  In RECORD mode a redirect is REJECTED
+// loudly: what a redirected derivation MEANS is a design question, not an
+// oversight.
+
+pub const Redirs = struct {
+    stdin: ?[]const u8 = null,
+    stdout: ?[]const u8 = null,
+    stdout_append: bool = false,
+    stderr: ?[]const u8 = null,
+    stderr_to_stdout: bool = false,
+
+    pub fn any(self: Redirs) bool {
+        return self.stdin != null or self.stdout != null or
+            self.stderr != null or self.stderr_to_stdout;
+    }
+};
+
+pub const RedirError = error{BadRedirect} || TokenizeError;
+
+/// Split redirect tokens OUT of the stage token lists.  Returns the remaining
+/// tokens (still one list per stage) plus the line's Redirs.  The caller owns
+/// both the input and the output token lists (this allocates new copies only
+/// for the surviving tokens; the input is freed by the caller as usual).
+pub fn parseRedirs(gpa: Allocator, stages: []const StageTok) RedirError!struct {
+    stages: []StageTok,
+    redirs: Redirs,
+} {
+    var out = std.ArrayList(StageTok).empty;
+    errdefer {
+        for (out.items) |st| {
+            for (st.toks) |t| gpa.free(t);
+            gpa.free(st.toks);
+        }
+        out.deinit(gpa);
+    }
+    var redirs: Redirs = .{};
+
+    for (stages) |st| {
+        var kept = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (kept.items) |t| gpa.free(t);
+            kept.deinit(gpa);
+        }
+        var i: usize = 0;
+        while (i < st.toks.len) : (i += 1) {
+            const t = st.toks[i];
+            const is_op = std.mem.eql(u8, t, ">") or std.mem.eql(u8, t, ">>") or
+                std.mem.eql(u8, t, "<") or std.mem.eql(u8, t, "2>") or
+                std.mem.eql(u8, t, "2>>") or std.mem.eql(u8, t, "2>&1");
+            if (!is_op) {
+                const dup = gpa.dupe(u8, t) catch return error.NoMem;
+                kept.append(gpa, dup) catch {
+                    gpa.free(dup);
+                    return error.NoMem;
+                };
+                continue;
+            }
+            if (std.mem.eql(u8, t, "2>&1")) {
+                redirs.stderr_to_stdout = true;
+                continue;
+            }
+            // every other operator needs a target token
+            if (i + 1 >= st.toks.len) return error.BadRedirect;
+            const target = st.toks[i + 1];
+            i += 1;
+            if (std.mem.eql(u8, t, "<")) {
+                redirs.stdin = target;
+            } else if (std.mem.eql(u8, t, ">")) {
+                redirs.stdout = target;
+                redirs.stdout_append = false;
+            } else if (std.mem.eql(u8, t, ">>")) {
+                redirs.stdout = target;
+                redirs.stdout_append = true;
+            } else if (std.mem.eql(u8, t, "2>")) {
+                redirs.stderr = target;
+            } else if (std.mem.eql(u8, t, "2>>")) {
+                redirs.stderr = target;
+            }
+        }
+        const kept_slice = kept.toOwnedSlice(gpa) catch return error.NoMem;
+        out.append(gpa, .{ .op = st.op, .toks = kept_slice }) catch {
+            for (kept_slice) |t| gpa.free(t);
+            gpa.free(kept_slice);
+            return error.NoMem;
+        };
+    }
+    return .{ .stages = out.toOwnedSlice(gpa) catch return error.NoMem, .redirs = redirs };
+}
+
+pub fn freeRedirStages(gpa: Allocator, stages: []StageTok) void {
+    freeStageTokens(gpa, stages);
+}
+
+/// Open a redirect target (child side, so a failure is that stage's, not the
+/// parent's).  Returns -1 on failure.
+fn openRedirTarget(path: []const u8, append: bool, read_only: bool, all_z: [][4096:0]u8, n: *usize) std.c.fd_t {
+    if (n.* >= all_z.len) return -1;
+    var buf = &all_z[n.*];
+    if (path.len + 1 > buf.len) return -1;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    n.* += 1;
+    const flags: c_int = if (read_only)
+        O_RDONLY_R
+    else if (append)
+        (O_WRONLY | O_CREAT | O_APPEND)
+    else
+        (O_WRONLY | O_CREAT | O_TRUNC);
+    return open(buf.ptr, flags, 0o644);
+}
+
+const O_APPEND: c_int = 0o2000;
+const O_RDONLY_R: c_int = 0;
 
 /// Build the child argv for one stage IN RUN MODE.  Returns a NULL-terminated
 /// slice of NUL-terminated strings (caller frees each + the slice).
@@ -685,20 +827,56 @@ fn childExec(
     stdout_fd: std.c.fd_t,
     argv: []?[*:0]const u8,
     all_pipes: []const [2]std.c.fd_t,
+    redirs: Redirs,
+    is_first: bool,
+    is_last: bool,
 ) noreturn {
+    // Redirect targets are opened HERE, in the child, so a failure is that
+    // stage's status rather than the parent's.  The NUL-terminated copies live
+    // in a stack scratch (the child does not allocate).
+    var zscratch: [3][4096:0]u8 = undefined;
+    const zs: [][4096:0]u8 = &zscratch;
+    var zn: usize = 0;
+    var eff_stdin = stdin_fd;
+    var eff_stdout = stdout_fd;
+    var want_stderr_to_stdout = false;
+    if (is_first) {
+        if (redirs.stdin) |path| {
+            const fd = openRedirTarget(path, false, true, zs, &zn);
+            if (fd < 0) _exit(1); // an unreadable input is a clean per-stage error
+            eff_stdin = fd;
+        }
+    }
+    if (is_last) {
+        if (redirs.stdout) |path| {
+            const fd = openRedirTarget(path, redirs.stdout_append, false, zs, &zn);
+            if (fd < 0) _exit(1); // an unwritable target is a clean per-stage error
+            eff_stdout = fd;
+        }
+        want_stderr_to_stdout = redirs.stderr_to_stdout;
+    }
     // close every pipe fd we are not deliberately keeping, or the pipes never
     // see EOF (each child would hold a write end of every later pipe)
     for (all_pipes) |p| {
-        if (p[0] != stdin_fd and p[0] != stdout_fd) _ = std.c.close(p[0]);
-        if (p[1] != stdin_fd and p[1] != stdout_fd) _ = std.c.close(p[1]);
+        if (p[0] != eff_stdin and p[0] != eff_stdout and p[0] != 2) _ = std.c.close(p[0]);
+        if (p[1] != eff_stdin and p[1] != eff_stdout and p[1] != 2) _ = std.c.close(p[1]);
     }
-    if (stdin_fd != 0) {
-        if (std.c.dup2(stdin_fd, 0) < 0) _exit(127);
-        _ = std.c.close(stdin_fd);
+    if (eff_stdin != 0) {
+        if (std.c.dup2(eff_stdin, 0) < 0) _exit(127);
+        _ = std.c.close(eff_stdin);
     }
-    if (stdout_fd != 1) {
-        if (std.c.dup2(stdout_fd, 1) < 0) _exit(127);
-        _ = std.c.close(stdout_fd);
+    if (eff_stdout != 1) {
+        if (std.c.dup2(eff_stdout, 1) < 0) _exit(127);
+        _ = std.c.close(eff_stdout);
+    }
+    // stderr last: `2>&1` must see the FINAL stdout, and an explicit `2> FILE`
+    // wins over the merge.
+    if (is_last and redirs.stderr != null) {
+        const fd = openRedirTarget(redirs.stderr.?, false, false, zs, &zn);
+        if (fd < 0) _exit(1);
+        _ = std.c.dup2(fd, 2);
+    } else if (want_stderr_to_stdout) {
+        _ = std.c.dup2(1, 2);
     }
     _ = execvp(argv[0].?, @ptrCast(argv.ptr));
     _exit(127); // execvp failed (127 = not found, the shell convention)
@@ -706,7 +884,7 @@ fn childExec(
 
 /// Run a plan in RUN MODE.  Returns the LAST stage's exit status.  Nothing is
 /// interned and nothing is recorded — that is the point of `|`.
-pub fn runPipes(plan: []const eval.Stage, bin_dir: []const u8, gpa: Allocator) !u8 {
+pub fn runPipes(plan: []const eval.Stage, bin_dir: []const u8, redirs: Redirs, gpa: Allocator) !u8 {
     const n = plan.len;
     if (n == 0) return error.NoStages;
 
@@ -741,7 +919,7 @@ pub fn runPipes(plan: []const eval.Stage, bin_dir: []const u8, gpa: Allocator) !
         const stdout_fd: std.c.fd_t = if (i == n - 1) 1 else pipes[i][1];
         const pid = fork();
         if (pid < 0) return error.ForkFailed;
-        if (pid == 0) childExec(stdin_fd, stdout_fd, argvs[i], pipes);
+        if (pid == 0) childExec(stdin_fd, stdout_fd, argvs[i], pipes, redirs, i == 0, i == n - 1);
         pids[i] = pid;
     }
 
@@ -788,12 +966,13 @@ pub fn runByMode(
     input: []const u8,
     state_dir: []const u8,
     bin_dir: []const u8,
+    redirs: Redirs,
     gpa: Allocator,
     io: std.Io,
 ) !Outcome {
     return switch (mode) {
         .record => .{ .recorded = try eval.run(plan, input, state_dir, bin_dir, gpa, io) },
-        .pipe => .{ .streamed = try runPipes(plan, bin_dir, gpa) },
+        .pipe => .{ .streamed = try runPipes(plan, bin_dir, redirs, gpa) },
     };
 }
 
@@ -830,14 +1009,30 @@ pub fn runLine(
     const stage_toks = try tokenizeStages(gpa, line);
     defer freeStageTokens(gpa, stage_toks);
     const mode = lineMode(stage_toks);
-    // buildPlan re-tokenizes internally; it is cheap and keeps one code path
-    // for the typecheck (the plan must be identical in both modes).
-    const plan = try buildPlan(gpa, line);
+
+    // Redirects are a RUN-mode feature.  What a REDIRECTED DERIVATION means is
+    // a design question (should the write land in the effect log? should the
+    // bytes be part of the derivation?), so record mode rejects one loudly
+    // rather than silently picking an answer.
+    const parsed = try parseRedirs(gpa, stage_toks);
+    defer freeRedirStages(gpa, parsed.stages);
+    if (parsed.redirs.any() and mode == .record) {
+        std.debug.print(
+            "fx-shell: a redirect is not supported on a '|>' (record) line — what a redirected derivation means is undecided; use '|' to just run it\n",
+            .{},
+        );
+        return error.RedirectInRecordMode;
+    }
+
+    // Build from the REDIRECT-STRIPPED tokens (re-tokenizing the raw line here
+    // would feed `>`/`>>` back in as if they were stage names).  The typecheck
+    // is identical in both modes: the operator never changes what is accepted.
+    const plan = try buildPlanTokens(gpa, parsed.stages);
     defer {
         for (plan) |*st| freeStage(gpa, st);
         gpa.free(plan); // freeStage frees each stage's argv, not the slice
     }
-    return runByMode(mode, plan, input, state_dir, bin_dir, gpa, io);
+    return runByMode(mode, plan, input, state_dir, bin_dir, parsed.redirs, gpa, io);
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,4 +1584,48 @@ test "run-mode argv: the ROLE decides the plan token, user tokens ride verbatim"
     try check(a, "find", &.{"/tmp"}, &.{ "/bin/fx-find", "/tmp", "--rows" });
     // basename: text_operand — bin + '-' (stdin) + the SUFFIX user token
     try check(a, "basename", &.{".txt"}, &.{ "/bin/fx-basename", "-", ".txt" });
+}
+
+test "redirects: operators are stripped from the stage tokens into Redirs" {
+    // A redirect is recognised ONLY as a whole token, so a pattern or filename
+    // containing '>' is untouched.  The tokens must leave the stage list, or
+    // buildPlan would treat '>' as a stage name (which is exactly what
+    // happened before parseRedirs fed the stripped lists into buildPlanTokens).
+    const gpa = testing.allocator;
+    const Case = struct { in: []const u8, want_toks: []const []const u8, red: Redirs };
+    const cases = [_]Case{
+        .{ .in = "sort", .want_toks = &.{"sort"}, .red = .{} },
+        .{ .in = "sort > out", .want_toks = &.{"sort"}, .red = .{ .stdout = "out" } },
+        .{ .in = "sort >> out", .want_toks = &.{"sort"}, .red = .{ .stdout = "out", .stdout_append = true } },
+        .{ .in = "sort < in", .want_toks = &.{"sort"}, .red = .{ .stdin = "in" } },
+        .{ .in = "sort 2> err", .want_toks = &.{"sort"}, .red = .{ .stderr = "err" } },
+        .{ .in = "sort 2>&1", .want_toks = &.{"sort"}, .red = .{ .stderr_to_stdout = true } },
+        // a > that is part of a TOKEN is not an operator
+        .{ .in = "grep 'a>b' f", .want_toks = &.{ "grep", "a>b", "f" }, .red = .{} },
+        // the operator may sit anywhere among the tokens
+        .{ .in = "sort -r < in", .want_toks = &.{ "sort", "-r" }, .red = .{ .stdin = "in" } },
+    };
+    for (cases) |c| {
+        const toks = try tokenizeStages(gpa, c.in);
+        defer freeStageTokens(gpa, toks);
+        const parsed = try parseRedirs(gpa, toks);
+        defer freeRedirStages(gpa, parsed.stages);
+        try testing.expectEqual(@as(usize, 1), parsed.stages.len);
+        try testing.expectEqual(c.want_toks.len, parsed.stages[0].toks.len);
+        for (c.want_toks, parsed.stages[0].toks) |w, g| try testing.expectEqualStrings(w, g);
+        try testing.expectEqualStrings(c.red.stdin orelse "", parsed.redirs.stdin orelse "");
+        try testing.expectEqualStrings(c.red.stdout orelse "", parsed.redirs.stdout orelse "");
+        try testing.expectEqual(c.red.stdout_append, parsed.redirs.stdout_append);
+        try testing.expectEqualStrings(c.red.stderr orelse "", parsed.redirs.stderr orelse "");
+        try testing.expectEqual(c.red.stderr_to_stdout, parsed.redirs.stderr_to_stdout);
+    }
+}
+
+test "redirects: a dangling operator is a loud error" {
+    // `sort >` has no target.  Silently treating the missing target as "" would
+    // open a path named "" — a confusing failure far from the cause.
+    const gpa = testing.allocator;
+    const toks = try tokenizeStages(gpa, "sort >");
+    defer freeStageTokens(gpa, toks);
+    try testing.expectError(error.BadRedirect, parseRedirs(gpa, toks));
 }
