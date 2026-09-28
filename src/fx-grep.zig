@@ -39,16 +39,17 @@
 // `name_glob` (the schema's RENAME NOTE; `{ name = "*.zig" }` is now an
 // unknown field).
 //
-// POSIX STAYS HAND-PARSED (the fx-seq precedent): -name/-maxdepth are
-// single-dash MULTI-CHAR tokens, inexpressible in the v1 flag vocabulary
-// (a short is exactly "-<c>", a long "--<name>"), so schemas/grep.dhall's
-// posix.flags carries ONLY the plain long `--rows` and the generated
-// cli_grep.parsePosix binds positionals plus that one flag.  Replacing the
-// hand parser with it would silently strip -name/-maxdepth from the POSIX
-// surface.  Options IS the generated cli_grep.Options (the shared type), and
-// the schema-completed RECORD form is differential-tested against it below;
-// when the vocabulary grows a single-dash long-word form, the generated
-// parser takes over and the POSIX-vs-record matrix lands (the seq flip).
+// MIGRATION STATUS (COMPLETE — the ls/du precedent, the seq flip done): the
+// FORMER vocabulary gap is closed: U1 grew the generator a single-dash
+// multi-char short token (-name/-maxdepth, never clustered), so
+// schemas/grep.dhall's posix.flags carries them as plain Value flags and
+// cli_grep.parsePosix binds the whole POSIX surface.  parsePosixArgs below is
+// the generated parser (aliased), the hand parser is DELETED, and the
+// schema-completed RECORD form is differential-tested against it through the
+// shared runner cli.expectPosixEqualsRecord (the matrix below).  Deliberate
+// strengthening over the hand parser: a THIRD bare operand is
+// error.UnexpectedOperand where the hand parser silently overwrote root —
+// no caller relied on the old behaviour.
 //
 // The regex uses the datalog-dafsa subset (literals incl. \xHH, ., [..], *,
 // +, ?, |, (); NO ^ $ anchors, backrefs, {n,m}, lookaround).  Matching is
@@ -91,47 +92,18 @@ extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_sta
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model — GENERATED shape (single source of truth:
-// schemas/grep.dhall).  maxdepth is u64 there (Dhall Natural); the walk
-// compares depths against it directly.  The POSIX parser STAYS HAND (the
-// fx-seq precedent — see the header); only the TYPE is shared.
+// CLI option model — GENERATED (single source of truth: schemas/grep.dhall,
+// both arg forms).  maxdepth is u64 there (Dhall Natural); the walk compares
+// depths against it directly.  The POSIX parser is the generated one too —
+// -name/-maxdepth are plain Value flags on the multi-char short now (the
+// header's MIGRATION STATUS).
 // ---------------------------------------------------------------------------
 
 const Options = cli_grep.Options;
 
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    var pattern_seen = false;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-name") and i + 1 < args.len) {
-            i += 1;
-            o.name_glob = try gpa.dupe(u8, args[i]);
-        } else if (std.mem.eql(u8, a, "-maxdepth") and i + 1 < args.len) {
-            i += 1;
-            o.maxdepth = std.fmt.parseInt(u64, args[i], 10) catch {
-                std.debug.print("fx-grep: bad -maxdepth '{s}'\n", .{args[i]});
-                return error.BadMaxdepth;
-            };
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-grep: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else if (!pattern_seen) {
-            o.pattern = try gpa.dupe(u8, a);
-            pattern_seen = true;
-        } else {
-            o.root = try gpa.dupe(u8, a);
-        }
-    }
-    if (!pattern_seen) {
-        std.debug.print("fx-grep: missing PATTERN\n", .{});
-        return error.MissingPattern;
-    }
-    return o;
-}
+// The POSIX parser IS the generated one now (both arg forms derive from
+// schemas/grep.dhall; the hand parser this alias replaces is deleted).
+const parsePosixArgs = cli_grep.parsePosix;
 
 // ---------------------------------------------------------------------------
 // Glob matcher (supports '*' and '?')
@@ -388,18 +360,19 @@ test "evalDhallArgs missing pattern rejected" {
 }
 
 // ---------------------------------------------------------------------------
-// THE DIFFERENTIAL TEST — record-side half + the flagless-POSIX pin (the
-// fx-seq template; see the header for why the POSIX parser stays hand)
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls STEP-2 template)
 // ---------------------------------------------------------------------------
 //
 // The generated cli_grep.Options (schemas/grep.dhall ty) is the SAME type both
-// sides produce.  Record-form vectors drive the schema completion
-// ((dflt // user) : ty, cli.completeSrc), rendered back to a record literal
-// (cli.renderDhallRecord) through THIS file's evalDhallArgs and compared
-// field-for-field against the generated Options.  The POSIX side is pinned to
-// the generated parser's FLAGLESS subset (operands only): the hand parser must
-// keep accepting exactly what the generated one would, plus the -name/-maxdepth
-// flags the schema vocabulary cannot spell.
+// sides produce, and BOTH arg forms are schema-generated now.  For a matrix
+// of POSIX argv vectors, the generated parser must produce the SAME Options
+// as the Dhall-record form of the same user intent, driven through the schema
+// completion ((dflt // user) : ty, cli.completeSrc), rendered back to a
+// record literal (cli.renderDhallRecord) and evaluated by THIS file's
+// evalDhallArgs — the exact runtime path `fx-grep '{ ... }'` takes.  Both
+// sides are re-encoded to the canonical term_to_json wire shape (the SHARED
+// comptime-reflection encoder cli.encodeOptionsWire) and compared as strings,
+// so the assertion is exact and FIELD-COMPLETE by construction.
 
 fn grepSchemaSrc() [:0]u8 {
     return cli.readSchemaFile(std.testing.allocator, &.{ "schemas/grep.dhall", "fx-core/schemas/grep.dhall" }) catch
@@ -417,27 +390,12 @@ fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void
     defer std.testing.allocator.free(schema_src);
     var c = try cli.completeSrc(gpa, schema_src, user_record);
     defer c.deinit(gpa);
+    // The rendered record re-parses as-is: fx-cli's renderer annotates every
+    // Optional from ty (the renderfix), so the needle-splice repair this
+    // helper used to carry is obsolete.
     const rendered = try cli.renderDhallRecord(gpa, &c.value, c.ty);
     defer gpa.free(rendered);
-
-    // THE repair (the md5sum precedent, on Optionals instead of a List):
-    // copyValue strips the annotation, so renderDhallRecord can emit the
-    // Optional defaults as a BARE `None` — untypeable on re-parse ("cannot
-    // infer type of empty list"-class).  Re-add the two annotations (each
-    // field appears at most once in a rendered record).
-    const eval_src = blk: {
-        var src = rendered;
-        const fixes = [_]struct { needle: []const u8, ann: []const u8 }{
-            .{ .needle = "name_glob = None", .ann = "name_glob = None Text" },
-            .{ .needle = "maxdepth = None", .ann = "maxdepth = None Natural" },
-        };
-        for (fixes) |fx| {
-            const at = std.mem.indexOf(u8, src, fx.needle) orelse continue;
-            src = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ src[0..at], fx.ann, src[at + fx.needle.len ..] });
-        }
-        break :blk src;
-    };
-    const rendered_z = try gpa.dupeZ(u8, eval_src);
+    const rendered_z = try gpa.dupeZ(u8, rendered);
     defer gpa.free(rendered_z);
     const record_o = try evalDhallArgs(rendered_z, gpa);
 
@@ -452,12 +410,61 @@ fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void
     try std.testing.expectEqual(expected.rows, record_o.rows);
 }
 
-test "DIFFERENTIAL: schema-completed record form matches the generated Options" {
-    // Dhall spelling notes (probed against completeSrc): an Optional field
-    // must be spelled `Some v` in the user record (a bare `v` is ill-typed
-    // against `Optional ...`), and `None` is inexpressible as user input —
-    // omitting the field is how a None is spelled, and the completed render
-    // emits it (re-annotated by expectRecordEqualsOptions above).
+/// One differential vector for fx-grep — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the fx-ls STEP-3 template
+/// each migration copies): the generated parser, the schema candidates, and
+/// this file's real runtime record evaluator are the whole per-command surface.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_grep, &.{ "schemas/grep.dhall", "fx-core/schemas/grep.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: no args (root ".", pattern "" placeholder — main()'s
+    // EmptyPattern check still owns the emptiness rejection, both forms) ---
+    try expectPosixEqualsRecord(&.{"fx-grep"}, "{ }");
+
+    // --- the PATTERN positional, alone and with the root ---
+    try expectPosixEqualsRecord(&.{ "fx-grep", "pat" }, "{ pattern = \"pat\" }");
+    try expectPosixEqualsRecord(&.{ "fx-grep", "pat", "root" }, "{ pattern = \"pat\", root = \"root\" }");
+
+    // --- each new-vocabulary flag ALONE: -name / -maxdepth (the U1
+    // multi-char short, never clustered) ---
+    try expectPosixEqualsRecord(&.{ "fx-grep", "-name", "*.zig", "pat" }, "{ pattern = \"pat\", name_glob = Some \"*.zig\" }");
+    try expectPosixEqualsRecord(&.{ "fx-grep", "-maxdepth", "3", "pat" }, "{ pattern = \"pat\", maxdepth = Some 3 }");
+    try expectPosixEqualsRecord(&.{ "fx-grep", "-maxdepth", "0", "pat" }, "{ pattern = \"pat\", maxdepth = Some 0 }");
+
+    // --- combined vectors: the whole surface at once, both token orders ---
+    try expectPosixEqualsRecord(
+        &.{ "fx-grep", "-name", "*.zig", "-maxdepth", "2", "pat", "root" },
+        "{ pattern = \"pat\", root = \"root\", name_glob = Some \"*.zig\", maxdepth = Some 2 }",
+    );
+    try expectPosixEqualsRecord(
+        &.{ "fx-grep", "pat", "-maxdepth", "2", "-name", "*.zig", "root" },
+        "{ pattern = \"pat\", root = \"root\", name_glob = Some \"*.zig\", maxdepth = Some 2 }",
+    );
+
+    // --- --rows (the plain long) alone and combined with the new flags ---
+    try expectPosixEqualsRecord(&.{ "fx-grep", "--rows", "pat" }, "{ pattern = \"pat\", rows = True }");
+    try expectPosixEqualsRecord(
+        &.{ "fx-grep", "--rows", "-name", "*.zig", "-maxdepth", "1", "pat", "root" },
+        "{ pattern = \"pat\", root = \"root\", name_glob = Some \"*.zig\", maxdepth = Some 1, rows = True }",
+    );
+
+    // --- None-carrying completions (the U0 renderfix shape): the annotated
+    // `None ...` spellings must render, parse back, and mean the same
+    // defaults the bare argv leaves ---
+    try expectPosixEqualsRecord(
+        &.{ "fx-grep", "pat" },
+        "{ pattern = \"pat\", name_glob = None Text, maxdepth = None Natural }",
+    );
+
+    // --- `--` terminator: the flag-looking token after it is the operand ---
+    try expectPosixEqualsRecord(&.{ "fx-grep", "--", "-name" }, "{ pattern = \"-name\" }");
+}
+
+test "DIFFERENTIAL: record-side schema-completed records match the generated Options" {
+    // The record half pinned DIRECTLY against evalDhallArgs (the exact
+    // runtime path) — the Some-spelling rule and the placeholder pattern:
     // all defaults: root ".", pattern "" placeholder (still rejected by
     // main()'s EmptyPattern runtime check), both Optionals None
     try expectRecordEqualsOptions("{ }", .{});
@@ -484,44 +491,31 @@ test "DIFFERENTIAL: schema-completed record form matches the generated Options" 
     );
 }
 
-test "DIFFERENTIAL: POSIX stays hand — parity with the generated flagless subset" {
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
+    // an arena over the testing allocator (the generated parser's documented
+    // no-free-on-error discipline)
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
-    // The generated parser (flags = [] in schemas/grep.dhall) binds operands
-    // only; the hand parser must agree with it EXACTLY on that subset.
-    const gen_o = try cli_grep.parsePosix(&.{ "fx-grep", "pat", "root" }, gpa);
-    const hand_o = try parsePosixArgs(&.{ "fx-grep", "pat", "root" }, gpa);
-    try std.testing.expectEqualStrings(gen_o.pattern, hand_o.pattern);
-    try std.testing.expectEqualStrings(gen_o.root, hand_o.root);
-    try std.testing.expect(gen_o.name_glob == null and hand_o.name_glob == null);
-    try std.testing.expect(gen_o.maxdepth == null and hand_o.maxdepth == null);
+    // an unknown flag is UnknownOption (both spellings)
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-grep", "-Zz", "pat" }, gpa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-grep", "--bogus", "pat" }, gpa));
 
-    // ...and the hand parser must keep the -name/-maxdepth surface the
-    // generated vocabulary cannot express (THE reason POSIX stays hand).
-    const with_flags = try parsePosixArgs(&.{ "fx-grep", "-name", "*.zig", "-maxdepth", "2", "pat", "root" }, gpa);
-    try std.testing.expectEqualStrings("*.zig", with_flags.name_glob.?);
-    try std.testing.expectEqual(@as(?u64, 2), with_flags.maxdepth);
-    try std.testing.expectEqualStrings("pat", with_flags.pattern);
-    try std.testing.expectEqualStrings("root", with_flags.root);
+    // -name/-maxdepth consume a value: the token at the END of argv with
+    // nothing after it is MissingValue
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-grep", "-name" }, gpa));
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-grep", "-maxdepth" }, gpa));
 
-    // --rows is on the SHARED surface now (a plain long both parsers take):
-    // generated and hand forms agree on it, like the positionals.
-    const rows_gen_o = try cli_grep.parsePosix(&.{ "fx-grep", "--rows", "pat" }, gpa);
-    const rows_hand_o = try parsePosixArgs(&.{ "fx-grep", "--rows", "pat" }, gpa);
-    try std.testing.expect(rows_gen_o.rows);
-    try std.testing.expect(rows_hand_o.rows);
-    try std.testing.expectEqualStrings(rows_gen_o.pattern, rows_hand_o.pattern);
+    // a non-numeric -maxdepth is the generated parser's BadValue (the hand
+    // parser's BadMaxdepth class, generated spelling)
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-grep", "-maxdepth", "x", "pat" }, gpa));
 
-    // the generated parser still rejects every OTHER flag-shaped token
-    // (pins the gap; --rows is asserted accepted above)
-    try std.testing.expectError(error.UnknownOption, cli_grep.parsePosix(&.{ "fx-grep", "-name", "*.zig" }, gpa));
-    try std.testing.expectError(error.UnknownOption, cli_grep.parsePosix(&.{ "fx-grep", "-maxdepth", "2" }, gpa));
-
-    // a third operand overflows the generated single-slot bindings (the
-    // deliberate strengthening over the hand parser's last-wins root)
-    try std.testing.expectError(error.UnexpectedOperand, cli_grep.parsePosix(&.{ "fx-grep", "a", "b", "c" }, gpa));
+    // a THIRD bare operand overflows the generated single-slot bindings (the
+    // deliberate strengthening over the hand parser's last-wins root — the
+    // hand parser this replaced overwrote root silently; nothing calls it
+    // that way)
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-grep", "a", "b", "c" }, gpa));
 
     // the record form's own rejections, at completion time: unknown field
     // (the old `name` spelling is gone — the RENAME NOTE converged it onto
@@ -532,6 +526,31 @@ test "DIFFERENTIAL: POSIX stays hand — parity with the generated flagless subs
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ pattern = \"x\", name = \"*.zig\" }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ pattern = \"x\", maxdepth = 2 }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ pattern = \"x\", maxdepth = -1 }"));
+}
+
+test "parsePosixArgs binds the new-vocabulary flags (generated)" {
+    // an arena over the testing allocator (the generated parser's documented
+    // no-free-on-error discipline)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // the hand parser's spellings, now through the generated parser: -name,
+    // maxdepth coercion, pattern/root slots, the multi-char shorts never
+    // cluster
+    const o = try parsePosixArgs(&.{ "fx-grep", "-name", "*.zig", "-maxdepth", "2", "pat", "root" }, gpa);
+    try std.testing.expectEqualStrings("*.zig", o.name_glob.?);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
+    try std.testing.expectEqualStrings("pat", o.pattern);
+    try std.testing.expectEqualStrings("root", o.root);
+
+    // defaults unchanged (the empty pattern is main()'s rejection, kept)
+    const dflt = try parsePosixArgs(&.{"fx-grep"}, gpa);
+    try std.testing.expectEqualStrings("", dflt.pattern);
+    try std.testing.expectEqualStrings(".", dflt.root);
+    try std.testing.expect(dflt.name_glob == null);
+    try std.testing.expect(dflt.maxdepth == null);
+    try std.testing.expect(!dflt.rows);
 }
 
 // ---------------------------------------------------------------------------

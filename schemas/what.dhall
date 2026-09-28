@@ -1,10 +1,11 @@
 -- schemas/what.dhall — the single source of truth for the fx-what command
 -- interface.
 --
---   ty    fx-what has NO runtime Dhall arg form (parsePosixArgs only,
---         fx-what.zig:52-71 — main never dispatches on a leading '{'), so
---         there is no record surface to mirror; the Options struct
---         (fx-what.zig:41-48) is projected directly:
+--   ty    fx-what has BOTH arg forms since the U5 migration: main dispatches
+--         on a leading '{' (fx-what.zig:445, the fx-du/fx-ls branch) and the
+--         record form is completed against this schema by the shared
+--         evaluator; the POSIX side is the generated parser (cli_what).
+--         The Options struct (fx-what.zig:41-48) is projected directly:
 --         `operand : []const u8` — REQUIRED, no struct default.  A single
 --         positional must bind a plain Text field (validateBindings,
 --         fx-clijson.zig:488), so it is Text with the "" placeholder
@@ -21,13 +22,14 @@
 --         keeps its real Optional too.
 --   dflt  operand = "" (placeholder), as_of = None Natural,
 --         store = None Text — the struct's defaults verbatim.
---   posix fx-what.zig:52-71 parsePosixArgs: the operand is REQUIRED and
---         must be argv[1] in the hand parser (flags cannot precede it);
---         --as-of N / --store DIR are kind Value (next-token consumers,
---         u32-parsed / bare); anything else is error.UnknownArg.  The
---         generated parser accepts flags in any position (the deliberate
---         strengthening surface) and binds PATH through its positional
---         slot.
+--   posix the generated parser (cli_what, the U5 migration): --as-of N /
+--         --store DIR are kind Value (next-token consumers, Natural-parsed /
+--         bare); PATH binds through the positional slot; anything else is
+--         error.UnknownOption.  The hand parser this replaced required the
+--         operand at argv[1] (flags could not precede it) — the generated
+--         parser accepts flags in any position (the deliberate strengthening
+--         surface).  The missing-PATH check stays in main() (the placeholder
+--         default above).
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 

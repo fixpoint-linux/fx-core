@@ -48,6 +48,7 @@ pub const ParseError = error{
 /// dupes on success; on error earlier dupes are not freed (same
 /// discipline as the hand parsers this replaces).
 pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
+    var type_filter_seen = false; // selector family repeat guard
     var next_pos: usize = 0; // next single-positional slot to fill
     var o = Options{};
     var i: usize = 1;
@@ -63,6 +64,48 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             continue;
         }
         var matched = false;
+        if (!matched and (std.mem.eql(u8, a, "-name"))) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-find: option '-name' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.name_glob = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            matched = true;
+        }
+        if (!matched and (std.mem.eql(u8, a, "-maxdepth"))) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-find: option '-maxdepth' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.maxdepth = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("fx-find: option '-maxdepth': '{s}' is not a Natural (u64)\n", .{ args[i] });
+                return error.BadValue;
+            };
+            matched = true;
+        }
+        if (!matched and (std.mem.eql(u8, a, "-type"))) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-find: option '-type' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            if (type_filter_seen) {
+                std.debug.print("fx-find: option '-type' may appear only once\n", .{});
+                return error.Conflict;
+            }
+            if (std.mem.eql(u8, args[i], "f")) {
+                o.type_filter = .File;
+            } else if (std.mem.eql(u8, args[i], "d")) {
+                o.type_filter = .Dir;
+            } else {
+                std.debug.print("fx-find: option '-type': '{s}' is not one of: d, f\n", .{ args[i] });
+                return error.BadValue;
+            }
+            type_filter_seen = true;
+            matched = true;
+        }
         if (!matched and (std.mem.eql(u8, a, "--rows"))) {
             o.rows = true;
             matched = true;
@@ -103,6 +146,24 @@ test "cli_find: empty argv yields the dflt defaults" {
     try std.testing.expectEqual(false, o.rows);
 }
 
+test "cli_find: -name binds name_glob" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "-name", "v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.name_glob.?);
+}
+
+test "cli_find: -maxdepth binds maxdepth" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "-maxdepth", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(u64, 7), o.maxdepth.?);
+}
+
 test "cli_find: --rows binds rows" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -110,6 +171,40 @@ test "cli_find: --rows binds rows" {
     const argv = [_][]const u8{ "fx-find", "--rows" };
     const o = try parsePosix(&argv, gpa);
     try std.testing.expect(o.rows);
+}
+
+test "cli_find: -type f binds type_filter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "-type", "f" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expect(o.type_filter == .File);
+}
+
+test "cli_find: -type d binds type_filter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "-type", "d" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expect(o.type_filter == .Dir);
+}
+
+test "cli_find: -type with unknown value rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "-type", "zzz" };
+    try std.testing.expectError(error.BadValue, parsePosix(&argv, gpa));
+}
+
+test "cli_find: -type repeated rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-find", "-type", "f", "-type", "d" };
+    try std.testing.expectError(error.Conflict, parsePosix(&argv, gpa));
 }
 
 test "cli_find: operand binds root" {

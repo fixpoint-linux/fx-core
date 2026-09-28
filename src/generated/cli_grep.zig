@@ -63,6 +63,27 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             continue;
         }
         var matched = false;
+        if (!matched and (std.mem.eql(u8, a, "-name"))) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-grep: option '-name' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.name_glob = gpa.dupe(u8, args[i]) catch return error.OutOfMemory;
+            matched = true;
+        }
+        if (!matched and (std.mem.eql(u8, a, "-maxdepth"))) {
+            if (i + 1 >= args.len) {
+                std.debug.print("fx-grep: option '-maxdepth' requires a value\n", .{});
+                return error.MissingValue;
+            }
+            i += 1;
+            o.maxdepth = std.fmt.parseInt(u64, args[i], 10) catch {
+                std.debug.print("fx-grep: option '-maxdepth': '{s}' is not a Natural (u64)\n", .{ args[i] });
+                return error.BadValue;
+            };
+            matched = true;
+        }
         if (!matched and (std.mem.eql(u8, a, "--rows"))) {
             o.rows = true;
             matched = true;
@@ -107,6 +128,24 @@ test "cli_grep: empty argv yields the dflt defaults" {
     try std.testing.expectEqualStrings("", o.pattern);
     try std.testing.expectEqualStrings(".", o.root);
     try std.testing.expectEqual(false, o.rows);
+}
+
+test "cli_grep: -name binds name_glob" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-grep", "-name", "v" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqualStrings("v", o.name_glob.?);
+}
+
+test "cli_grep: -maxdepth binds maxdepth" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-grep", "-maxdepth", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(u64, 7), o.maxdepth.?);
 }
 
 test "cli_grep: --rows binds rows" {

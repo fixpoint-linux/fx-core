@@ -39,15 +39,17 @@ pub const ParseError = error{
 /// dupes on success; on error earlier dupes are not freed (same
 /// discipline as the hand parsers this replaces).
 pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
-    _ = gpa;
-    const o = Options{};
+    var next_pos: usize = 0; // next single-positional slot to fill
+    var ops = std.ArrayList([]const u8).empty;
+    errdefer ops.deinit(gpa);
+    var o = Options{};
     var i: usize = 1;
     var after_ddash = false;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (after_ddash) {
-            std.debug.print("fx-seq: unexpected operand '{s}'\n", .{ a });
-            return error.UnexpectedOperand;
+            try bindOperand(a, &o, &next_pos, gpa, &ops);
+            continue;
         }
         if (std.mem.eql(u8, a, "--")) {
             after_ddash = true;
@@ -57,14 +59,58 @@ pub fn parsePosix(args: []const []const u8, gpa: Allocator) ParseError!Options {
             std.debug.print("fx-seq: unknown option '{s}'\n", .{ a });
             return error.UnknownOption;
         }
-        std.debug.print("fx-seq: unexpected operand '{s}'\n", .{ a });
-        return error.UnexpectedOperand;
+        try bindOperand(a, &o, &next_pos, gpa, &ops);
+    }
+    // counts remap: dispatch by operand TOTAL (bindOperand collected)
+    if (ops.items.len > 0) {
+        switch (ops.items.len) {
+            1 => {
+                o.last = std.fmt.parseInt(i64, ops.items[0], 10) catch {
+                    std.debug.print("fx-seq: option 'LAST': '{s}' is not an Integer (i64)\n", .{ ops.items[0] });
+                    return error.BadValue;
+                };
+            },
+            2 => {
+                o.first = std.fmt.parseInt(i64, ops.items[0], 10) catch {
+                    std.debug.print("fx-seq: option 'FIRST': '{s}' is not an Integer (i64)\n", .{ ops.items[0] });
+                    return error.BadValue;
+                };
+                o.last = std.fmt.parseInt(i64, ops.items[1], 10) catch {
+                    std.debug.print("fx-seq: option 'LAST': '{s}' is not an Integer (i64)\n", .{ ops.items[1] });
+                    return error.BadValue;
+                };
+            },
+            3 => {
+                o.first = std.fmt.parseInt(i64, ops.items[0], 10) catch {
+                    std.debug.print("fx-seq: option 'FIRST': '{s}' is not an Integer (i64)\n", .{ ops.items[0] });
+                    return error.BadValue;
+                };
+                o.inc = std.fmt.parseInt(i64, ops.items[1], 10) catch {
+                    std.debug.print("fx-seq: option 'INC': '{s}' is not an Integer (i64)\n", .{ ops.items[1] });
+                    return error.BadValue;
+                };
+                o.last = std.fmt.parseInt(i64, ops.items[2], 10) catch {
+                    std.debug.print("fx-seq: option 'LAST': '{s}' is not an Integer (i64)\n", .{ ops.items[2] });
+                    return error.BadValue;
+                };
+            },
+            else => {
+                std.debug.print("fx-seq: unexpected operand '{s}'\n", .{ ops.items[ops.items.len - 1] });
+                return error.UnexpectedOperand;
+            },
+        }
     }
     return o;
 }
 
+fn bindOperand(arg: []const u8, o: *Options, next_pos: *usize, gpa: Allocator, ops: *std.ArrayList([]const u8)) ParseError!void {
+    _ = o;
+    _ = next_pos; // the counts remap dispatches by operand TOTAL
+    ops.append(gpa, arg) catch return error.OutOfMemory;
+}
+
 pub fn usage() []const u8 {
-    return "usage: fx-seq\n";
+    return "usage: fx-seq [FIRST] [INC] [LAST]\n";
 }
 
 test "cli_seq: empty argv yields the dflt defaults" {
@@ -76,6 +122,66 @@ test "cli_seq: empty argv yields the dflt defaults" {
     try std.testing.expectEqual(@as(i64, 1), o.first);
     try std.testing.expectEqual(@as(i64, 1), o.inc);
     try std.testing.expectEqual(@as(i64, 0), o.last);
+}
+
+test "cli_seq: operand binds first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-seq", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(i64, 7), o.last);
+    try std.testing.expectEqual(@as(i64, 1), o.first);
+    try std.testing.expectEqual(@as(i64, 1), o.inc);
+}
+
+test "cli_seq: 2 operands bind by counts remap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-seq", "7", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(i64, 7), o.first);
+    try std.testing.expectEqual(@as(i64, 7), o.last);
+    try std.testing.expectEqual(@as(i64, 1), o.inc);
+}
+
+test "cli_seq: 3 operands bind by counts remap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-seq", "7", "7", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(i64, 7), o.first);
+    try std.testing.expectEqual(@as(i64, 7), o.inc);
+    try std.testing.expectEqual(@as(i64, 7), o.last);
+}
+
+test "cli_seq: operand binds first (numeric)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-seq", "7", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(i64, 7), o.first);
+}
+
+test "cli_seq: operand binds inc (numeric)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-seq", "7", "7", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(i64, 7), o.inc);
+}
+
+test "cli_seq: operand binds last (numeric)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    const argv = [_][]const u8{ "fx-seq", "7" };
+    const o = try parsePosix(&argv, gpa);
+    try std.testing.expectEqual(@as(i64, 7), o.last);
 }
 
 test "cli_seq: unknown option rejected" {

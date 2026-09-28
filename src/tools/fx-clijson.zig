@@ -31,6 +31,24 @@
 //                                             (Natural -> u64, Integer -> i64)
 //                                             / parseFloat (Double)
 //   Enum "<ctor>"  union-ctor selector     -> o.<field> = .<ctor>
+//                  + value = Some "<argv spelling>" turns it into a
+//                  VALUE-CONSUMING selector ("-type f" -> .File): one flags
+//                  entry PER ALTERNATIVE sharing the token and field (a
+//                  selector FAMILY).  The merged arm takes the next argv
+//                  token (a long axis also the --long=value tail), selects
+//                  the ctor by value equality, fails error.BadValue on an
+//                  unknown value and error.Conflict on a repeat (the
+//                  built-in <field>_seen guard — no mutually_exclusive
+//                  group needed).  A bare union or Optional <union> field.
+//
+// SHORT TOKENS: a short is any single-dash token of 2+ chars, "--" never —
+// the classic "-<c>" AND the multi-char "-name" (find/grep).  A multi-char
+// short NEVER clusters (clusterLetter requires len == 2) and the clustering
+// pre-pass carries an exact-match guard: a token some flag spells exactly
+// skips the letter scan entirely, so "-max" cannot decompose into "-m -a
+// -x" when those single-char shorts exist (the guard bytes are emitted only
+// when a multi-char short is declared — schemas without one keep the exact
+// v1 pre-pass bytes).
 //
 // MUTUAL EXCLUSION: each mutually_exclusive group is compiled to a seen-bitset
 // check — when a flag in a group matches and any OTHER member's bit is already
@@ -54,13 +72,25 @@
 // the STEP-2+ differential tests must not assert its old rejection.
 // Operands that begin with '-' still need `--` (strict-getopt parity).
 //
-// POSITIONALS: single (many=False) Text fields fill in declared order (an
-// operand beyond the single slots is error.UnexpectedOperand); a many=True
-// List Text positional (must be last) accumulates every remaining operand
-// into a gpa-owned slice.  v1 operands are optional-or-many (their ty fields
-// carry defaults in dflt).  REQUIRED operands (fx-mv style) need one
-// vocabulary addition and land with the mutator batch (STEP 3) — noted in the
-// handoff.
+// POSITIONALS: single (many=False) slots fill in declared order (an
+// operand beyond the single slots is error.UnexpectedOperand) and may bind
+// a Text field (gpa-duped) OR a numeric one — Natural -> u64, Integer ->
+// i64, each optionally Optional (the seq/log/undo shapes); the COERCION is
+// driven by the ty field type, so the Positional record gains nothing.  A
+// many=True List Text positional (must be last) accumulates every remaining
+// operand into a gpa-owned slice.  v1 operands are optional-or-many (their
+// ty fields carry defaults in dflt).  REQUIRED operands (fx-mv style) need
+// one vocabulary addition and land with the mutator batch (STEP 3) — noted
+// in the handoff.
+//
+// COUNTS REMAP (Positional.counts : Optional (List Natural), the seq
+// shape): the operand TOTALS this slot participates in.  When any slot
+// declares counts, bindOperand only COLLECTS the operands and the parser
+// dispatches after the walk: for total T the slots whose counts contains T
+// (counts-less slots always) bind the T operands in DECLARED order — seq's
+// 1=LAST / 2=FIRST LAST / 3=FIRST INC LAST.  Validation rejects many+counts,
+// totals outside 1..n, duplicates, and any total whose participating-slot
+// count is not exactly T.
 //
 // BUILD WIRING (the STEP-1 decision): generated files are COMMITTED, and the
 // `zig build gen-cli-check` step (wired into `zig build test`) re-runs this
@@ -409,6 +439,25 @@ fn mutexTogether(s: *const cli.Schema, ai: usize, bi: usize) bool {
     return false;
 }
 
+/// True for a VALUE-CONSUMING enum selector alternative: kind Enum carrying
+/// value = Some "<argv spelling>" (the "-type f" shape).  Its argumentless
+/// sibling (value = None, the 91 existing sites) stays a plain selector.
+fn isSelector(f: cli.Flag) bool {
+    return f.kind == .enum_ and f.value != null;
+}
+
+/// True if a and b are two alternatives of ONE selector family: the same
+/// field, both Enum + Some(value), and the same TOKEN AXIS — a family with
+/// both spellings (short = Some "-type", long = Some "--type") gets TWO
+/// merged arms, one per axis, each guarded by the shared <field>_seen.
+fn sameSelectorFamily(a: cli.Flag, b: cli.Flag) bool {
+    if (!isSelector(a) or !isSelector(b)) return false;
+    if (!std.mem.eql(u8, a.field, b.field)) return false;
+    if (a.short != null and b.short != null and std.mem.eql(u8, a.short.?, b.short.?)) return true;
+    if (a.long != null and b.long != null and std.mem.eql(u8, a.long.?, b.long.?)) return true;
+    return false;
+}
+
 fn validateBindings(s: *const cli.Schema) GenError!void {
     if (s.posix.flags.len > 32)
         return fail("{d} flags: more than 32 is not supported in v1", .{s.posix.flags.len});
@@ -430,8 +479,12 @@ fn validateBindings(s: *const cli.Schema) GenError!void {
         if (f.short == null and f.long == null)
             return fail("posix.flags[{d}] ('{s}'): one of short/long must be Some", .{ fi, f.field });
         if (f.short) |sh| {
-            if (sh.len != 2 or sh[0] != '-' or sh[1] == '-')
-                return fail("posix.flags[{d}]: short '{s}' must be exactly \"-<c>\" (no clustering in v1)", .{ fi, sh });
+            // a short is any SINGLE-dash token of 2+ chars ("-", never
+            // "--"): the classic "-<c>" AND the multi-char "-name" shape
+            // (find/grep).  Multi-char shorts NEVER cluster (clusterLetter
+            // still requires len == 2).
+            if (sh.len < 2 or !std.mem.startsWith(u8, sh, "-") or std.mem.startsWith(u8, sh, "--"))
+                return fail("posix.flags[{d}]: short '{s}' must be a single-dash token \"-<c>\"/\"-<word>\" (no \"--\")", .{ fi, sh });
         }
         if (f.long) |l| {
             if (!std.mem.startsWith(u8, l, "--") or l.len <= 2)
@@ -451,35 +504,65 @@ fn validateBindings(s: *const cli.Schema) GenError!void {
                     return fail("flag '{s}': kind Value does not read the value field", .{flagToken(f)});
             },
             .enum_ => |ctor| {
-                if (fty.* != .union_)
+                // a selector (Enum + value = Some) may bind an Optional
+                // union field (find's type_filter) — its emitted arm
+                // assigns through the optional; an ARGUMENTLESS Enum keeps
+                // the v1 rule (a bare union field)
+                const eff = if (isSelector(f) and fty.* == .optional) fty.optional else fty;
+                if (eff.* != .union_)
                     return fail("flag '{s}': kind Enum binds a non-union field", .{flagToken(f)});
                 var found = false;
-                for (fty.union_) |alt| {
+                for (eff.union_) |alt| {
                     if (std.mem.eql(u8, alt, ctor)) found = true;
                 }
                 if (!found)
                     return fail("flag '{s}': Enum selects '{s}', not an alternative of the field's union", .{ flagToken(f), ctor });
-                if (f.value != null)
-                    return fail("flag '{s}': kind Enum does not read the value field", .{flagToken(f)});
+                // value = Some "<argv spelling>" turns the Enum into a
+                // VALUE-CONSUMING selector alternative ("-type f" -> ctor);
+                // value = None keeps the argumentless v1 selector.
+                if (f.value != null and f.value.?.len == 0)
+                    return fail("flag '{s}': selector value must be a non-empty argv spelling", .{flagToken(f)});
+                // a selector needs its spelling to be unique within its
+                // family (the emitted arm selects by eql against it)
+                if (isSelector(f)) {
+                    for (s.posix.flags, 0..) |o, oi| {
+                        if (oi == fi) continue;
+                        if (!sameSelectorFamily(f, o)) continue;
+                        if (std.mem.eql(u8, f.value.?, o.value.?))
+                            return fail("flag '{s}': duplicate selector value '{s}'", .{ flagToken(f), f.value.? });
+                    }
+                }
             },
         }
     }
 
-    // duplicate tokens across flags
+    // duplicate tokens across flags.  EXEMPT: two alternatives of one
+    // selector family share their token BY DESIGN ("-type f" / "-type d"
+    // are two flags entries binding one field) — everything else still
+    // rejects.
     for (s.posix.flags, 0..) |a, i| {
         for (s.posix.flags[i + 1 ..]) |b| {
-            if (a.short != null and b.short != null and std.mem.eql(u8, a.short.?, b.short.?))
+            if (a.short != null and b.short != null and std.mem.eql(u8, a.short.?, b.short.?)) {
+                if (sameSelectorFamily(a, b)) continue;
                 return fail("duplicate short flag '{s}'", .{a.short.?});
-            if (a.long != null and b.long != null and std.mem.eql(u8, a.long.?, b.long.?))
+            }
+            if (a.long != null and b.long != null and std.mem.eql(u8, a.long.?, b.long.?)) {
+                if (sameSelectorFamily(a, b)) continue;
                 return fail("duplicate long flag '{s}'", .{a.long.?});
+            }
         }
     }
 
     // two flags binding the same field must share a mutually_exclusive group
-    // (otherwise last-wins silently — exactly the drift the schema kills)
+    // (otherwise last-wins silently — exactly the drift the schema kills).
+    // EXEMPT: a selector family's alternatives bind the same field BY DESIGN
+    // — its merged arm carries a built-in <field>_seen repeat guard
+    // (error.Conflict), and a mutex group cannot even express the pair
+    // (duplicate-member check below rejects a [-type, -type] group).
     for (s.posix.flags, 0..) |a, i| {
         for (s.posix.flags[i + 1 ..]) |b| {
             if (!std.mem.eql(u8, a.field, b.field)) continue;
+            if (sameSelectorFamily(a, b)) continue;
             var shares_group = false;
             for (s.posix.mutually_exclusive) |grp| {
                 var has_a = false;
@@ -495,18 +578,65 @@ fn validateBindings(s: *const cli.Schema) GenError!void {
         }
     }
 
-    // positionals
+    // positionals.  A many=False slot binds a Text field (v1) OR a numeric
+    // one (Natural -> u64, Integer -> i64, each optionally Optional — the
+    // seq/log/undo shapes): the COERCION is driven by the ty field type,
+    // so the Positional record itself gains nothing.
+    //
+    // counts + many ANYWHERE in one schema is rejected: the counts remap
+    // defers ALL binding to the operand-TOTAL dispatcher (bindOperand only
+    // collects), so a many sibling's append never runs — its list is dead
+    // state, the emitted bindOperand carries an unused parameter (which
+    // does not even compile).  Declaring the many tail's semantics under a
+    // remap is v2 growth (review SHOULD-FIX 3); no schema uses both today.
+    {
+        var any_counts = false;
+        var any_many = false;
+        for (s.posix.positionals) |p| {
+            if (p.counts != null) any_counts = true;
+            if (p.many) any_many = true;
+        }
+        if (any_counts and any_many)
+            return fail("positional schema mixes counts (arity remap) with a many positional: a remap dispatches by operand TOTAL and cannot express a many tail (v2 growth); declare one or the other", .{});
+    }
     for (s.posix.positionals, 0..) |p, pi| {
         const fty = s.ty.findField(p.field) orelse
             return fail("posix.positionals[{d}]: binds unknown ty field '{s}'", .{ pi, p.field });
+        if (p.counts != null and p.many)
+            return fail("positional '{s}': counts (arity remap) and many cannot combine", .{p.field});
         if (p.many) {
             if (fty.* != .list or fty.list.* != .text)
                 return fail("positional '{s}' (many=True): field type must be List Text", .{p.field});
             if (pi + 1 != s.posix.positionals.len)
                 return fail("positional '{s}' (many=True) must be the last positional", .{p.field});
         } else {
-            if (fty.* != .text)
-                return fail("positional '{s}' (many=False): field type must be Text", .{p.field});
+            switch (fty.*) {
+                .text, .natural, .integer => {},
+                .optional => |inner| switch (inner.*) {
+                    .text, .natural, .integer => {},
+                    else => return fail("positional '{s}' (many=False): field type must be Text/Natural/Integer (optionally Optional)", .{p.field}),
+                },
+                else => return fail("positional '{s}' (many=False): field type must be Text/Natural/Integer (optionally Optional)", .{p.field}),
+            }
+        }
+        // counts = the operand TOTALS this slot participates in: distinct,
+        // and within 1..n where n is the number of non-many positionals (a
+        // total above n leaves an operand unbound — the strict walk already
+        // rejects it with UnexpectedOperand, so the remap cannot exceed it).
+        if (p.counts) |cs| {
+            var singles: usize = 0;
+            for (s.posix.positionals) |q| {
+                if (q.many) break;
+                singles += 1;
+            }
+            for (cs, 0..) |c, ci| {
+                if (c < 1 or c > singles)
+                    return fail("positional '{s}': counts total {d} is outside 1..{d} (the non-many positional slots)", .{ p.field, c, singles });
+                for (cs[ci + 1 ..]) |c2| {
+                    if (c == c2)
+                        return fail("positional '{s}': duplicate counts total {d}", .{ p.field, c });
+                }
+            }
         }
         // a field is bound by a flag XOR a positional, never both
         for (s.posix.flags) |f| {
@@ -521,13 +651,54 @@ fn validateBindings(s: *const cli.Schema) GenError!void {
         }
     }
 
+    // counts coverage: for every operand TOTAL T in 1..n (n = non-many
+    // slots), exactly T slots must participate — more leaves operands
+    // unbound, fewer would need a slot to take two operands.  Only checked
+    // when any slot declares counts (a counts-less schema participates
+    // uniformly, which is always exactly T).
+    {
+        var any_counts = false;
+        for (s.posix.positionals) |p| {
+            if (p.counts != null) {
+                any_counts = true;
+                break;
+            }
+        }
+        if (any_counts) {
+            var singles: usize = 0;
+            for (s.posix.positionals) |p| {
+                if (p.many) break;
+                singles += 1;
+            }
+            var total: usize = 1;
+            while (total <= singles) : (total += 1) {
+                var participants: usize = 0;
+                for (s.posix.positionals) |p| {
+                    if (p.many) break;
+                    if (inCount(p, @intCast(total))) participants += 1;
+                }
+                if (participants != total)
+                    return fail("counts remap: operand total {d} has {d} participating slots (needs exactly {d})", .{ total, participants, total });
+            }
+        }
+    }
+
     // mutually_exclusive groups
     for (s.posix.mutually_exclusive, 0..) |grp, gi| {
         if (grp.len < 2)
             return fail("mutually_exclusive[{d}]: a group needs at least two flags", .{gi});
         for (grp, 0..) |nm, ni| {
-            if (flagIndex(s, nm) == null)
+            const gf = flagIndex(s, nm) orelse
                 return fail("mutually_exclusive[{d}][{d}]: '{s}' names no flag", .{ gi, ni, nm });
+            // a group member naming a VALUE-CONSUMING selector is dead code:
+            // the family's merged arm is the ONLY arm that matches its token
+            // and it never sets a `seen` bit, so the group's Conflict check
+            // cannot fire.  The family's built-in <field>_seen guard already
+            // gives "-type f -type d" -> error.Conflict; anything more a
+            // group would add (e.g. -type + -m) is better rejected here than
+            // silently unenforced (review SHOULD-FIX 1).
+            if (isSelector(s.posix.flags[gf]))
+                return fail("mutually_exclusive[{d}][{d}]: '{s}' names a value-consuming selector (kind Enum + value); a selector family carries its own repeat guard and cannot join a group", .{ gi, ni, nm });
             for (grp[ni + 1 ..]) |other| {
                 if (std.mem.eql(u8, nm, other))
                     return fail("mutually_exclusive[{d}]: duplicate member '{s}'", .{ gi, nm });
@@ -812,9 +983,13 @@ fn valueBindingSrc(gpa: Allocator, disp: []const u8, f: cli.Flag, fty: *const cl
 
 /// The letter a flag contributes to short clustering: its single argumentless
 /// short (Flag/Enum kinds — a Value short never clusters; its value boundary
-/// would be ambiguous, so `-n7` stays UnknownOption).
+/// would be ambiguous, so `-n7` stays UnknownOption).  A VALUE-CONSUMING
+/// selector (Enum + value = Some, the "-type f" shape) does not cluster
+/// either — its argv value would be swallowed — and neither does a
+/// multi-char short (len != 2): `-name` is a token, not a letter cluster.
 fn clusterLetter(f: cli.Flag) ?u8 {
     if (f.kind == .value) return null;
+    if (isSelector(f)) return null;
     const sh = f.short orelse return null;
     if (sh.len != 2) return null;
     return sh[1];
@@ -880,6 +1055,217 @@ fn emitFlagBody(gpa: Allocator, disp: []const u8, s: *const cli.Schema, fi: usiz
         out.appendSlice(gpa, line.items) catch return error.OutOfMemory;
     }
     return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
+/// The merged arm for one value-consuming enum selector FAMILY AXIS: the
+/// alternatives sharing the head flag's token axis (short or long), field
+/// and Enum+Some(value) kind.  Consumes the next argv token, rejects a
+/// repeat via the family's built-in <field>_seen guard (error.Conflict),
+/// selects the constructor by argv-value equality and rejects an unknown
+/// value with error.BadValue.  Emitted at the 12-space arm indent, in place
+/// of the per-alternative arms a non-selector flag would get.
+fn emitSelectorFamilyArm(out: *Out, gpa: Allocator, disp: []const u8, s: *const cli.Schema, head: usize, comptime axis: enum { short, long }) GenError!void {
+    const f = s.posix.flags[head];
+    const tok = if (axis == .short) f.short.? else f.long.?;
+    const eq_len = try std.fmt.allocPrint(gpa, "{d}", .{tok.len + 1});
+    defer gpa.free(eq_len);
+    const etok = try zigEscape(gpa, tok);
+    defer gpa.free(etok);
+    const id = try ident(gpa, f.field);
+    defer if (id.ptr != f.field.ptr) gpa.free(id);
+    const seen_name = try std.fmt.allocPrint(gpa, "{s}_seen", .{f.field});
+    const seen_id = try ident(gpa, seen_name);
+    // NOT freed before its last use (ident returns seen_name verbatim when
+    // bare; the arena reclaims it at emit exit — freeing early reuses the
+    // region and the later puts read dangling memory)
+
+    // alternatives in schema order (the arm's if/else-if chain), plus their
+    // argv spellings sorted for the not-one-of diagnostic (deterministic).
+    // ctor idents are NOT freed before their last use (the seen_id NOTE
+    // above): a quoted ctor's ident is a fresh allocation, and freeing it
+    // mid-loop lets the next iteration's allocs reuse the region — the arm
+    // would then embed garbage bytes (review blocker).  Freed together
+    // after the arm is emitted, comparing pointers as everywhere else.
+    var ctors: [32][]const u8 = undefined;
+    var raws: [32][]const u8 = undefined;
+    var vals: [32][]const u8 = undefined;
+    var sorted: [32][]const u8 = undefined;
+    var n: usize = 0;
+    for (s.posix.flags) |m| {
+        if (!sameSelectorFamily(f, m)) continue;
+        ctors[n] = try ident(gpa, m.kind.enum_);
+        raws[n] = m.kind.enum_;
+        vals[n] = m.value.?;
+        sorted[n] = m.value.?;
+        n += 1;
+    }
+    var k: usize = 1;
+    while (k < n) : (k += 1) {
+        const v = sorted[k];
+        var j = k;
+        while (j > 0 and std.mem.order(u8, sorted[j - 1], v) == .gt) : (j -= 1) sorted[j] = sorted[j - 1];
+        sorted[j] = v;
+    }
+
+    // the arm condition: the exact token; a long-axis family also matches
+    // the inline --long=value spelling (Value-long parity)
+    try out.put("        if (!matched and (std.mem.eql(u8, a, \"");
+    try out.put(etok);
+    try out.put("\")");
+    if (axis == .long) {
+        try out.put(" or std.mem.startsWith(u8, a, \"");
+        try out.put(etok);
+        try out.put("=\")");
+    }
+    try out.put(")) {\n");
+    // the value: the next argv token, or the long's =tail when inline
+    if (axis == .long) {
+        try out.put("            var v: []const u8 = undefined;\n");
+        try out.put("            if (std.mem.startsWith(u8, a, \"");
+        try out.put(etok);
+        try out.put("=\")) {\n");
+        try out.put("                v = a[");
+        try out.put(eq_len);
+        try out.put("..];\n");
+        try out.put("            } else if (i + 1 >= args.len) {\n");
+        try out.put("                std.debug.print(\"");
+        try out.put(disp);
+        try out.put(": option '");
+        try out.put(etok);
+        try out.put("' requires a value\\n\", .{});\n");
+        try out.put("                return error.MissingValue;\n");
+        try out.put("            } else {\n");
+        try out.put("                i += 1;\n");
+        try out.put("                v = args[i];\n");
+        try out.put("            }\n");
+    } else {
+        try out.put("            if (i + 1 >= args.len) {\n");
+        try out.put("                std.debug.print(\"");
+        try out.put(disp);
+        try out.put(": option '");
+        try out.put(etok);
+        try out.put("' requires a value\\n\", .{});\n");
+        try out.put("                return error.MissingValue;\n");
+        try out.put("            }\n");
+        try out.put("            i += 1;\n");
+    }
+    const vexpr: []const u8 = if (axis == .long) "v" else "args[i]";
+    try out.put("            if (");
+    try out.put(seen_id);
+    try out.put(") {\n");
+    try out.put("                std.debug.print(\"");
+    try out.put(disp);
+    try out.put(": option '");
+    try out.put(etok);
+    try out.put("' may appear only once\\n\", .{});\n");
+    try out.put("                return error.Conflict;\n");
+    try out.put("            }\n");
+    for (ctors[0..n], vals[0..n], 0..) |cid, val, ai| {
+        const eval = try zigEscape(gpa, val);
+        defer gpa.free(eval);
+        try out.put(if (ai == 0) "            if (std.mem.eql(u8, " else "            } else if (std.mem.eql(u8, ");
+        try out.put(vexpr);
+        try out.put(", \"");
+        try out.put(eval);
+        try out.put("\")) {\n");
+        try out.put("                o.");
+        try out.put(id);
+        try out.put(" = .");
+        try out.put(cid);
+        try out.put(";\n");
+    }
+    try out.put("            } else {\n");
+    try out.put("                std.debug.print(\"");
+    try out.put(disp);
+    try out.put(": option '");
+    try out.put(etok);
+    try out.put("': '{s}' is not one of: ");
+    for (sorted[0..n], 0..) |val, si| {
+        if (si > 0) try out.put(", ");
+        const eval = try zigEscape(gpa, val);
+        defer gpa.free(eval);
+        try out.put(eval);
+    }
+    try out.put("\\n\", .{ ");
+    try out.put(vexpr);
+    try out.put(" });\n");
+    try out.put("                return error.BadValue;\n");
+    try out.put("            }\n");
+    try out.put("            ");
+    try out.put(seen_id);
+    try out.put(" = true;\n");
+    try out.put("            matched = true;\n");
+    try out.put("        }\n");
+    for (ctors[0..n], raws[0..n]) |cid, raw| {
+        if (cid.ptr != raw.ptr) gpa.free(cid);
+    }
+    gpa.free(seen_name);
+    if (seen_id.ptr != seen_name.ptr) gpa.free(seen_id);
+}
+
+/// One single-positional binding: the assignment (and, for numeric fields,
+/// the parseInt coercion with the badValueMsg-style diagnostic) at the
+/// `ind` indent.  `val` is the value expression ("arg" or "ops.items[k]");
+/// the COERCION target comes from the field's ty (validateBindings already
+/// rejected everything but Text/Natural/Integer, each optionally Optional).
+fn putPositionalBinding(out: *Out, gpa: Allocator, disp: []const u8, p: cli.Positional, fty: *const cli.TypeExpr, val: []const u8, ind: []const u8, ind2: []const u8) GenError!void {
+    const id = try ident(gpa, p.field);
+    defer if (id.ptr != p.field.ptr) gpa.free(id);
+    const etok = try zigEscape(gpa, p.display);
+    defer gpa.free(etok);
+    var ity = fty;
+    if (fty.* == .optional) ity = fty.optional;
+    switch (ity.*) {
+        .text => {
+            try out.put(ind);
+            try out.put("o.");
+            try out.put(id);
+            try out.put(" = gpa.dupe(u8, ");
+            try out.put(val);
+            try out.put(") catch return error.OutOfMemory;\n");
+        },
+        .natural, .integer => {
+            const zty: []const u8 = if (ity.* == .natural) "u64" else "i64";
+            const what: []const u8 = if (ity.* == .natural) "is not a Natural (u64)" else "is not an Integer (i64)";
+            try out.put(ind);
+            try out.put("o.");
+            try out.put(id);
+            try out.put(" = std.fmt.parseInt(");
+            try out.put(zty);
+            try out.put(", ");
+            try out.put(val);
+            try out.put(", 10) catch {\n");
+            // same diagnostic WORDING as badValueMsg (which bakes the
+            // 16-space Value-arm indent — unusable here without drifting
+            // the 56 committed emissions), at this context's indent
+            try out.put(ind2);
+            try out.put("std.debug.print(\"");
+            try out.put(disp);
+            try out.put(": option '");
+            try out.put(etok);
+            try out.put("': '{s}' ");
+            try out.put(what);
+            try out.put("\\n\", .{ ");
+            try out.put(val);
+            try out.put(" });\n");
+            try out.put(ind2);
+            try out.put("return error.BadValue;\n");
+            try out.put(ind);
+            try out.put("};\n");
+        },
+        else => unreachable, // validateBindings rejected the field type
+    }
+}
+
+/// True when the positional participates in a `total`-operand argv form:
+/// counts-less slots participate in every total, counts-carrying ones only
+/// in the totals they list.
+fn inCount(p: cli.Positional, total: u64) bool {
+    const cs = p.counts orelse return true;
+    for (cs) |c| {
+        if (c == total) return true;
+    }
+    return false;
 }
 
 /// Append `src` to `out`, prefixing every non-empty line with `depth` extra
@@ -960,10 +1346,66 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         }
         break :blk null;
     };
+    // the counts remap (any positional carrying counts) collects operands
+    // into `ops` during the walk and dispatches by operand TOTAL after it —
+    // this holds the dispatcher's source until then (null: no counts)
+    var pending_counts_dispatch: ?[]const u8 = null;
+    var any_counts = false;
+    for (s.posix.positionals) |p| {
+        if (p.counts != null) {
+            any_counts = true;
+            break;
+        }
+    }
     const many_id: ?[]const u8 = if (many) |m| try ident(gpa, m.field) else null;
     defer if (many_id) |mid| {
         if (many != null and mid.ptr != many.?.field.ptr) gpa.free(mid);
     };
+    // Build the counts-remap dispatcher BEFORE the argv loop is emitted (it
+    // is spliced right after the loop's closing brace): for total T the
+    // case binds the participating slots — counts contains T, or none
+    // declared — to the collected operands in DECLARED order.
+    if (any_counts) {
+        var singles_n: usize = 0;
+        for (s.posix.positionals) |p| {
+            if (p.many) break;
+            singles_n += 1;
+        }
+        var disp_src = std.ArrayList(u8).empty;
+        errdefer disp_src.deinit(gpa);
+        var dout = Out{ .gpa = gpa, .buf = disp_src };
+        try dout.put("    // counts remap: dispatch by operand TOTAL (bindOperand collected)\n");
+        try dout.put("    if (ops.items.len > 0) {\n");
+        try dout.put("        switch (ops.items.len) {\n");
+        var t: usize = 1;
+        while (t <= singles_n) : (t += 1) {
+            var bound: usize = 0;
+            var opened = false;
+            for (s.posix.positionals) |p| {
+                if (p.many) break;
+                if (!inCount(p, @intCast(t))) continue;
+                if (!opened) {
+                    try dout.print("            {d} => {{\n", .{t});
+                    opened = true;
+                }
+                const fty2 = s.ty.findField(p.field).?;
+                const idx = try std.fmt.allocPrint(gpa, "ops.items[{d}]", .{bound});
+                defer gpa.free(idx);
+                try putPositionalBinding(&dout, gpa, disp, p, fty2, idx, "                ", "                    ");
+                bound += 1;
+            }
+            if (opened) try dout.put("            },\n");
+        }
+        try dout.put("            else => {\n");
+        try dout.put("                std.debug.print(\"");
+        try dout.put(edisp);
+        try dout.put(": unexpected operand '{s}'\\n\", .{ ops.items[ops.items.len - 1] });\n");
+        try dout.put("                return error.UnexpectedOperand;\n");
+        try dout.put("            },\n");
+        try dout.put("        }\n");
+        try dout.put("    }\n");
+        pending_counts_dispatch = dout.buf.items;
+    }
 
     try out.put(
         \\
@@ -1016,6 +1458,36 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
     if (!gpa_used) try out.put("    _ = gpa;\n");
 
     if (has_groups) try out.put("    var seen: u32 = 0; // bit i set once flags[i] matched\n");
+    // one <field>_seen boolean per value-consuming selector family (the
+    // family's built-in repeat guard — error.Conflict on "-type f -type d")
+    {
+        var done: [32][]const u8 = undefined;
+        var nd: usize = 0;
+        for (s.posix.flags) |f| {
+            if (!isSelector(f)) continue;
+            var already = false;
+            for (done[0..nd]) |d| {
+                if (std.mem.eql(u8, d, f.field)) already = true;
+            }
+            if (already) continue;
+            done[nd] = f.field;
+            nd += 1;
+            const seen_name = try std.fmt.allocPrint(gpa, "{s}_seen", .{f.field});
+            const seen_id = try ident(gpa, seen_name);
+            // NOTE: seen_name is intentionally NOT freed before use — ident
+            // returns it verbatim when it is a bare id, and freeing first
+            // lets the line-building allocs below reuse that exact region
+            // (@memcpy alias panic; the arena reclaims it at emit exit)
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "    var ");
+            try line.appendSlice(gpa, seen_id);
+            try line.appendSlice(gpa, " = false; // selector family repeat guard\n");
+            try out.put(line.items);
+            gpa.free(seen_name);
+            if (seen_id.ptr != seen_name.ptr) gpa.free(seen_id);
+        }
+    }
     if (many_id) |mid| {
         var line = std.ArrayList(u8).empty;
         defer line.deinit(gpa);
@@ -1028,6 +1500,12 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         try out.put(line.items);
     }
     if (has_pos) try out.put("    var next_pos: usize = 0; // next single-positional slot to fill\n");
+    if (any_counts) {
+        // operand collector for the counts remap (bindOperand appends; the
+        // dispatcher after the argv loop binds by operand TOTAL)
+        try out.put("    var ops = std.ArrayList([]const u8).empty;\n");
+        try out.put("    errdefer ops.deinit(gpa);\n");
+    }
     // `const o` when nothing can mutate it (no flags, no positionals —
     // caught by the meta_noflags gate fixture)
     if (has_flags or has_pos) {
@@ -1046,6 +1524,7 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
     // operand-or-reject inside the after-ddash arm
     if (has_pos) {
         try out.put("            try bindOperand(a, &o, &next_pos, gpa");
+        if (any_counts) try out.put(", &ops");
         if (many_id) |mid| {
             var line = std.ArrayList(u8).empty;
             defer line.deinit(gpa);
@@ -1086,7 +1565,57 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
             }
         }
         if (any_clusterable) {
+            // EXACT-MATCH GUARD (the #1 silent-wrong hazard): a multi-char
+            // short ("-name") whose every letter happens to be an
+            // argumentless single-char short of this schema ("-n","-a",
+            // "-m","-e") would be wrongly DECOMPOSED into those bindings.
+            // A token that some flag spells EXACTLY is that flag's token,
+            // never a cluster.  The guard bytes are emitted ONLY when a
+            // multi-char short exists, so every counts/selector-free schema
+            // (all 56 committed ones) keeps its byte-identical pre-pass.
+            var any_multichar_short = false;
+            for (s.posix.flags) |mf| {
+                if (mf.short) |msh| {
+                    if (msh.len > 2) {
+                        any_multichar_short = true;
+                        break;
+                    }
+                }
+            }
             try out.put("        if (a.len > 2 and a[0] == '-' and a[1] != '-') {\n");
+            // EXACT-MATCH GUARD, take 2: the letter loop BINDS as a side
+            // effect of its scan, so `cluster = false` after the fact is
+            // too late — the token must never ENTER the loop.  With any
+            // multi-char short present, the loop runs under an inner `if`
+            // whose condition excludes every exact multi-char token (a
+            // bare `else` would need to skip `cluster` too, and the token
+            // still has to fall through to the arms below — which it does,
+            // `cluster` stays true only via the loop).
+            if (any_multichar_short) {
+                try out.put("            if (");
+                var first_guard = true;
+                for (s.posix.flags, 0..) |mf, mi| {
+                    const msh = mf.short orelse continue;
+                    if (msh.len <= 2) continue;
+                    // a selector family shares its token across members —
+                    // the guard needs it once
+                    var dup = false;
+                    for (s.posix.flags[0..mi]) |pf| {
+                        if (pf.short) |psh| {
+                            if (psh.len > 2 and std.mem.eql(u8, psh, msh)) dup = true;
+                        }
+                    }
+                    if (dup) continue;
+                    if (!first_guard) try out.put(" and ");
+                    first_guard = false;
+                    const emsh = try zigEscape(gpa, msh);
+                    defer gpa.free(emsh);
+                    try out.put("!std.mem.eql(u8, a, \"");
+                    try out.put(emsh);
+                    try out.put("\")");
+                }
+                try out.put(") {\n");
+            }
             try out.put("            var cluster = true;\n");
             try out.put("            for (a[1..]) |ch| {\n");
             try out.put("                var letter_matched = false;\n");
@@ -1114,9 +1643,31 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
             try out.put("                if (!letter_matched) cluster = false;\n");
             try out.put("            }\n");
             try out.put("            if (cluster) continue;\n");
+            if (any_multichar_short) try out.put("            }\n");
             try out.put("        }\n");
         }
         for (s.posix.flags, 0..) |f, fi| {
+            // a value-consuming selector FAMILY emits ONE merged arm per
+            // token axis at its head (the first member carrying that axis);
+            // the other members contribute none (their token, field and
+            // guard all live in that arm)
+            if (isSelector(f)) {
+                if (f.short != null) {
+                    var is_head = true;
+                    for (s.posix.flags[0..fi]) |prev| {
+                        if (prev.short != null and sameSelectorFamily(f, prev)) is_head = false;
+                    }
+                    if (is_head) try emitSelectorFamilyArm(out, gpa, disp, s, fi, .short);
+                }
+                if (f.long != null) {
+                    var is_head = true;
+                    for (s.posix.flags[0..fi]) |prev| {
+                        if (prev.long != null and sameSelectorFamily(f, prev)) is_head = false;
+                    }
+                    if (is_head) try emitSelectorFamilyArm(out, gpa, disp, s, fi, .long);
+                }
+                continue;
+            }
             const fty = s.ty.findField(f.field).?;
             const id = try ident(gpa, f.field);
             defer if (id.ptr != f.field.ptr) gpa.free(id);
@@ -1219,6 +1770,7 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         try out.put(": unknown option '{s}'\\n\", .{ a });\n                return error.UnknownOption;\n            }\n");
         if (has_pos) {
             try out.put("            try bindOperand(a, &o, &next_pos, gpa");
+            if (any_counts) try out.put(", &ops");
             if (many_id) |mid| {
                 var line = std.ArrayList(u8).empty;
                 defer line.deinit(gpa);
@@ -1242,6 +1794,7 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         try out.put(": unknown option '{s}'\\n\", .{ a });\n            return error.UnknownOption;\n        }\n");
         if (has_pos) {
             try out.put("        try bindOperand(a, &o, &next_pos, gpa");
+            if (any_counts) try out.put(", &ops");
             if (many_id) |mid| {
                 var line = std.ArrayList(u8).empty;
                 defer line.deinit(gpa);
@@ -1259,6 +1812,9 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
     }
 
     try out.put("    }\n");
+    if (pending_counts_dispatch) |dsrc| {
+        try out.put(dsrc);
+    }
     if (many_id) |mid| {
         var line = std.ArrayList(u8).empty;
         defer line.deinit(gpa);
@@ -1285,6 +1841,7 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
     // ---- bindOperand helper (emitted only when positionals exist) ----------
     if (has_pos) {
         try out.put("\nfn bindOperand(arg: []const u8, o: *Options, next_pos: *usize, gpa: Allocator");
+        if (any_counts) try out.put(", ops: *std.ArrayList([]const u8)");
         if (many_id) |mid| {
             var line = std.ArrayList(u8).empty;
             defer line.deinit(gpa);
@@ -1303,6 +1860,25 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
             // many-only schema: o/next_pos are never read — discard them
             try out.put("    _ = o;\n    _ = next_pos;\n");
         }
+        // gpa is read only by a Text single (the dupe), the many list, or
+        // the counts remap's ops collector — an all-numeric, counts-less
+        // positional schema (log/undo) never touches it (Zig rejects
+        // discarding a used parameter, so this must be exact)
+        {
+            var gpa_read = any_counts;
+            if (many_id != null) {
+                gpa_read = true;
+            } else if (!gpa_read) {
+                for (s.posix.positionals) |p| {
+                    if (p.many) break;
+                    const fty = s.ty.findField(p.field) orelse continue;
+                    var ity = fty;
+                    if (fty.* == .optional) ity = fty.optional;
+                    if (ity.* == .text) gpa_read = true;
+                }
+            }
+            if (!gpa_read) try out.put("    _ = gpa;\n");
+        }
         // LIMITATION (v1, for the STEP-3 mutator batch): single slots fill
         // STRICTLY IN ORDER — bindOperand cannot SKIP a slot, so with
         // positionals [A(many=False), B(many=False)] the argv `fx-x B` binds
@@ -1314,30 +1890,41 @@ fn emitParsePosix(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Sch
         // operand after the many list has begun appends to the many list
         // instead of erroring — accepted for v1 (GNU treats post-`--` tokens
         // as operands too).
-        for (s.posix.positionals, 0..) |p, pi| {
-            if (p.many) break;
-            const id = try ident(gpa, p.field);
-            defer if (id.ptr != p.field.ptr) gpa.free(id);
-            try out.print("    if (next_pos.* == {d}) {{\n", .{pi});
+        //
+        // The counts REMAP (any positional carrying counts) instead defers
+        // binding to the end of the walk: operands are collected, and after
+        // the loop the parser switches on the operand TOTAL — for total T
+        // the positionals whose counts contains T (counts-less ones always)
+        // bind the T operands in DECLARED order (the seq 1/2/3 shapes).
+        if (any_counts) {
+            // collect-only: the dispatcher (built above, spliced after the
+            // argv loop) binds by operand TOTAL
             var line = std.ArrayList(u8).empty;
             defer line.deinit(gpa);
-            try line.appendSlice(gpa, "        o.");
-            try line.appendSlice(gpa, id);
-            try line.appendSlice(gpa, " = gpa.dupe(u8, arg) catch return error.OutOfMemory;\n");
+            try line.appendSlice(gpa, "    _ = o;\n");
+            try line.appendSlice(gpa, "    _ = next_pos; // the counts remap dispatches by operand TOTAL\n");
             try out.put(line.items);
-            try out.print("        next_pos.* = {d};\n        return;\n    }}\n", .{pi + 1});
-        }
-        if (many_id) |mid| {
-            var line = std.ArrayList(u8).empty;
-            defer line.deinit(gpa);
-            try line.appendSlice(gpa, "    ");
-            try line.appendSlice(gpa, mid);
-            try line.appendSlice(gpa, "_items.append(gpa, gpa.dupe(u8, arg) catch return error.OutOfMemory) catch return error.OutOfMemory;\n}\n");
-            try out.put(line.items);
+            try out.put("    ops.append(gpa, arg) catch return error.OutOfMemory;\n}\n");
         } else {
-            try out.put("    std.debug.print(\"");
-            try out.put(edisp);
-            try out.put(": unexpected operand '{s}'\\n\", .{ arg });\n    return error.UnexpectedOperand;\n}\n");
+            for (s.posix.positionals, 0..) |p, pi| {
+                if (p.many) break;
+                const fty = s.ty.findField(p.field).?;
+                try out.print("    if (next_pos.* == {d}) {{\n", .{pi});
+                try putPositionalBinding(out, gpa, disp, p, fty, "arg", "        ", "            ");
+                try out.print("        next_pos.* = {d};\n        return;\n    }}\n", .{pi + 1});
+            }
+            if (many_id) |mid| {
+                var line = std.ArrayList(u8).empty;
+                defer line.deinit(gpa);
+                try line.appendSlice(gpa, "    ");
+                try line.appendSlice(gpa, mid);
+                try line.appendSlice(gpa, "_items.append(gpa, gpa.dupe(u8, arg) catch return error.OutOfMemory) catch return error.OutOfMemory;\n}\n");
+                try out.put(line.items);
+            } else {
+                try out.put("    std.debug.print(\"");
+                try out.put(edisp);
+                try out.put(": unexpected operand '{s}'\\n\", .{ arg });\n    return error.UnexpectedOperand;\n}\n");
+            }
         }
     }
 }
@@ -1588,16 +2175,28 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
     try out.put("    const argv = [_][]const u8{ \"");
     try out.put(disp);
     try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n");
+    var asserted_any = false;
     for (s.ty.record) |f| {
         const dv = s.dflt.findField(f.name) orelse
             return fail("dflt: record field '{s}' absent", .{f.name});
+        const before = out.buf.items.len;
         try defaultAssert(out, gpa, f.name, f.ty, &dv);
+        if (out.buf.items.len > before) asserted_any = true;
     }
+    // an all-Optional-tail schema (fx-log/fx-undo: Optional Natural
+    // positionals) asserts nothing here — defaultAssert covers Text-tail
+    // optionals only — so the parse result would go unused; keep the
+    // emission compiling without perturbing any asserted schema's bytes
+    if (!asserted_any) try out.put("    _ = o;\n");
     try out.put("}\n");
 
     // ---- one binds test per flag kind AND field shape (see bindsShapeBit) ----
     var did_shapes: u16 = 0;
     for (s.posix.flags) |f| {
+        // a value-consuming selector gets the per-family tests below, not
+        // this argumentless-shape one (driving its token alone would hit
+        // the family arm's MissingValue guard)
+        if (isSelector(f)) continue;
         const fty = s.ty.findField(f.field).?;
         const bit = bindsShapeBit(f, fty);
         if (did_shapes & bit != 0) continue;
@@ -1721,6 +2320,144 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
         try out.put("}\n");
     }
 
+    // ---- value-consuming selector family (the "-type f" shape): one test
+    // per family AXIS pinning EVERY alternative of that axis, its
+    // unknown-value reject (BadValue) and repeat reject (Conflict via
+    // <field>_seen).  The inline "tok=value" spelling is a LONG-axis-only
+    // test (the short arm has no inline-= path — emitting it for a short
+    // axis produced a test failing UnknownOption; review SHOULD-FIX 2a)
+    // ----
+    for (s.posix.flags, 0..) |f, fi| {
+        if (!isSelector(f)) continue;
+        const use_short = f.short != null and blk: {
+            for (s.posix.flags[0..fi]) |prev| {
+                if (prev.short != null and sameSelectorFamily(f, prev)) break :blk false;
+            }
+            break :blk true;
+        };
+        const use_long = f.long != null and blk: {
+            for (s.posix.flags[0..fi]) |prev| {
+                if (prev.long != null and sameSelectorFamily(f, prev)) break :blk false;
+            }
+            break :blk true;
+        };
+        if (!use_short and !use_long) continue;
+        const id = try ident(gpa, f.field);
+        defer if (id.ptr != f.field.ptr) gpa.free(id);
+
+        // both axes share one alternative list (the family is one field);
+        // each axis emits its own two-token / inline tests with ITS token
+        // (short first, matching the arm emission order)
+        var axes: [2][]const u8 = undefined;
+        var naxes: usize = 0;
+        if (use_short) {
+            axes[naxes] = f.short.?;
+            naxes += 1;
+        }
+        if (use_long) {
+            axes[naxes] = f.long.?;
+            naxes += 1;
+        }
+        for (axes[0..naxes]) |tok| {
+            const is_short_axis = f.short != null and tok.ptr == f.short.?.ptr;
+            for (s.posix.flags) |m| {
+                if (!sameSelectorFamily(f, m)) continue;
+                // this axis's alternatives: the arm's chain only includes
+                // members carrying this axis's spelling
+                if (is_short_axis and m.short == null) continue;
+                if (!is_short_axis and m.long == null) continue;
+                const cid = try ident(gpa, m.kind.enum_);
+                defer if (cid.ptr != m.kind.enum_.ptr) gpa.free(cid);
+                try out.put("\ntest \"cli_");
+                try out.put(name);
+                try out.put(": ");
+                try out.put(tok);
+                try out.put(" ");
+                try out.put(m.value.?);
+                try out.put(" binds ");
+                try out.put(f.field);
+                try out.put("\" {\n");
+                try out.put(prologue);
+                try out.put("    const argv = [_][]const u8{ \"");
+                try out.put(disp);
+                try out.put("\", \"");
+                try out.put(tok);
+                try out.put("\", \"");
+                try out.put(m.value.?);
+                try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n    try std.testing.expect(o.");
+                try out.put(id);
+                try out.put(" == .");
+                try out.put(cid);
+                try out.put(");\n}\n");
+                // the inline --long=value spelling (long axis only)
+                if (!is_short_axis) {
+                    try out.put("\ntest \"cli_");
+                    try out.put(name);
+                    try out.put(": ");
+                    try out.put(tok);
+                    try out.put("=");
+                    try out.put(m.value.?);
+                    try out.put(" binds ");
+                    try out.put(f.field);
+                    try out.put("\" {\n");
+                    try out.put(prologue);
+                    try out.put("    const argv = [_][]const u8{ \"");
+                    try out.put(disp);
+                    try out.put("\", \"");
+                    try out.put(tok);
+                    try out.put("=");
+                    try out.put(m.value.?);
+                    try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n    try std.testing.expect(o.");
+                    try out.put(id);
+                    try out.put(" == .");
+                    try out.put(cid);
+                    try out.put(");\n}\n");
+                }
+            }
+            // unknown value -> BadValue
+            try out.put("\ntest \"cli_");
+            try out.put(name);
+            try out.put(": ");
+            try out.put(tok);
+            try out.put(" with unknown value rejected\" {\n");
+            try out.put(prologue);
+            try out.put("    const argv = [_][]const u8{ \"");
+            try out.put(disp);
+            try out.put("\", \"");
+            try out.put(tok);
+            try out.put("\", \"zzz\" };\n    try std.testing.expectError(error.BadValue, parsePosix(&argv, gpa));\n}\n");
+            // repeat -> Conflict (the family's built-in seen guard)
+            try out.put("\ntest \"cli_");
+            try out.put(name);
+            try out.put(": ");
+            try out.put(tok);
+            try out.put(" repeated rejected\" {\n");
+            try out.put(prologue);
+            try out.put("    const argv = [_][]const u8{ \"");
+            try out.put(disp);
+            try out.put("\", \"");
+            try out.put(tok);
+            try out.put("\", \"");
+            try out.put(f.value.?);
+            try out.put("\", \"");
+            try out.put(tok);
+            try out.put("\", \"");
+            // a second token selecting a DIFFERENT alternative when this
+            // axis has one (both are then bound, so the seen guard is the
+            // reject)
+            var other: ?cli.Flag = null;
+            for (s.posix.flags) |m| {
+                if (!sameSelectorFamily(f, m)) continue;
+                if (std.mem.eql(u8, m.value.?, f.value.?)) continue;
+                if (is_short_axis and m.short == null) continue;
+                if (!is_short_axis and m.long == null) continue;
+                other = m;
+            }
+            try out.put(if (other) |m| m.value.? else f.value.?);
+            try out.put("\" };\n    try std.testing.expectError(error.Conflict, parsePosix(&argv, gpa));\n}\n");
+        }
+    }
+
     // ---- argv-spelling pins (review SHOULD-FIX 1: short clustering and
     // --long=value are generator vocabulary now — a test here per schema
     // exercising the shapes it has, so no migration batch can regress them
@@ -1842,8 +2579,11 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
         }
 
         for (s.posix.flags) |f| {
-            // (4) a Value short never clusters
-            if (f.kind == .value and f.short != null and nc > 0) {
+            // (4) a Value short never clusters.  Len-2 shorts only: for a
+            // multi-char short the appended letter makes a token whose
+            // letters may ALL cluster ("-maxA" with -m/-a/-x shorts),
+            // which is correct behavior, not a rejection
+            if (f.kind == .value and f.short != null and f.short.?.len == 2 and nc > 0) {
                 try out.put("\ntest \"cli_");
                 try out.put(name);
                 try out.put(": value short ");
@@ -1974,9 +2714,26 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
         try out.put(p.field);
         try out.put("\" {\n");
         try out.put(prologue);
+        // the operand literal depends on the slot's ty: a numeric field
+        // needs a numeric operand (the parseInt coercion is the shape under
+        // test), a Text field keeps "op0" (the committed bytes)
+        const fty = s.ty.findField(p.field) orelse
+            return fail("positional '{s}': binds unknown ty field", .{p.field});
+        var ity = fty;
+        if (fty.* == .optional) ity = fty.optional;
+        const numeric = ity.* == .natural or ity.* == .integer;
+        var any_counts = false;
+        for (s.posix.positionals) |q| {
+            if (q.counts != null) {
+                any_counts = true;
+                break;
+            }
+        }
         try out.put("    const argv = [_][]const u8{ \"");
         try out.put(disp);
-        try out.put("\", \"op0\" };\n    const o = try parsePosix(&argv, gpa);\n");
+        try out.put("\", \"");
+        try out.put(if (numeric) "7" else "op0");
+        try out.put("\" };\n    const o = try parsePosix(&argv, gpa);\n");
         if (p.many) {
             var line = std.ArrayList(u8).empty;
             defer line.deinit(gpa);
@@ -1986,15 +2743,307 @@ fn emitTests(out: *Out, gpa: Allocator, name: []const u8, s: *const cli.Schema) 
             try line.appendSlice(gpa, id);
             try line.appendSlice(gpa, "[0]);\n");
             try out.put(line.items);
+        } else if (numeric and any_counts) {
+            // counts remap, total 1: the LAST slot participating in total 1
+            // binds the operand; every other positional slot keeps its dflt
+            // (the "seq 5" silent-empty trap this test exists for)
+            var last_field: []const u8 = "";
+            for (s.posix.positionals) |q| {
+                if (q.many) break;
+                if (!inCount(q, 1)) continue;
+                last_field = q.field;
+            }
+            const lid = try ident(gpa, last_field);
+            defer if (lid.ptr != last_field.ptr) gpa.free(lid);
+            const lty = s.ty.findField(last_field).?;
+            var lity = lty;
+            if (lty.* == .optional) lity = lty.optional;
+            const unwrap: []const u8 = if (lty.* == .optional) ".?" else "";
+            const zty: []const u8 = if (lity.* == .natural) "u64" else "i64";
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(");
+            try line.appendSlice(gpa, zty);
+            try line.appendSlice(gpa, ", 7), o.");
+            try line.appendSlice(gpa, lid);
+            try line.appendSlice(gpa, unwrap);
+            try line.appendSlice(gpa, ");\n");
+            try out.put(line.items);
+            for (s.posix.positionals) |q| {
+                if (q.many) continue;
+                if (inCount(q, 1)) continue;
+                const dv = s.dflt.findField(q.field) orelse
+                    return fail("dflt: record field '{s}' absent", .{q.field});
+                try defaultAssert(out, gpa, q.field, s.ty.findField(q.field).?, &dv);
+            }
+        } else if (numeric) {
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            const unwrap: []const u8 = if (fty.* == .optional) ".?" else "";
+            const zty: []const u8 = if (ity.* == .natural) "u64" else "i64";
+            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(");
+            try line.appendSlice(gpa, zty);
+            try line.appendSlice(gpa, ", 7), o.");
+            try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, unwrap);
+            try line.appendSlice(gpa, ");\n");
+            try out.put(line.items);
         } else {
+            // same Optional unwrap as the numeric branch: an Optional Text
+            // positional (o.<f> is ?[]const u8) needs .? before the
+            // expectEqualStrings (review nice-to-have 1)
+            const unwrap: []const u8 = if (fty.* == .optional) ".?" else "";
             var line = std.ArrayList(u8).empty;
             defer line.deinit(gpa);
             try line.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"op0\", o.");
             try line.appendSlice(gpa, id);
+            try line.appendSlice(gpa, unwrap);
             try line.appendSlice(gpa, ");\n");
             try out.put(line.items);
         }
         try out.put("}\n");
+    }
+
+    // ---- counts remap: one binds test per operand TOTAL beyond the 1-op
+    // form the first-positional test above already pins — for total T the
+    // participating slots (counts contains T, or none declared) bind the T
+    // operands in DECLARED order, and non-participants keep their dflt ----
+    {
+        var any_counts = false;
+        for (s.posix.positionals) |q| {
+            if (q.counts != null) {
+                any_counts = true;
+                break;
+            }
+        }
+        if (any_counts) {
+            var singles_n: usize = 0;
+            for (s.posix.positionals) |q| {
+                if (q.many) break;
+                singles_n += 1;
+            }
+            var t: usize = 2;
+            while (t <= singles_n) : (t += 1) {
+                try out.put("\ntest \"cli_");
+                try out.put(name);
+                try out.put(": ");
+                const tn = try std.fmt.allocPrint(gpa, "{d}", .{t});
+                try out.put(tn);
+                gpa.free(tn);
+                try out.put(" operands bind by counts remap\" {\n");
+                try out.put(prologue);
+                try out.put("    const argv = [_][]const u8{ \"");
+                try out.put(disp);
+                try out.put("\"");
+                var k: usize = 0;
+                while (k < t) : (k += 1) {
+                    try out.put(", \"7\"");
+                }
+                try out.put(" };\n    const o = try parsePosix(&argv, gpa);\n");
+                for (s.posix.positionals) |q| {
+                    if (q.many) break;
+                    if (!inCount(q, @intCast(t))) continue;
+                    const qid = try ident(gpa, q.field);
+                    defer if (qid.ptr != q.field.ptr) gpa.free(qid);
+                    const qty = s.ty.findField(q.field).?;
+                    var qity = qty;
+                    if (qty.* == .optional) qity = qty.optional;
+                    const unwrap: []const u8 = if (qty.* == .optional) ".?" else "";
+                    const zty: []const u8 = if (qity.* == .natural) "u64" else "i64";
+                    try out.print("    try std.testing.expectEqual(@as({s}, 7), o.{s}{s});\n", .{ zty, qid, unwrap });
+                }
+                for (s.posix.positionals) |q| {
+                    if (q.many) continue;
+                    if (inCount(q, @intCast(t))) continue;
+                    const dv = s.dflt.findField(q.field) orelse
+                        return fail("dflt: record field '{s}' absent", .{q.field});
+                    try defaultAssert(out, gpa, q.field, s.ty.findField(q.field).?, &dv);
+                }
+                try out.put("}\n");
+            }
+        }
+    }
+
+    // ---- numeric positional operands coerce (parseInt u64/i64): one test
+    // per non-many NUMERIC slot, driving it with the operands that reach
+    // it in the walk (a counts remap's slots by their total) ----
+    {
+        var any_counts_l = false;
+        for (s.posix.positionals) |q| {
+            if (q.counts != null) {
+                any_counts_l = true;
+                break;
+            }
+        }
+        for (s.posix.positionals, 0..) |p, pi| {
+            if (p.many) continue;
+            const fty = s.ty.findField(p.field) orelse continue;
+            var ity = fty;
+            if (fty.* == .optional) ity = fty.optional;
+            if (ity.* != .natural and ity.* != .integer) continue;
+            const id = try ident(gpa, p.field);
+            defer if (id.ptr != p.field.ptr) gpa.free(id);
+            // the operand argv: under a counts remap, the smallest total
+            // this slot participates in reaches it; in the strict walk it
+            // is the pi+1'th operand
+            var t: usize = pi + 1;
+            if (any_counts_l) {
+                t = 0;
+                for (s.posix.positionals) |q| {
+                    if (q.many) continue;
+                    if (std.mem.eql(u8, q.field, p.field) and q.counts != null and q.counts.?.len > 0) {
+                        t = @intCast(q.counts.?[0]);
+                    }
+                }
+                if (t == 0) t = pi + 1; // counts-less numeric slot: walk order
+            }
+            const val: []const u8 = "7";
+            try out.put("\ntest \"cli_");
+            try out.put(name);
+            try out.put(": operand binds ");
+            try out.put(p.field);
+            try out.put(" (numeric)\" {\n");
+            try out.put(prologue);
+            try out.put("    const argv = [_][]const u8{ \"");
+            try out.put(disp);
+            try out.put("\"");
+            var k: usize = 0;
+            while (k < t) : (k += 1) {
+                try out.put(", \"");
+                try out.put(val);
+                try out.put("\"");
+            }
+            try out.put(" };\n    const o = try parsePosix(&argv, gpa);\n");
+            const unwrap: []const u8 = if (fty.* == .optional) ".?" else "";
+            const zty: []const u8 = if (ity.* == .natural) "u64" else "i64";
+            const zval: []const u8 = "7";
+            try out.print("    try std.testing.expectEqual(@as({s}, {s}), o.{s}{s});\n", .{ zty, zval, id, unwrap });
+            try out.put("}\n");
+        }
+    }
+
+    // ---- a multi-char short binds its VALUE, never clusters: pin the
+    // guard against the pre-pass swallowing "-max" as "-m -a -x" when
+    // single-char argumentless shorts exist for its letters.  Prefer a
+    // VALUE-kind multi-char short (the strongest form: the value token
+    // itself proves the arm ran); a selector/flag one otherwise.  Emitted
+    // when a multi-char short coexists with clusterable letters ----
+    {
+        var multi: ?cli.Flag = null;
+        var any_clusterable = false;
+        for (s.posix.flags) |f| {
+            if (clusterLetter(f) != null) any_clusterable = true;
+            const sh = f.short orelse continue;
+            if (sh.len <= 2) continue;
+            if (multi == null or (multi.?.kind != .value and f.kind == .value)) multi = f;
+        }
+        if (multi != null and any_clusterable) {
+            const f = multi.?;
+            const id = try ident(gpa, f.field);
+            defer if (id.ptr != f.field.ptr) gpa.free(id);
+            const fty = s.ty.findField(f.field).?;
+            const tok = f.short.?;
+            // the argv vector: a Value flag needs its value token, a
+            // selector its spelled value; an argumentless flag is bare
+            const val: []const u8 = switch (f.kind) {
+                .value => switch (fty.*) {
+                    .natural, .double => "7",
+                    .integer => "-7",
+                    .optional => |inner| switch (inner.*) {
+                        .text => "v",
+                        else => "7",
+                    },
+                    else => "v",
+                },
+                .enum_ => f.value orelse "",
+                .flag => "",
+            };
+            try out.put("\ntest \"cli_");
+            try out.put(name);
+            try out.put(": ");
+            try out.put(tok);
+            try out.put(" binds ");
+            try out.put(f.field);
+            try out.put(" (not a cluster)\" {\n");
+            try out.put(prologue);
+            try out.put("    const argv = [_][]const u8{ \"");
+            try out.put(disp);
+            try out.put("\", \"");
+            try out.put(tok);
+            try out.put("\"");
+            if (val.len > 0) {
+                try out.put(", \"");
+                try out.put(val);
+                try out.put("\"");
+            }
+            try out.put(" };\n    const o = try parsePosix(&argv, gpa);\n");
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(gpa);
+            switch (f.kind) {
+                .flag => {
+                    try line.appendSlice(gpa, "    try std.testing.expect(o.");
+                    try line.appendSlice(gpa, id);
+                    try line.appendSlice(gpa, ");\n");
+                },
+                .enum_ => |ctor| {
+                    const cid = try ident(gpa, ctor);
+                    defer if (cid.ptr != ctor.ptr) gpa.free(cid);
+                    try line.appendSlice(gpa, "    try std.testing.expect(o.");
+                    try line.appendSlice(gpa, id);
+                    try line.appendSlice(gpa, " == .");
+                    try line.appendSlice(gpa, cid);
+                    try line.appendSlice(gpa, ");\n");
+                },
+                .value => switch (fty.*) {
+                    .text => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"v\", o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .natural => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(u64, 7), o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .integer => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(i64, -7), o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .double => {
+                        try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(f64, 7), o.");
+                        try line.appendSlice(gpa, id);
+                        try line.appendSlice(gpa, ");\n");
+                    },
+                    .optional => |inner| switch (inner.*) {
+                        .text => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqualStrings(\"v\", o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        .natural => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(u64, 7), o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        .integer => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(i64, 7), o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        .double => {
+                            try line.appendSlice(gpa, "    try std.testing.expectEqual(@as(f64, 7), o.");
+                            try line.appendSlice(gpa, id);
+                            try line.appendSlice(gpa, ".?);\n");
+                        },
+                        else => return fail("flag '{s}': unsupported Optional inner type", .{tok}),
+                    },
+                    else => return fail("flag '{s}': unsupported Value field type", .{tok}),
+                },
+            }
+            try out.put(line.items);
+            try out.put("}\n");
+        }
     }
 
     // ---- mutual exclusion (first group) ----
@@ -2213,4 +3262,79 @@ test "zigEscape escapes quotes, backslashes and control bytes" {
     const e = try zigEscape(gpa, "a\"b\\c\nd\x01");
     defer gpa.free(e);
     try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\x01", e);
+}
+
+// ---------------------------------------------------------------------------
+// validation rejection pins (review SHOULD-FIX 1 + 3): both hazards were
+// ACCEPTED schemas whose generated parser was broken or silently
+// unenforced — validateBindings must reject them at codegen time.  The
+// shapes live here (not in a meta_* fixture) because a fixture must
+// GENERATE; these must NOT.
+// ---------------------------------------------------------------------------
+
+/// A minimal selector-family schema whose mutually_exclusive group names
+/// the family's token: the family's merged arm never sets a `seen` bit,
+/// so the group would be dead code (its Conflict can never fire).
+fn mutexSelectorSchemaSrc(gpa: Allocator) Allocator.Error![:0]const u8 {
+    return std.fmt.allocPrintSentinel(gpa,
+        \\let Flag = {{ short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }}
+        \\let Positional = {{ field : Text, display : Text, many : Bool }}
+        \\in
+        \\{{ ty = {{ pick : Optional < File | Dir >, other : Bool }}
+        \\, dflt = {{ pick = None < File | Dir >, other = False }}
+        \\, posix =
+        \\  {{ flags =
+        \\    [ {{ short = Some "-p", long = None Text, field = "pick", kind = < Flag | Value | Enum : Text >.Enum "File", value = Some "f" }}
+        \\    , {{ short = Some "-p", long = None Text, field = "pick", kind = < Flag | Value | Enum : Text >.Enum "Dir", value = Some "d" }}
+        \\    , {{ short = Some "-o", long = None Text, field = "other", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }}
+        \\    ] : List Flag
+        \\  , mutually_exclusive = [ [ "-p", "-o" ] ] : List (List Text)
+        \\  , positionals = [] : List Positional
+        \\  }}
+        \\}}
+    , .{}, 0);
+}
+
+test "validateBindings rejects a mutually_exclusive group naming a selector" {
+    const gpa = std.testing.allocator;
+    const src = try mutexSelectorSchemaSrc(gpa);
+    defer gpa.free(src);
+    var s = try cli.evalSchemaSrc(gpa, src);
+    defer s.deinit(gpa);
+    // the schema EVALS (the shape is well-typed dhall) — the rejection is
+    // the generator's binding validation
+    try std.testing.expectError(error.Schema, validateBindings(&s));
+}
+
+/// A counts positional plus a SEPARATE many positional: each slot is
+/// individually legal (counts+many on ONE slot is rejected elsewhere), but
+/// the counts remap's collect-only bindOperand can never append to the
+/// many list — the emitted parser carries an unused parameter and the many
+/// field is unreachable.
+fn countsManySchemaSrc(gpa: Allocator) Allocator.Error![:0]const u8 {
+    return std.fmt.allocPrintSentinel(gpa,
+        \\let Flag = {{ short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }}
+        \\let Positional = {{ field : Text, display : Text, many : Bool, counts : Optional (List Natural) }}
+        \\in
+        \\{{ ty = {{ a : Integer, rest : List Text }}
+        \\, dflt = {{ a = +1, rest = [] : List Text }}
+        \\, posix =
+        \\  {{ flags = [] : List Flag
+        \\  , mutually_exclusive = [] : List (List Text)
+        \\  , positionals =
+        \\    [ {{ field = "a", display = "A", many = False, counts = Some [ 1 ] }}
+        \\    , {{ field = "rest", display = "REST", many = True, counts = None (List Natural) }}
+        \\    ] : List Positional
+        \\  }}
+        \\}}
+    , .{}, 0);
+}
+
+test "validateBindings rejects counts positionals mixed with a many positional" {
+    const gpa = std.testing.allocator;
+    const src = try countsManySchemaSrc(gpa);
+    defer gpa.free(src);
+    var s = try cli.evalSchemaSrc(gpa, src);
+    defer s.deinit(gpa);
+    try std.testing.expectError(error.Schema, validateBindings(&s));
 }

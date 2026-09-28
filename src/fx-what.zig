@@ -4,10 +4,13 @@
 // over the snapshot-versioned install/provides facts fx-activate writes
 // into the store db).
 //
+// Two arg forms, ONE source of truth (schemas/what.dhall):
+//   fx-what '{ operand = "/bin/hello", as_of = Some 7, store = Some "/s" }'
 //   fx-what PATH [--as-of N] [--store DIR]
 //
 // - PATH is a rootfs-absolute install target (/bin/name, /etc/p) — the
-//   install-relation target column exactly.
+//   install-relation target column exactly.  The record form names the same
+//   value `operand` (the schema ty field).
 // - --as-of N queries snapshot version N instead of the newest published
 //   one (pre-provenance snapshots read absent-as-empty: the path reports
 //   unmanaged rather than erroring).
@@ -24,11 +27,21 @@
 // miss with a 'fxstore verify' hint, never a stack trace.
 
 const std = @import("std");
+const dh = @import("dhall");
 const prov = @import("provenance");
 const st = @import("store");
 const cl = @import("closure");
 const cli_what = @import("cli-what");
 const cli = @import("fx-cli");
+
+const dhall = dh.dhall;
+const arena = dh.arena;
+const ast = dh.ast;
+const parser = dh.parser;
+const typecheck = dh.typecheck;
+const normalize = dh.normalize;
+const serialize = dh.serialize;
+const import_mod = dh.import_mod;
 
 const Allocator = std.mem.Allocator;
 
@@ -53,44 +66,183 @@ const Options = cli_what.Options;
 const parsePosixArgs = cli_what.parsePosix; // the generated POSIX parser
 
 fn usage() void {
-    std.debug.print(
-        "usage: fx-what PATH [--as-of N] [--store DIR]\n" ++
+    // no format args: the literal's `{ }` braces are Dhall record syntax,
+    // not placeholders, so the text goes through as a {s} argument
+    std.debug.print("{s}", .{
+        "usage: fx-what PATH [--as-of N] [--store DIR] | fx-what '{ operand = ... }'\n" ++
             "\n" ++
             "  PATH        rootfs-absolute target to identify (/bin/name, /etc/p)\n" ++
             "  --as-of N   query snapshot version N (default: newest published)\n" ++
             "  --store DIR resolve store-relative origins against DIR\n",
-        .{},
-    );
+    });
 }
 
 // ---------------------------------------------------------------------------
 // THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
 // ---------------------------------------------------------------------------
 //
-// fx-what has NO runtime Dhall-record arg form (main never dispatches on a
-// leading '{'): the record side of the matrix is the SCHEMA completion
-// ((dflt // user) : ty via fx-cli.completeSrc), rendered to a record literal
-// and evaluated by the identity evalDhallArgs below — so the generated
-// parser's Options are pinned field-complete against schemas/what.dhall
-// itself.  Both sides are re-encoded to the canonical term_to_json wire
-// shape (fx-cli.encodeOptionsWire) and compared as strings.
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal (fx-cli.renderDhallRecord) and evaluated by THIS
+// file's evalDhallArgs — the exact runtime path `fx-what '{ ... }'` takes.
+// Both sides are re-encoded to the canonical term_to_json wire shape
+// (fx-cli.encodeOptionsWire) and compared as strings.
 
-/// The identity evaluator: fx-what has no runtime record form, so the
-/// differential's record side is the completed schema record itself (the
-/// runner only needs SOME function record-literal -> Options).
+// Minimal JSON object parser (mirrors fx-ls/fx-du): extracts
+// operand:Text, as_of:Optional Natural (number or null), store:Text.
+// STRICT (the fx-du rule): an unknown key is a parse FAILURE, never a
+// silent skip — a schema/evaluator field mismatch must fail loudly, not
+// fall back to defaults.
+const JsonOpts = struct {
+    operand: ?[]const u8 = null,
+    as_of: ?u64 = null,
+    store: ?[]const u8 = null,
+};
+
+fn jsonSkipWs(s: []const u8, i: *usize) void {
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\t' or s[i.*] == '\n' or s[i.*] == '\r')) i.* += 1;
+}
+
+fn jsonExpect(s: []const u8, i: *usize, c: u8) bool {
+    jsonSkipWs(s, i);
+    if (i.* < s.len and s[i.*] == c) {
+        i.* += 1;
+        return true;
+    }
+    return false;
+}
+
+fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
+    if (!jsonExpect(s, i, '"')) return null;
+    var n: usize = 0;
+    while (i.* < s.len) : (i.* += 1) {
+        const c = s[i.*];
+        if (c == '"') {
+            i.* += 1;
+            return buf[0..n];
+        } else if (c == '\\') {
+            i.* += 1;
+            if (i.* >= s.len) return null;
+            const rep: u8 = switch (s[i.*]) {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' => 0x08,
+                'f' => 0x0C,
+                else => return null,
+            };
+            if (n >= buf.len) return null;
+            buf[n] = rep;
+            n += 1;
+        } else {
+            if (n >= buf.len) return null;
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    return null;
+}
+
+fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+    var res = JsonOpts{};
+    var off: usize = 0;
+    var i: usize = 0;
+    if (!jsonExpect(s, &i, '{')) return null;
+    if (jsonExpect(s, &i, '}')) return res; // empty object
+    while (true) {
+        var keybuf: [64]u8 = undefined;
+        const key = jsonParseString(s, &i, &keybuf) orelse return null;
+        if (!jsonExpect(s, &i, ':')) return null;
+        jsonSkipWs(s, &i);
+        if (i < s.len and s[i] == '"') {
+            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+            if (std.mem.eql(u8, key, "operand")) {
+                res.operand = val;
+            } else if (std.mem.eql(u8, key, "store")) {
+                res.store = val;
+            } else {
+                return null; // unknown key -> could not parse fields
+            }
+            off += val.len;
+        } else if (i < s.len and std.ascii.isDigit(s[i])) {
+            const start = i;
+            while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+            const n = std.fmt.parseInt(u64, s[start..i], 10) catch return null;
+            if (!std.mem.eql(u8, key, "as_of")) return null; // unknown key
+            res.as_of = n;
+        } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
+            i += 4; // None (Optional absent)
+        } else {
+            return null; // unknown value shape -> could not parse fields
+        }
+        if (!jsonExpect(s, &i, ',')) break;
+    }
+    if (!jsonExpect(s, &i, '}')) return null;
+    return res;
+}
+
+/// The REAL record evaluator: parse -> infer -> normalize -> term_to_json ->
+/// field walk (the fx-ls template) — the exact runtime path
+/// `fx-what '{ operand = "/bin/hello", as_of = Some 7 }'` takes.
 fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
-    _ = gpa;
-    _ = src;
-    return error.NoRecordForm;
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    arena.arena_reset(arena.dhall_arena.?);
+
+    const loader = import_mod.import_loader_new();
+    defer import_mod.import_loader_free(loader);
+
+    var p: dhall.Parser = std.mem.zeroes(dhall.Parser);
+    p.loader = loader;
+    var err: dhall.DhallError = undefined;
+    ast.dhall_error_clear(&err);
+    const t = parser.parse_source(&p, src, null, &err);
+    if (t == null) {
+        std.debug.print("fx-what: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallParse;
+    }
+    const ty = typecheck.infer_type(&p, t.?, &err);
+    if (ty == null) {
+        std.debug.print("fx-what: dhall type error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallType;
+    }
+    normalize.normalize_clear_error();
+    const nf = normalize.normalize(t.?);
+    if (normalize.normalize_has_error()) {
+        err = normalize.normalize_get_error().*;
+        std.debug.print("fx-what: dhall normalize error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallNormalize;
+    }
+
+    var ob = std.ArrayList(u8).initCapacity(gpa, 4096) catch unreachable;
+    defer ob.deinit(gpa);
+    const out = ast.Out{ .b = &ob };
+    if (!serialize.term_to_json(out, nf, &err)) {
+        std.debug.print("fx-what: dhall serialize error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallSerialize;
+    }
+
+    const buf = try gpa.alloc(u8, 65536);
+    defer gpa.free(buf);
+    const opts = jsonParseOpts(ob.items, buf) orelse {
+        std.debug.print("fx-what: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
+        return error.DhallFields;
+    };
+
+    var o = Options{};
+    if (opts.operand) |op| o.operand = try gpa.dupe(u8, op);
+    o.as_of = opts.as_of; // absent (None/null) stays the null default
+    if (opts.store) |sr| o.store = try gpa.dupe(u8, sr);
+    return o;
 }
 
 /// One differential vector for fx-what — a one-line wrapper over the SHARED
-/// generic runner (fx-cli.expectPosixEqualsRecord).  NOTE: with the identity
-/// evaluator above every vector FAILS on the record side, so this wrapper is
-/// intentionally NOT called by any test; the POSIX-side contract is pinned by
-/// the direct generated-parser assertions below (the fx-ls equality matrix
-/// shape returns when a runtime record form lands, schemas/what.dhall's
-/// ty/dflt are the completed-record single source of truth either way).
+/// generic runner (fx-cli.expectPosixEqualsRecord; the fx-ls STEP-3 template
+/// each migration copies): the generated parser, the schema candidates, and
+/// the REAL runtime record evaluator above are the whole per-command surface.
 fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
     return cli.expectPosixEqualsRecord(cli_what, &.{ "schemas/what.dhall", "fx-core/schemas/what.dhall" }, evalDhallArgs, argv, user_record);
 }
@@ -137,6 +289,57 @@ test "DIFFERENTIAL: generated parsePosix equals the schema record (matrix)" {
     try std.testing.expectEqualStrings("--store", ddash.operand);
 }
 
+test "DIFFERENTIAL: record form equals POSIX (the un-deprecated matrix)" {
+    // --- each field ALONE, against the no-flag POSIX spelling of the same
+    // intent: defaults stay defaults ({ } <-> bare), the operand positional
+    // round-trips, and --as-of / --store actually REACH the evaluator (the
+    // lazy-hide guard: a dropped as_of/store would render the record side
+    // with null/absent values and the field-complete wire comparison would
+    // go red) ---
+    try expectPosixEqualsRecord(&.{"fx-what"}, "{ }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "p" }, "{ operand = \"p\" }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "--as-of", "7" }, "{ as_of = Some 7 }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "--store", "/s" }, "{ store = Some \"/s\" }");
+
+    // --- combined: the full surface, both flag spellings, flags before the
+    // positional, and the None-carrying completion (the pre-renderfix
+    // blocker shape: `None Natural` / `None Text` must render, parse, and
+    // mean the same defaults as the bare argv) ---
+    try expectPosixEqualsRecord(&.{ "fx-what", "/bin/hello", "--as-of=3", "--store=/var/fx/store" }, "{ operand = \"/bin/hello\", as_of = Some 3, store = Some \"/var/fx/store\" }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "/bin/hello", "--as-of", "3", "--store", "/var/fx/store" }, "{ operand = \"/bin/hello\", as_of = Some 3, store = Some \"/var/fx/store\" }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "--store=/s", "--as-of=7", "/etc/motd" }, "{ operand = \"/etc/motd\", as_of = Some 7, store = Some \"/s\" }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "p" }, "{ operand = \"p\", as_of = None Natural, store = None Text }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "--as-of", "0" }, "{ as_of = Some 0 }");
+    try expectPosixEqualsRecord(&.{ "fx-what", "--", "--store" }, "{ operand = \"--store\" }");
+}
+
+test "evalDhallArgs: operand only, defaults intact" {
+    const o = try evalDhallArgs("{ operand = \"/bin/hello\" }", std.testing.allocator);
+    defer std.testing.allocator.free(o.operand);
+    try std.testing.expectEqualStrings("/bin/hello", o.operand);
+    try std.testing.expect(o.as_of == null);
+    try std.testing.expect(o.store == null);
+}
+
+test "evalDhallArgs: as_of and store bind; None spellings keep them null" {
+    const o = try evalDhallArgs("{ as_of = Some 7, store = Some \"/s\" }", std.testing.allocator);
+    defer std.testing.allocator.free(o.store.?);
+    try std.testing.expectEqual(@as(u64, 7), o.as_of.?);
+    try std.testing.expectEqualStrings("/s", o.store.?);
+
+    const n = try evalDhallArgs("{ as_of = None Natural, store = None Text }", std.testing.allocator);
+    try std.testing.expect(n.as_of == null);
+    try std.testing.expect(n.store == null);
+    try std.testing.expectEqualStrings("", n.operand);
+}
+
+test "jsonParseOpts: unknown key is a loud failure (the strict fx-du rule)" {
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(jsonParseOpts("{\"typo\":true}", &buf) == null);
+    try std.testing.expect(jsonParseOpts("{\"as_of\":true}", &buf) == null);
+    try std.testing.expect(jsonParseOpts("{\"operand\":\"p\",\"ghost\":1}", &buf) == null);
+}
+
 test "DIFFERENTIAL: rejection parity — the generated parser fails loudly" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -159,6 +362,14 @@ test "DIFFERENTIAL: rejection parity — the generated parser fails loudly" {
     defer std.testing.allocator.free(schema_src);
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ as_of = -1 }"));
+    // record-form rejection parity: a bare record literal infers its OWN
+    // type (there is no schema at the evaluator), so an unknown field or a
+    // wrong field type surfaces at the strict field walk (DhallFields) —
+    // never a silent default fallback.  (The schema-typed rejections are
+    // the SchemaCheck pins above.)
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ typo = True }", gpa));
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ as_of = \"x\" }", gpa));
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ operand = \"p\", ghost = 1 }", gpa));
 }
 
 // ---------------------------------------------------------------------------
@@ -226,13 +437,21 @@ fn run(
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // the GENERATED parser (schemas/what.dhall -> src/generated/cli_what.zig);
-    // the POSIX contract is pinned by the differential tests
-    // (expectPosixEqualsRecord + the direct generated-parser assertions)
-    const opts = parsePosixArgs(args, init.arena.allocator()) catch {
-        usage();
-        std.process.exit(2);
-    };
+    // The GENERATED parser (schemas/what.dhall -> src/generated/cli_what.zig)
+    // and the Dhall-record form share one dispatch, exactly like every other
+    // migrated command (the fx-du/fx-ls branch): a first argv token starting
+    // with '{' is the record form.
+    var opts: Options = undefined;
+    if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
+        opts = try evalDhallArgs(args[1], init.arena.allocator());
+    } else {
+        // the POSIX contract is pinned by the differential tests
+        // (expectPosixEqualsRecord + the direct generated-parser assertions)
+        opts = parsePosixArgs(args, init.arena.allocator()) catch {
+            usage();
+            std.process.exit(2);
+        };
+    }
     // the placeholder-default check that stays in main(): operand = "" (the
     // schema dflt — no PATH operand given) is the old MissingOperand
     if (opts.operand.len == 0) {

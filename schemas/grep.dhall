@@ -40,27 +40,26 @@
 --         lands.  root/pattern/maxdepth already match.
 --   dflt  the struct's defaults verbatim (pattern "" placeholder above;
 --         maxdepth None walks unbounded).
---   posix fx-grep.zig:256-286 parsePosixArgs: PATTERN is REQUIRED,
---         exactly one; ROOT is an optional single positional —
---         the hand parser binds the first bare operand to pattern and
---         the second to root (last-wins is impossible: a third operand
---         overwrites root, fx-grep.zig:277-279; the generated
---         single-slot bindings REJECT the third — the deliberate
---         drift-killing strengthening, the fx-du precedent).
---         The hand flags are the single-dash multi-char tokens
---         `-name GLOB` / `-maxdepth N` (fx-grep.zig:262-270), plus the
---         long-only `--rows` (the plain long form the generated
---         vocabulary DOES model — same token is a flags entry below so
---         both parsers accept it, the find/tree precedent).
+--   posix the GENERATED parser (fx-grep.zig aliases
+--         parsePosixArgs = cli_grep.parsePosix): PATTERN is REQUIRED,
+--         exactly one; ROOT is an optional single positional — a THIRD
+--         bare operand is REJECTED (error.UnexpectedOperand).  The hand
+--         parser this replaced overwrote root on a third operand;
+--         the single-slot bindings are the deliberate drift-killing
+--         strengthening (the fx-du precedent), and no caller relied on
+--         the old behaviour.
+--         The flags are the single-dash multi-char tokens
+--         `-name GLOB` and `-maxdepth N` (kind Value on the plain
+--         multi-char short — never clustered), plus the long-only
+--         `--rows` (a plain long).
 --
---   VOCABULARY GAP (reported): `-name` and `-maxdepth` are
---   single-dash MULTI-CHAR tokens — expressible neither as a short
---   (exactly "-<c>", fx-clijson.zig:417) nor as a long ("--<name>",
---   fx-clijson.zig:420).  flags therefore carries ONLY `--rows`; the
---   single-dash pair above stays hand-parser territory until the
---   vocabulary grows a single-dash long-word form; the generated
---   parser remains record-form-only for the rest and must not replace
---   fx-grep's hand parser (the seq precedent).
+--   The FORMER VOCABULARY GAP (reported against the v1 generator) is
+--   CLOSED: the vocabulary now models a single-dash multi-char
+--   `short` token, so -name/-maxdepth are plain Value flags on it.
+--   cli_grep.parsePosix takes over the whole POSIX surface and the
+--   hand parser is DELETED (the seq flip); the schema-completed
+--   record form is differential-tested against it through the shared
+--   runner (fx-grep.zig's matrix).
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 
@@ -93,7 +92,10 @@ in
     }
 , posix =
     { flags =
-        [ { short = None Text, long = Some "--rows", field = "rows", kind = < Flag | Value | Enum : Text >.Flag, value = None Text } ] : List Flag
+        [ { short = Some "-name", long = None Text, field = "name_glob", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = Some "-maxdepth", long = None Text, field = "maxdepth", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = None Text, long = Some "--rows", field = "rows", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }
+        ] : List Flag
     , mutually_exclusive = [] : List (List Text)
     , positionals =
         [ { field = "pattern", display = "PATTERN", many = False }

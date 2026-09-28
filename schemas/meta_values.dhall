@@ -21,7 +21,39 @@
 --   * short clustering (-x -y -> -xy; both are argumentless)
 --   * inline --long=value (--num=5, --tail=5)
 --   * a mutually_exclusive pair sharing one union field
---   * a Text positional
+--   * a Text positional and an OPTIONAL-Text positional (osrc, first
+--     slot): the first-positional binds test asserts o.osrc.? unwrapped
+--   * MULTI-CHAR SINGLE-DASH SHORTS (the find/grep shape): -max GLOB and
+--     -maxdepth N reuse the `short` field with a longer token; they never
+--     cluster.  The single-char argumentless shorts -m/-a are declared
+--     TOO (and -x already was), so "-max"'s letters are each a clusterable
+--     letter — the cluster pre-pass would swallow the token as "-m -a -x"
+--     without the exact-match guard (the #1 silent-wrong hazard; the
+--     generated "-max v (not a cluster)" test pins the guard)
+--   * a VALUE-CONSUMING ENUM SELECTOR family (the "-type f|d" shape):
+--     TWO flags entries sharing the token "-type" and the field, kind
+--     Enum with value = Some "<argv spelling>" (Enum + value = None stays
+--     the argumentless selector — the -A/-D pair above).  The emitted
+--     merged arm consumes the next argv token, selects the ctor by value
+--     equality, rejects an unknown value with BadValue and a repeat with
+--     Conflict (the built-in <field>_seen guard); the field is an
+--     Optional <union> (find's type_filter shape).  A SECOND family on
+--     the LONG axis (--fmt json|text) pins the --long=value / --long
+--     value / repeat / unknown-value spellings a long-axis family adds
+--   * a BOTH-AXIS family (-p f|d and --pick f|d on one field): the
+--     per-alternative "tok=value" inline test is LONG-axis-only (the
+--     short arm has no inline-= spelling — emitting it with the short
+--     token produced a generated test failing UnknownOption), and each
+--     axis gets its own binds / unknown-value / repeat tests with ITS
+--     token
+--   * a family whose ctor label NEEDS @"..." quoting (pick2's File-2):
+--     the ctor ident is a FRESH allocation, not a slice of the schema
+--     source — a generator that frees it before emitting embeds garbage
+--     bytes into the arm (the review's blocker probe; the bare-id
+--     fixtures above pass even when the free is wrong, which is exactly
+--     how it shipped)
+--   * an OPTIONAL-TEXT positional first slot: the first-positional binds
+--     test must unwrap o.<f>.? before expectEqualStrings
 -- When a future generator edit makes any emission shape non-compiling,
 -- THIS gate fails at `zig build test`, not at the first STEP-3 batch.
 --
@@ -43,10 +75,21 @@ in
     , optint : Optional Integer
     , optdbl : Optional Double
     , mopt : Optional Text
+    , osrc : Optional Text
     , name : Text
     , src : Text
     , x : Bool
     , y : Bool
+    , glob : Optional Text
+    , depth : Optional Natural
+    , kind : Optional < File | Dir >
+    , fmt : Optional < Json | Text >
+    , pick : Optional < File | Dir >
+    , pick2 : Optional < File-2 | Dir >
+    , count : Optional Natural
+    , step : Integer
+    , m : Bool
+    , a : Bool
     }
 , dflt =
     { mode = < Asc | Desc >.Asc
@@ -58,10 +101,21 @@ in
     , optint = None Integer
     , optdbl = None Double
     , mopt = Some "dflt"
+    , osrc = None Text
     , name = "n"
     , src = "."
     , x = False
     , y = False
+    , glob = None Text
+    , depth = None Natural
+    , kind = None < File | Dir >
+    , fmt = None < Json | Text >
+    , pick = None < File | Dir >
+    , pick2 = None < File-2 | Dir >
+    , count = None Natural
+    , step = +1
+    , m = False
+    , a = False
     }
 , posix =
     { flags =
@@ -77,8 +131,25 @@ in
         , { short = Some "-D", long = None Text, field = "mode", kind = < Flag | Value | Enum : Text >.Enum "Desc", value = None Text }
         , { short = Some "-x", long = None Text, field = "x", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }
         , { short = Some "-y", long = None Text, field = "y", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }
+        , { short = Some "-max", long = None Text, field = "glob", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = Some "-maxdepth", long = None Text, field = "depth", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = Some "-type", long = None Text, field = "kind", kind = < Flag | Value | Enum : Text >.Enum "File", value = Some "f" }
+        , { short = Some "-type", long = None Text, field = "kind", kind = < Flag | Value | Enum : Text >.Enum "Dir", value = Some "d" }
+        , { short = None Text, long = Some "--fmt", field = "fmt", kind = < Flag | Value | Enum : Text >.Enum "Json", value = Some "json" }
+        , { short = None Text, long = Some "--fmt", field = "fmt", kind = < Flag | Value | Enum : Text >.Enum "Text", value = Some "text" }
+        , { short = Some "-p", long = Some "--pick", field = "pick", kind = < Flag | Value | Enum : Text >.Enum "File", value = Some "f" }
+        , { short = Some "-p", long = Some "--pick", field = "pick", kind = < Flag | Value | Enum : Text >.Enum "Dir", value = Some "d" }
+        , { short = Some "-q", long = Some "--pick2", field = "pick2", kind = < Flag | Value | Enum : Text >.Enum "File-2", value = Some "f" }
+        , { short = Some "-q", long = Some "--pick2", field = "pick2", kind = < Flag | Value | Enum : Text >.Enum "Dir", value = Some "d" }
+        , { short = Some "-m", long = None Text, field = "m", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }
+        , { short = Some "-a", long = None Text, field = "a", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }
         ] : List Flag
     , mutually_exclusive = [ [ "-A", "-D" ] ] : List (List Text)
-    , positionals = [ { field = "src", display = "SRC", many = False } ] : List Positional
+    , positionals =
+        [ { field = "osrc", display = "SRC", many = False }
+        , { field = "src", display = "NAME", many = False }
+        , { field = "count", display = "COUNT", many = False }
+        , { field = "step", display = "STEP", many = False }
+        ] : List Positional
     }
 }

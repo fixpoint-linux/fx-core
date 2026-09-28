@@ -18,31 +18,31 @@
 --         mkfifo/touch struct-precedent) — the runtime key converges
 --         when the schema-generated surface lands.
 --   dflt  the struct's defaults verbatim (last placeholder 0 above).
---   posix fx-seq.zig:244-264 parsePosixArgs: NO flags; 1-3 numeric
---         operands with an ARITY SWITCH:
+--   posix the GENERATED parser (src/generated/cli_seq.zig) -- NO flags;
+--         1-3 numeric operands with an ARITY SWITCH, declared with the
+--         counts : Optional (List Natural) positional member (the v2
+--         vocabulary, schemas/meta_arity.dhall): `counts` lists the
+--         operand TOTALS the slot participates in; for a total T the
+--         participating slots bind the T operands in DECLARED order:
 --           1 operand   LAST            (first=1, inc=1)
 --           2 operands  FIRST LAST      (inc=1)
 --           3 operands  FIRST INC LAST
---         NEITHER axis fits the v1 positional vocabulary, so
---         positionals is EMPTY and the POSIX surface stays
---         hand-parser territory:
---           * a positional must bind a Text field (validateBindings,
---             fx-clijson.zig:488-493) — first/inc/last are Integer;
---           * slots fill strictly in order — the 1-operand form binds
---             LAST while the 3-operand form binds FIRST first, and no
---             arity dispatch exists to distinguish them (binding the
---             three slots in order would make `seq 5` set first=5 and
---             print NOTHING — a silent wrong, worse than a loud
---             reject).
---         VOCABULARY GAP — reported: seq needs Integer-coercing
---         positionals plus per-arity slot mapping (or a LAST-annealing
---         rule) before its generated parser can converge with the
---         hand one.  Until then the generated parser is record-form
---         only and must not replace fx-seq's hand parser.
+--         first/inc/last are Integer fields, so the operands coerce via
+--         parseInt(i64) with a BadValue diagnostic; the `seq 5`
+--         single-operand form binds LAST and leaves first/inc at their
+--         +1 defaults (a strictly-in-order walk would set first=5 and
+--         print NOTHING — the silent wrong the counts remap exists to
+--         prevent; pinned by meta_arity and the fx-seq differential).
+--         The runtime "last was supplied" check stays OUTSIDE the
+--         schema (no required vocabulary): MissingLast in the record
+--         evaluator (fx-seq.zig:226-229; see the ty comment), the
+--         zero-operand MissingOperand check in main().
+--         `--` still ends flag parsing before the operands, so
+--         `seq -- -3` names LAST = -3.
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 
-let Positional = { field : Text, display : Text, many : Bool }
+let Positional = { field : Text, display : Text, many : Bool, counts : Optional (List Natural) }
 
 in
 { doc = Some "print a sequence of numbers FIRST..LAST (step INC)"
@@ -59,6 +59,10 @@ in
 , posix =
     { flags = [] : List Flag
     , mutually_exclusive = [] : List (List Text)
-    , positionals = [] : List Positional
+    , positionals =
+        [ { field = "first", display = "FIRST", many = False, counts = Some [ 2, 3 ] }
+        , { field = "inc", display = "INC", many = False, counts = Some [ 3 ] }
+        , { field = "last", display = "LAST", many = False, counts = Some [ 1, 2, 3 ] }
+        ] : List Positional
     }
 }

@@ -424,23 +424,27 @@ canonical, replayable form — each stage referenced by its `sha256:` integrity.
 > remaining commands migrate in flag-shape batches, each landing with its own
 > differential matrix (the same template).
 
-> **Single-schema file map (2026-09, cmdif STEP 4):** all 56 commands have
+> **Single-schema file map (2026-09, cmdif STEP 4):** all 58 commands have
 > migrated to the generated-parser + shared-evaluator architecture (the
 > per-command hand `parsePosixArgs`/`usage`/`Options` are gone everywhere
 > the migration's vocabulary could express the surface), so the full data
 > flow is visible in one picture —
-> **EXCEPTIONS — read before editing a schema expecting POSIX behavior to
-> change:** fx-find.zig:594, fx-grep.zig:78 and fx-seq.zig:262 keep their
-> FULL hand POSIX parser on main's path — their schemas declare
-> `flags=[]`/`positionals=[]`, a dead spec for that POSIX surface (each is
-> documented at the site).  fx-what/fx-why are POSIX-only (no runtime
-> record evaluator; fx-what's shared-runner wrapper is intentionally never
-> called, fx-what.zig:86-96), so none of find/grep/seq/what/why runs the
-> shared runner today.  Also cut in migration: fx-basename's `-a`
-> operand-routing arm (schemas/basename.dhall cannot express its
-> mode-dependent operand semantics; the flag field exists but routes
-> nothing).  Their schemas still carry honest VOCABULARY GAP notes
-> (find/grep/nl/seq/echo).  Everything else: the hand parser is gone and
+> The migration is COMPLETE: fx-find, fx-grep and fx-seq's hand POSIX
+> parsers are DELETED (their schemas now declare `-name`/`-maxdepth`,
+> `-type f|d` and the counts arity remap — the former vocabulary gaps);
+> `fx-log`/`fx-undo` gained schemas (`schemas/log.dhall`, `undo.dhall`)
+> and generated parsers; and `fx-what`/`fx-why` gained real runtime
+> Dhall-record evaluators — so every schema-backed command runs the shared
+> differential runner (`expectPosixEqualsRecord`).  Deliberate cuts, NOT
+> pending work:
+> fx-basename's `-a` operand-routing arm (mode-dependent operand routing;
+> the flag field exists but routes nothing), required operands (the
+> placeholder-default + main()-check convention stands), and
+> fx-true/fx-false stay schema-less (nothing to configure).  Remaining
+> honest VOCABULARY GAP notes live where the engine, not the command,
+> owns a spelling (find/grep are native stages; nl's runtime-derived
+> enums; echo's no-clear-flag cut; echo's options-after-operand
+> divergence).  Everything else: the hand parser is gone and
 > the differential matrix is the proof.
 >
 >     schemas/<name>.dhall          SINGLE SOURCE OF TRUTH per command:
@@ -516,16 +520,22 @@ its own output is a no-op; this is what composes with the journal's roll-forward
 
 ## Honest cut — where NOT to do this
 
-- **The flag vocabulary does not cover single-dash multi-char flags**
-  (`-name`, `-maxdepth`, `-type`): a short must be exactly `-<c>` and a long
-  exactly `--<word>`, so those tokens cannot be declared in a schema.  They stay
-  hand-parser territory in fx-find/fx-grep, which is why those two are NATIVE
-  pipeline stages and why their binaries grew a long-form `--rows` mode (U10)
-  so the run-mode executor's `find | grep` means the same thing as the record
-  path's `find |> grep`.  This is the single biggest v1 vocabulary gap; the full
-  inventory of what is NOT schema-expressible (roles, argv plans, engine-
-  synthesised stage flags, non-stage commands like the mutators) is documented
-  in [`schemas/README.md`](./schemas/README.md).
+- **The flag vocabulary now covers the single-dash multi-char surface that
+  drove the old cut** (`-name`, `-maxdepth` declare as multi-char shorts
+  that never cluster; `-type f|d` as an `Enum` selector carrying
+  `value = Some "<argv spelling>"`; seq's 1/2/3-operand arity as the
+  `counts` positional remap), so find/grep/seq no longer keep hand parsers
+  — find/grep remain NATIVE pipeline stages (`fx-eval`'s nativeFind) as a
+  composition-choice cut, not a vocabulary one, and their binaries keep
+  the long-form `--rows` mode (U10) that lets the run-mode executor's
+  `find | grep` mean the same thing as the record path's
+  `find |> grep`.  Still not schema-expressible, deliberately:
+  fx-basename's mode-dependent `-a` operand routing, a required-operand
+  vocabulary (placeholder defaults + `main()` checks stand),
+  fx-true/fx-false stay schema-less (nothing to configure), and the full
+  engine-side inventory (roles, argv plans, engine-synthesised stage
+  flags, non-stage commands like the mutators) documented in
+  [`schemas/README.md`](./schemas/README.md).
 - **Streaming transform tools** (`cat`, `head`, `tail`, `sed`, `awk`, `tr`,
   `dd`): their value-add isn't a data model — don't back a 10GB file as facts.
   Determinism is already their default when inputs are deterministic. Keep them

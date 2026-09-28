@@ -171,11 +171,18 @@ zig build run-compose -- …      # run fx-compose
 
 ## Known limitations (documented, by design)
 
-* **Hand-parser exceptions.** `fx-find`, `fx-grep` and `fx-seq` keep a full hand
-  POSIX parser on main's path — their schemas declare `flags = []`, a dead spec
-  for that surface. `fx-what`/`fx-why` are POSIX-only (no runtime record
-  evaluator). `fx-basename`'s `-a` operand-routing arm cannot be expressed and
-  is cut. See the file-map note in [`concept.md`](./concept.md).
+* **Migrated surface.** Every schema-backed command's POSIX parser is
+  generated from its schema (`src/generated/cli_<name>.zig`), including
+  `fx-find`, `fx-grep`, `fx-seq` and the new `fx-log`/`fx-undo` schemas,
+  and `fx-what`/`fx-why` have runtime Dhall-record evaluators — so all of
+  them run the shared differential runner.  Still cut, deliberately:
+  `fx-basename`'s `-a`
+  operand-routing arm (mode-dependent operand routing is not expressible)
+  and required operands (the placeholder-default + `main()` check
+  convention stands).  `fx-true`/`fx-false` stay schema-less (nothing to
+  configure).  See the file-map note in [`concept.md`](./concept.md) and
+  the vocabulary inventory in
+  [`schemas/README.md`](./schemas/README.md).
 * **Empty-list / `None` rendering.** `renderDhallRecord` annotates empty lists
   and `None` for the round-trip; the per-command repair helpers are bounded and
   heap-backed (`cli.repairDhallRecordSpellings`).

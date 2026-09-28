@@ -172,11 +172,11 @@
   "doc": "walk a directory closure via Datalog reachability from ROOT",
   "usage": "usage: fx-find [OPTIONS] [ROOT]",
   "args": [
-    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": []},
-    {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": []},
+    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": [ { "short": "-maxdepth", "long": null, "kind": "Value", "value": null } ]},
+    {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": "-name", "long": null, "kind": "Value", "value": null } ]},
     {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []},
     {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]},
-    {"field": "type_filter", "type": "Optional < Dir | File >", "default": "None < Dir | File >", "positional": null, "flags": []}
+    {"field": "type_filter", "type": "Optional < Dir | File >", "default": "None < Dir | File >", "positional": null, "flags": [ { "short": "-type", "long": null, "kind": "Enum", "value": "File" }, { "short": "-type", "long": null, "kind": "Enum", "value": "Dir" } ]}
   ],
   "mutually_exclusive": []
 },
@@ -185,8 +185,8 @@
   "doc": "print lines of files under ROOT matching a regex PATTERN",
   "usage": "usage: fx-grep [OPTIONS] [PATTERN] [ROOT]",
   "args": [
-    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": []},
-    {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": []},
+    {"field": "maxdepth", "type": "Optional Natural", "default": "None Natural", "positional": null, "flags": [ { "short": "-maxdepth", "long": null, "kind": "Value", "value": null } ]},
+    {"field": "name_glob", "type": "Optional Text", "default": "None Text", "positional": null, "flags": [ { "short": "-name", "long": null, "kind": "Value", "value": null } ]},
     {"field": "pattern", "type": "Text", "default": "\"\"", "positional": { "display":"PATTERN", "many":false }, "flags": []},
     {"field": "root", "type": "Text", "default": "\".\"", "positional": { "display":"ROOT", "many":false }, "flags": []},
     {"field": "rows", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": null, "long": "--rows", "kind": "Flag", "value": null } ]}
@@ -244,6 +244,15 @@
     {"field": "dst", "type": "Text", "default": "\"\"", "positional": { "display":"LINK_NAME", "many":false }, "flags": []},
     {"field": "src", "type": "Text", "default": "\"\"", "positional": { "display":"TARGET", "many":false }, "flags": []},
     {"field": "symbolic", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-s", "long": "--symbolic", "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "log",
+  "doc": "list the last N entries of the global derivation log",
+  "usage": "usage: fx-log [N]",
+  "args": [
+    {"field": "count", "type": "Optional Natural", "default": "None Natural", "positional": { "display":"N", "many":false }, "flags": []}
   ],
   "mutually_exclusive": []
 },
@@ -365,11 +374,11 @@
 {
   "name": "seq",
   "doc": "print a sequence of numbers FIRST..LAST (step INC)",
-  "usage": "usage: fx-seq",
+  "usage": "usage: fx-seq [FIRST] [INC] [LAST]",
   "args": [
-    {"field": "first", "type": "Integer", "default": "1", "positional": null, "flags": []},
-    {"field": "inc", "type": "Integer", "default": "1", "positional": null, "flags": []},
-    {"field": "last", "type": "Integer", "default": "0", "positional": null, "flags": []}
+    {"field": "first", "type": "Integer", "default": "1", "positional": { "display":"FIRST", "many":false }, "flags": []},
+    {"field": "inc", "type": "Integer", "default": "1", "positional": { "display":"INC", "many":false }, "flags": []},
+    {"field": "last", "type": "Integer", "default": "0", "positional": { "display":"LAST", "many":false }, "flags": []}
   ],
   "mutually_exclusive": []
 },
@@ -522,6 +531,15 @@
     {"field": "os", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-o", "long": "--operating-system", "kind": "Flag", "value": null } ]},
     {"field": "release", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-r", "long": "--release", "kind": "Flag", "value": null } ]},
     {"field": "version", "type": "Bool", "default": "False", "positional": null, "flags": [ { "short": "-v", "long": null, "kind": "Flag", "value": null } ]}
+  ],
+  "mutually_exclusive": []
+},
+{
+  "name": "undo",
+  "doc": "undo one entry of the global derivation log (default: the last)",
+  "usage": "usage: fx-undo [SEQ]",
+  "args": [
+    {"field": "seq", "type": "Optional Natural", "default": "None Natural", "positional": { "display":"SEQ", "many":false }, "flags": []}
   ],
   "mutually_exclusive": []
 },

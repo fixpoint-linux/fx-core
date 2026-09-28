@@ -21,19 +21,16 @@
 // pair (wire.declaredFieldKinds + wire.encodeRowsOrdered over the registry
 // record type below).
 //
-// MIGRATION STATUS (a deliberate PARTIAL, unlike ls/cp/mv — the fx-seq
-// precedent): Options is an ALIAS of the generated cli_find.Options and the
-// record side is differential-tested through the schema completion — but the
-// POSIX form STAYS on the hand parser.  schemas/find.dhall documents why:
-// -name/-type/-maxdepth are single-dash MULTI-CHAR tokens (expressible
-// neither as a short "-<c>" nor a long "--<name>"), and `-type f|d` is a
-// VALUE-CONSUMING enum selector no v1 flag kind models — the vocabulary gap.
-// cli_find.parsePosix is therefore record-form-plus---rows only (it binds
-// the ROOT positional and the plain-long --rows, and rejects every other
-// flag), and replacing the hand parser would break `-name`/`-type`/
-// `-maxdepth` entirely.  The differential matrix pins the SHARED surface
-// (the root positional, --rows, `--`, defaults) and the rejection class
-// that keeps the gap explicit.
+// MIGRATION STATUS (COMPLETE — the ls/cp/mv precedent, the seq flip done):
+// Options is an ALIAS of the generated cli_find.Options and BOTH arg forms
+// derive from schemas/find.dhall.  The FORMER vocabulary gap is closed: U1
+// grew the generator a single-dash multi-char short token (-name/-maxdepth,
+// never clustered) and the value-consuming enum selector (`-type f|d`, two
+// flags entries with kind Enum + value), so cli_find.parsePosix now binds the
+// whole POSIX surface and the hand parser is DELETED.  parsePosixArgs below
+// is the generated parser (aliased), and the differential matrix drives the
+// schema-completed record form through the shared runner
+// (cli.expectPosixEqualsRecord) against it.
 //
 // RENAME NOTE (schemas/find.dhall, the seq "increment"->"inc" precedent):
 // the hand record form read the JSON keys `name` and `type`; the schema
@@ -79,9 +76,10 @@ extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_sta
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// CLI option model — GENERATED for the record side (single source of truth:
-// schemas/find.dhall).  The POSIX side stays HAND (see the header: the
-// vocabulary gap).
+// CLI option model — GENERATED (single source of truth: schemas/find.dhall,
+// both arg forms).  The POSIX parser is the generated one too: the
+// single-dash multi-char trio and the -type f|d selector family are in the
+// schema now (the header's MIGRATION STATUS).
 // ---------------------------------------------------------------------------
 
 // cli_find.Options.type_filter is `?enum { Dir, File }` — the same members as
@@ -91,10 +89,14 @@ const Options = cli_find.Options;
 
 const TypeFilter = @typeInfo(@FieldType(Options, "type_filter")).optional.child; // enum { Dir, File }
 
-// The old hand parser spelled the tags f/d; keep the walk/main dispatch
-// sites readable under the schema's File/Dir spelling.
+// The hand parser spelled the tags f/d; the walk/main dispatch sites below
+// stay readable under the schema's File/Dir spelling.
 const TypeFilter_f: TypeFilter = .File;
 const TypeFilter_d: TypeFilter = .Dir;
+
+// The POSIX parser IS the generated one now (both arg forms derive from
+// schemas/find.dhall; the hand parser this alias replaces is deleted).
+const parsePosixArgs = cli_find.parsePosix;
 
 /// The --rows wire record type: find's declared pipeline rows type.  The
 /// The schema's `out` section, via the generated cli_find.zig — ONE literal
@@ -162,27 +164,21 @@ test "globMatch" {
 }
 
 // ---------------------------------------------------------------------------
-// THE DIFFERENTIAL TEST — record-side half (the fx-seq template; see the
-// header for why the POSIX side stays hand)
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls STEP-2 template)
 // ---------------------------------------------------------------------------
 //
-// UPSTREAM BLOCKER (reported; fx-cli.zig is outside this batch's scope):
-// the shared runner cli.expectPosixEqualsRecord is UNUSABLE for find.  Its
-// record side is completeSrc -> renderDhallRecord -> evalDhallArgs, and
-// renderValue's .none_ arm (fx-cli.zig) emits a BARE `None` — which this
-// dhall-c subset's parser rejects in value position (only the annotated
-// `None Natural` / `None Text` / `None < File | Dir >` forms parse; probes in
-// this file's history).  Every find completion carries at least one None
-// (name_glob/maxdepth/type_filter have no POSIX spelling), so EVERY vector
-// would die in evalDhallArgs.  schemas/find.dhall's RENDER CAVEAT has this
-// inverted: the render side is what is broken, not the .some arm.  The fix —
-// render `None` with its ty-projected inner type — belongs in fx-cli.zig.
-//
-// Until then find gets the fx-seq treatment: a record-side differential
-// through the schema completion for the ALL-SOME vectors (which render
-// parsably), direct evalDhallArgs pins for the defaults, and the JSON-layer
-// unit tests (term_to_json renders None as `null`, which jsonParseOpts
-// accepts — the RUNTIME record path is unaffected by the render bug).
+// For a matrix of POSIX argv vectors, the GENERATED parser (parsePosixArgs,
+// aliased above) must produce the SAME Options as the Dhall-record form of
+// the same user intent, driven through the schema completion
+// ((dflt // user) : ty, cli.completeSrc), rendered back to a record literal
+// (cli.renderDhallRecord) and evaluated by THIS file's evalDhallArgs — the
+// exact runtime path `fx-find '{ ... }'` takes.  Both sides are re-encoded to
+// the canonical term_to_json wire shape (the SHARED comptime-reflection
+// encoder cli.encodeOptionsWire) and compared as strings, so the assertion is
+// exact and FIELD-COMPLETE by construction.  (The pre-U0 render bug that once
+// blocked this runner — a bare unparseable `None` / the .some arm's
+// Optional-typed union projection — is fixed in fx-cli.zig; the note this
+// file used to carry describing it as a live blocker is gone with it.)
 
 /// Locate schemas/find.dhall (tests run from varying CWDs).  Caller frees.
 fn findSchemaSrc() [:0]u8 {
@@ -190,12 +186,10 @@ fn findSchemaSrc() [:0]u8 {
         @panic("cannot locate schemas/find.dhall (run tests from the fx-core root)");
 }
 
-/// One record-side differential vector: (1) the record must be SCHEMA-VALID
-/// (the (dflt // user) : ty completion succeeds), and (2) the SAME record
-/// source evaluated by THIS file's evalDhallArgs — the exact runtime path
+/// One record-side differential vector: the record must be SCHEMA-VALID
+/// (the (dflt // user) : ty completion succeeds), and the SAME record source
+/// evaluated by THIS file's evalDhallArgs — the exact runtime path
 /// `fx-find '{ ... }'` takes — must equal the expected Options field-for-field.
-/// (The completion's renderDhallRecord leg is unusable for find until the
-/// fx-cli renderer is fixed — see the blocker note above.)
 fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -218,136 +212,154 @@ fn expectRecordEqualsOptions(user_record: [:0]const u8, expected: Options) !void
     try std.testing.expectEqual(expected.rows, record_o.rows);
 }
 
-test "DIFFERENTIAL: schema-valid record form matches the generated Options" {
-    // Optional fields must be spelled Some <value>: the annotation check
-    // rejects a bare value against `Optional T` (probe-pinned in
-    // "record-form rejections" below via { name_glob = "*.c" }).
+/// One differential vector for fx-find — a one-line wrapper over the SHARED
+/// generic runner: the same intent as a POSIX argv vector, parsed by the
+/// generated parser and driven through completeSrc -> renderDhallRecord ->
+/// evalDhallArgs on the record side, encodeOptionsWire on both sides, exact
+/// string compare (the fx-ls STEP-2 template).
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_find, &.{ "schemas/find.dhall", "fx-core/schemas/find.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- defaults: no args (root ".", the three Optionals None) ---
+    try expectPosixEqualsRecord(&.{"fx-find"}, "{ }");
+
+    // --- each new-vocabulary flag ALONE: -name / -maxdepth / -type f|d ---
+    try expectPosixEqualsRecord(&.{ "fx-find", "-name", "*.c" }, "{ name_glob = Some \"*.c\" }");
+    try expectPosixEqualsRecord(&.{ "fx-find", "-maxdepth", "3" }, "{ maxdepth = Some 3 }");
+    try expectPosixEqualsRecord(&.{ "fx-find", "-maxdepth", "0" }, "{ maxdepth = Some 0 }");
+    try expectPosixEqualsRecord(&.{ "fx-find", "-type", "f" }, "{ type_filter = Some < File | Dir >.File }");
+    try expectPosixEqualsRecord(&.{ "fx-find", "-type", "d" }, "{ type_filter = Some < File | Dir >.Dir }");
+
+    // --- the root positional, alone and flag-interleaved ---
+    try expectPosixEqualsRecord(&.{ "fx-find", "/tmp" }, "{ root = \"/tmp\" }");
+    try expectPosixEqualsRecord(&.{ "fx-find", "-name", "*.c", "/tmp" }, "{ root = \"/tmp\", name_glob = Some \"*.c\" }");
+    try expectPosixEqualsRecord(&.{ "fx-find", "/tmp", "-name", "*.c" }, "{ root = \"/tmp\", name_glob = Some \"*.c\" }");
+
+    // --- combined vectors: the whole surface at once, both token orders ---
+    try expectPosixEqualsRecord(
+        &.{ "fx-find", "-name", "*.c", "-type", "d", "-maxdepth", "2", "/tmp" },
+        "{ root = \"/tmp\", name_glob = Some \"*.c\", type_filter = Some < File | Dir >.Dir, maxdepth = Some 2 }",
+    );
+    try expectPosixEqualsRecord(
+        &.{ "fx-find", "-maxdepth", "3", "-type", "f", "-name", "a?c", "/w" },
+        "{ root = \"/w\", name_glob = Some \"a?c\", type_filter = Some < File | Dir >.File, maxdepth = Some 3 }",
+    );
+
+    // --- --rows (the plain long) alone and combined with the new flags ---
+    try expectPosixEqualsRecord(&.{ "fx-find", "--rows", "/tmp" }, "{ root = \"/tmp\", rows = True }");
+    try expectPosixEqualsRecord(
+        &.{ "fx-find", "--rows", "-name", "*.c", "-type", "f", "-maxdepth", "1", "/tmp" },
+        "{ root = \"/tmp\", name_glob = Some \"*.c\", type_filter = Some < File | Dir >.File, maxdepth = Some 1, rows = True }",
+    );
+
+    // --- None-carrying completions (the pre-U0 blocker shape): the
+    // annotated `None ...` spellings must render, parse back, and mean the
+    // same defaults the bare argv leaves ---
+    try expectPosixEqualsRecord(
+        &.{"fx-find"},
+        "{ root = \".\", name_glob = None Text, type_filter = None < File | Dir >, maxdepth = None Natural, rows = False }",
+    );
+    try expectPosixEqualsRecord(
+        &.{ "fx-find", "-name", "*.c" },
+        "{ name_glob = Some \"*.c\", maxdepth = None Natural, type_filter = None < File | Dir > }",
+    );
+
+    // --- `--` terminator: the flag-looking token after it is the operand ---
+    try expectPosixEqualsRecord(&.{ "fx-find", "--", "-name" }, "{ root = \"-name\" }");
+}
+
+test "DIFFERENTIAL: record-side schema-valid records match the generated Options" {
+    // The record half pinned DIRECTLY against evalDhallArgs (the exact
+    // runtime path) — the Some-spelling rule and the union inside Some:
     try expectRecordEqualsOptions(
         "{ root = \"/x\", name_glob = Some \"*.c\", maxdepth = Some 2 }",
         .{ .root = "/x", .name_glob = "*.c", .maxdepth = 2, .type_filter = null },
     );
     try expectRecordEqualsOptions(
-        "{ root = \"/y\", name_glob = Some \"a?c\", maxdepth = Some 0 }",
-        .{ .root = "/y", .name_glob = "a?c", .maxdepth = 0, .type_filter = null },
-    );
-    // the type_filter union must ALSO sit inside Some (Optional < File | Dir >)
-    try expectRecordEqualsOptions(
         "{ root = \"/z\", type_filter = Some < File | Dir >.Dir }",
         .{ .root = "/z", .name_glob = null, .maxdepth = null, .type_filter = TypeFilter_d },
     );
-    // every field at once (the typed-payload union spelling < f : Text |
-    // d : Text > does NOT survive the annotation check — the completion
-    // rejects it; only the nullary File/Dir tags are schema-valid)
     try expectRecordEqualsOptions(
         "{ root = \"/w\", name_glob = Some \"*.c\", maxdepth = Some 3, type_filter = Some < File | Dir >.File }",
         .{ .root = "/w", .name_glob = "*.c", .maxdepth = 3, .type_filter = TypeFilter_f },
     );
-    // the rows flag is a plain Bool in the record form (Lens-3 dispatch,
-    // the fx-tree convention) and lands on Options.rows
     try expectRecordEqualsOptions(
         "{ root = \"/r\", rows = True }",
         .{ .root = "/r", .name_glob = null, .maxdepth = null, .type_filter = null, .rows = true },
     );
 }
 
-test "DIFFERENTIAL: generated parsePosix equals the record form on the SHARED surface" {
-    // The shared runner is blocked upstream (see above), so the root-positional
-    // parity between the generated parser and the record form is pinned
-    // directly: both sides of the same intent, evaluated and compared.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const gpa = arena_state.allocator();
-
-    const posix_o = try cli_find.parsePosix(&.{ "fx-find", "/tmp" }, gpa);
-    const record_o = try evalDhallArgs("{ root = \"/tmp\" }", gpa);
-    try std.testing.expectEqualStrings(posix_o.root, record_o.root);
-    try std.testing.expectEqual(posix_o.name_glob, record_o.name_glob);
-    try std.testing.expectEqual(posix_o.maxdepth, record_o.maxdepth);
-    try std.testing.expectEqual(posix_o.type_filter, record_o.type_filter);
-
-    // empty argv vs the all-defaults record (root ".", everything None —
-    // the record side takes the { } literal, not a completion render)
-    const dflt_o = try cli_find.parsePosix(&.{"fx-find"}, gpa);
-    const empty_o = try evalDhallArgs("{ }", gpa);
-    try std.testing.expectEqualStrings(dflt_o.root, empty_o.root);
-    try std.testing.expectEqual(dflt_o.name_glob, empty_o.name_glob);
-    try std.testing.expectEqual(dflt_o.maxdepth, empty_o.maxdepth);
-    try std.testing.expectEqual(dflt_o.type_filter, empty_o.type_filter);
-    try std.testing.expectEqual(dflt_o.rows, empty_o.rows);
-
-    // --rows is on the SHARED surface now (a plain long both parsers take):
-    // generated and hand+record forms agree on it, like the root positional.
-    const rows_gen_o = try cli_find.parsePosix(&.{ "fx-find", "--rows", "/tmp" }, gpa);
-    const rows_hand_o = try parsePosixArgs(&.{ "fx-find", "--rows", "/tmp" }, gpa);
-    try std.testing.expect(rows_gen_o.rows);
-    try std.testing.expect(rows_hand_o.rows);
-    try std.testing.expectEqualStrings(rows_gen_o.root, rows_hand_o.root);
-}
-
-test "DIFFERENTIAL: the vocabulary-gap flags are generated-rejected (the gap pinned)" {
+test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
     // an arena over the testing allocator (the generated parser's documented
     // no-free-on-error discipline)
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
-    // -name/-type/-maxdepth are single-dash multi-char tokens: the generated
-    // parser has no vocabulary for them (UnknownOption), while the HAND
-    // parser — the one main() keeps using — accepts them.  Both sides of this
-    // pin are asserted so the gap cannot silently close or widen.  (--rows is
-    // the ONE flag on the shared surface — a plain long — and is asserted in
-    // the SHARED-surface differential above.)
-    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-name", "*.c" }, gpa));
-    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-type", "f" }, gpa));
-    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-maxdepth", "3" }, gpa));
-    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "-Zz" }, gpa));
-    try std.testing.expectError(error.UnknownOption, cli_find.parsePosix(&.{ "fx-find", "--bogus" }, gpa));
+    // an unknown flag/cluster is UnknownOption on both spellings
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-find", "-Zz" }, gpa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-find", "--bogus" }, gpa));
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-find", "--bogus=x" }, gpa));
 
     // a SECOND bare operand: the generated single-slot binding rejects it
-    // (the fx-du/fx-tree precedent) where the hand parser is LAST-WINS
-    try std.testing.expectError(error.UnexpectedOperand, cli_find.parsePosix(&.{ "fx-find", "/a", "/b" }, gpa));
-    // the hand parser keeps last-wins (the schemas/find.dhall documented
-    // divergence it still owns while the POSIX side stays hand)
-    {
-        var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_i.deinit();
-        const aa = arena_i.allocator();
-        const args = [_][:0]const u8{ "fx-find", "/a", "/b" };
-        const o = try parsePosixArgs(&args, aa);
-        try std.testing.expectEqualStrings("/b", o.root);
-    }
+    // (the fx-du/fx-tree precedent).  The hand parser this replaced was
+    // LAST-WINS (each bare operand overwrote root); no caller relied on
+    // that — the deliberate strengthening, pinned here.
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-find", "/a", "/b" }, gpa));
 
-    // the hand parser's own spellings still bind (f/d, maxdepth coercion)
-    {
-        var arena_i = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_i.deinit();
-        const aa = arena_i.allocator();
-        const args = [_][:0]const u8{ "fx-find", "-name", "*.c", "-type", "d", "-maxdepth", "2", "/tmp" };
-        const o = try parsePosixArgs(&args, aa);
-        try std.testing.expectEqualStrings("*.c", o.name_glob.?);
-        try std.testing.expectEqual(@as(?TypeFilter, TypeFilter_d), o.type_filter);
-        try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
-        try std.testing.expectEqualStrings("/tmp", o.root);
-    }
-}
+    // -name/-maxdepth consume a value: a trailing token is MissingValue
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-find", "-name" }, gpa));
+    try std.testing.expectError(error.MissingValue, parsePosixArgs(&.{ "fx-find", "-maxdepth" }, gpa));
 
-test "DIFFERENTIAL: record-form rejections at completion time" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const gpa = arena_state.allocator();
+    // a non-numeric -maxdepth is the generated parser's BadValue
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-find", "-maxdepth", "x" }, gpa));
+
+    // an unknown -type VALUE is the selector family's BadValue ("is not one
+    // of: d, f") — the hand parser's BadType class, generated spelling
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-find", "-type", "x" }, gpa));
+
+    // a REPEATED -type is the selector family's built-in Conflict (the hand
+    // parser last-wins'd silently)
+    try std.testing.expectError(error.Conflict, parsePosixArgs(&.{ "fx-find", "-type", "f", "-type", "d" }, gpa));
+    try std.testing.expectError(error.Conflict, parsePosixArgs(&.{ "fx-find", "-type", "d", "-type", "f" }, gpa));
+
+    // the record form's own rejections, at completion time: unknown field
+    // (the old hand-layer keys `name`/`type` — the RENAME NOTE), wrong
+    // types, a bogus union alternative
     const schema_src = findSchemaSrc();
     defer std.testing.allocator.free(schema_src);
-
-    // unknown field / wrong type — and the OLD hand-layer key spellings
-    // `name` and `type`, gone from the schema in favor of the struct names
-    // `name_glob`/`type_filter` (the seq "increment"->"inc" precedent)
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ root = 5 }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ name = \"*.c\" }"));
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ maxdepth = \"x\" }"));
-
-    // a bogus type_filter union alternative is a COMPLETION rejection
     try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ type_filter = < File | Dir >.Socket }"));
+}
+
+test "parsePosixArgs binds the new-vocabulary flags (generated)" {
+    // an arena over the testing allocator (the generated parser's documented
+    // no-free-on-error discipline)
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // the hand parser's own spellings, now through the generated parser:
+    // f/d, maxdepth coercion, the multi-char shorts never cluster
+    const args = [_][]const u8{ "fx-find", "-name", "*.c", "-type", "d", "-maxdepth", "2", "/tmp" };
+    const o = try parsePosixArgs(&args, gpa);
+    try std.testing.expectEqualStrings("*.c", o.name_glob.?);
+    try std.testing.expectEqual(@as(?TypeFilter, TypeFilter_d), o.type_filter);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
+    try std.testing.expectEqualStrings("/tmp", o.root);
+
+    // defaults unchanged
+    const dflt = try parsePosixArgs(&.{"fx-find"}, gpa);
+    try std.testing.expectEqualStrings(".", dflt.root);
+    try std.testing.expect(dflt.name_glob == null);
+    try std.testing.expect(dflt.maxdepth == null);
+    try std.testing.expect(dflt.type_filter == null);
+    try std.testing.expect(!dflt.rows);
 }
 
 test "jsonParseOpts full record (schema key names)" {
@@ -575,7 +587,7 @@ fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
         } else if (i < s.len and (s[i] == 't' or s[i] == 'f')) {
             const b = jsonParseBool(s, &i) orelse return null;
             if (std.mem.eql(u8, key, "rows")) res.rows = b;
-        } else if (i < s.len and s[i] == 'n' and (std.mem.startsWith(u8, s[i..], "null") or std.mem.eql(u8, s[i..i + 4], "None"))) {
+        } else if (i < s.len and s[i] == 'n' and (std.mem.startsWith(u8, s[i..], "null") or std.mem.eql(u8, s[i .. i + 4], "None"))) {
             i += 4; // None (Optional absent) — term_to_json's `null`, or the
             // completed-record render's bare `None` (the annotation
             // lives only in the schema source; see findSchemaSrc below)
@@ -674,49 +686,6 @@ fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
         .File => .File,
         .Dir => .Dir,
     };
-    return o;
-}
-
-// ---------------------------------------------------------------------------
-// POSIX-style fallback arg parsing
-// ---------------------------------------------------------------------------
-
-fn parsePosixArgs(args: []const [:0]const u8, gpa: Allocator) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-name") and i + 1 < args.len) {
-            i += 1;
-            o.name_glob = try gpa.dupe(u8, args[i]);
-        } else if (std.mem.eql(u8, a, "-type") and i + 1 < args.len) {
-            i += 1;
-            // the POSIX spelling stays f|d; the schema union is File|Dir
-            if (std.mem.eql(u8, args[i], "f")) {
-                o.type_filter = TypeFilter_f;
-            } else if (std.mem.eql(u8, args[i], "d")) {
-                o.type_filter = TypeFilter_d;
-            } else {
-                std.debug.print("fx-find: unsupported -type '{s}'\n", .{args[i]});
-                return error.BadType;
-            }
-        } else if (std.mem.eql(u8, a, "-maxdepth") and i + 1 < args.len) {
-            i += 1;
-            const n = std.fmt.parseInt(u64, args[i], 10) catch {
-                std.debug.print("fx-find: bad -maxdepth '{s}'\n", .{args[i]});
-                return error.BadMaxdepth;
-            };
-            o.maxdepth = n;
-        } else if (std.mem.eql(u8, a, "--rows")) {
-            o.rows = true;
-        } else if (a.len > 0 and a[0] == '-' and a.len > 1) {
-            std.debug.print("fx-find: unknown option '{s}'\n", .{a});
-            return error.UnknownOption;
-        } else {
-            // positional root (LAST-WINS on further bare operands)
-            o.root = try gpa.dupe(u8, a);
-        }
-    }
     return o;
 }
 

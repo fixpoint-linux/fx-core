@@ -1,9 +1,15 @@
 // fx-undo.zig — inverse-effect application over the global derivation log + CAS
 // (Option B; see concept.md).  The follow-up to the fxmut batch.
 //
-// Two arg forms (POSIX only — it has nothing to parameterize via Dhall):
-//   fx-undo              undo the LAST (highest-seq) entry
-//   fx-undo SEQ          undo the entry with the given seq
+// Two arg forms, ONE source of truth (schemas/undo.dhall):
+//   fx-undo '{ seq = Some 3 }'      the Dhall record form
+//   fx-undo SEQ                     the POSIX form
+// - Some SEQ undoes the entry with that sequence number; None (the default)
+//   undoes the LAST (highest-seq) entry.  None is genuinely "no choice",
+//   not 0: main() passes the Optional straight to selectEntry
+//   (fx-undo.zig:554), whose seq==null arm scans for the maximum — a
+//   coerced-to-0 None would look up seq 0 (no entry ever carries it) and
+//   fail with NoEntry (the silent-mis-target trap the schema documents).
 //
 // Semantics — the DESIGN C undo rule, verbatim:
 //   effects are logged in APPLICATION order; undo applies the INVERSE of each
@@ -59,11 +65,25 @@
 const std = @import("std");
 const caslog = @import("caslog");
 const dh = @import("dhall");
+const cli_undo = @import("cli-undo");
+const cli = @import("fx-cli");
+
+const dhall = dh.dhall;
+const arena = dh.arena;
+const ast = dh.ast;
+const parser = dh.parser;
+const typecheck = dh.typecheck;
+const normalize = dh.normalize;
+const serialize = dh.serialize;
+const import_mod = dh.import_mod;
 
 const dl = caslog.dl;
 const Allocator = std.mem.Allocator;
 const Effect = caslog.Effect;
 const LogEntry = caslog.LogEntry;
+
+const Options = cli_undo.Options;
+const parsePosixArgs = cli_undo.parsePosix; // the generated POSIX parser
 
 // Locally-defined constants (no @cInclude of fcntl.h / unistd.h).  AT_FDCWD =
 // -100, AT_SYMLINK_NOFOLLOW = 0x100, AT_SYMLINK_FOLLOW = 0x400, O_RDONLY = 0,
@@ -567,6 +587,175 @@ fn selectEntry(entries: []const LogEntry, seq: ?u64) UndoErr!LogEntry {
 }
 
 // ---------------------------------------------------------------------------
+// CLI option model — GENERATED (single source of truth: schemas/undo.dhall)
+// ---------------------------------------------------------------------------
+//
+// `seq` keeps its real Optional Natural (None = the LAST entry, Some SEQ =
+// that entry): the None-vs-0 distinction lives in selectEntry, whose
+// seq==null arm takes the highest-seq entry.
+
+fn usage() void {
+    // no format args: the literal's `{ }` braces are Dhall record syntax,
+    // not placeholders, so the text goes through as a {s} argument
+    std.debug.print("{s}", .{
+        "usage: fx-undo [SEQ] | fx-undo '{ seq = ... }'\n",
+    });
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls STEP-2 template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal (fx-cli.renderDhallRecord) and evaluated by THIS
+// file's evalDhallArgs — the exact runtime path `fx-undo '{ ... }'` takes.
+// Both sides are re-encoded to the canonical term_to_json wire shape
+// (fx-cli.encodeOptionsWire) and compared as strings.
+
+// Minimal JSON object parser (the fx-what/fx-ls template): extracts
+// seq:Optional Natural (number or null).  STRICT (the fx-du rule): an
+// unknown key or value shape is a parse FAILURE, never a silent skip —
+// a schema/evaluator field mismatch must fail loudly, not fall back to
+// defaults.
+const JsonOpts = struct {
+    seq: ?u64 = null,
+};
+
+fn jsonSkipWs(s: []const u8, i: *usize) void {
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\t' or s[i.*] == '\n' or s[i.*] == '\r')) i.* += 1;
+}
+
+fn jsonExpect(s: []const u8, i: *usize, c: u8) bool {
+    jsonSkipWs(s, i);
+    if (i.* < s.len and s[i.*] == c) {
+        i.* += 1;
+        return true;
+    }
+    return false;
+}
+
+fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
+    if (!jsonExpect(s, i, '"')) return null;
+    var n: usize = 0;
+    while (i.* < s.len) : (i.* += 1) {
+        const c = s[i.*];
+        if (c == '"') {
+            i.* += 1;
+            return buf[0..n];
+        } else if (c == '\\') {
+            i.* += 1;
+            if (i.* >= s.len) return null;
+            const rep: u8 = switch (s[i.*]) {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' => 0x08,
+                'f' => 0x0C,
+                else => return null,
+            };
+            if (n >= buf.len) return null;
+            buf[n] = rep;
+            n += 1;
+        } else {
+            if (n >= buf.len) return null;
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    return null;
+}
+
+fn jsonParseOpts(s: []const u8) ?JsonOpts {
+    var res = JsonOpts{};
+    var i: usize = 0;
+    if (!jsonExpect(s, &i, '{')) return null;
+    if (jsonExpect(s, &i, '}')) return res; // empty object
+    while (true) {
+        var keybuf: [64]u8 = undefined;
+        const key = jsonParseString(s, &i, &keybuf) orelse return null;
+        if (!jsonExpect(s, &i, ':')) return null;
+        jsonSkipWs(s, &i);
+        if (i < s.len and std.ascii.isDigit(s[i])) {
+            const start = i;
+            while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+            const n = std.fmt.parseInt(u64, s[start..i], 10) catch return null;
+            if (!std.mem.eql(u8, key, "seq")) return null; // unknown key
+            res.seq = n;
+        } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
+            i += 4; // None (Optional absent)
+        } else {
+            return null; // unknown value shape -> could not parse fields
+        }
+        if (!jsonExpect(s, &i, ',')) break;
+    }
+    if (!jsonExpect(s, &i, '}')) return null;
+    return res;
+}
+
+/// The REAL record evaluator: parse -> infer -> normalize -> term_to_json ->
+/// field walk (the fx-ls template) — the exact runtime path
+/// `fx-undo '{ seq = Some 3 }'` takes.
+fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    arena.arena_reset(arena.dhall_arena.?);
+
+    const loader = import_mod.import_loader_new();
+    defer import_mod.import_loader_free(loader);
+
+    var p: dhall.Parser = std.mem.zeroes(dhall.Parser);
+    p.loader = loader;
+    var err: dhall.DhallError = undefined;
+    ast.dhall_error_clear(&err);
+    const t = parser.parse_source(&p, src, null, &err);
+    if (t == null) {
+        std.debug.print("fx-undo: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallParse;
+    }
+    const ty = typecheck.infer_type(&p, t.?, &err);
+    if (ty == null) {
+        std.debug.print("fx-undo: dhall type error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallType;
+    }
+    normalize.normalize_clear_error();
+    const nf = normalize.normalize(t.?);
+    if (normalize.normalize_has_error()) {
+        err = normalize.normalize_get_error().*;
+        std.debug.print("fx-undo: dhall normalize error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallNormalize;
+    }
+
+    var ob = std.ArrayList(u8).initCapacity(gpa, 4096) catch unreachable;
+    defer ob.deinit(gpa);
+    const out = ast.Out{ .b = &ob };
+    if (!serialize.term_to_json(out, nf, &err)) {
+        std.debug.print("fx-undo: dhall serialize error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallSerialize;
+    }
+
+    const opts = jsonParseOpts(ob.items) orelse {
+        std.debug.print("fx-undo: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
+        return error.DhallFields;
+    };
+
+    var o = Options{};
+    o.seq = opts.seq; // absent (None/null) stays the null default = LAST entry
+    return o;
+}
+
+/// One differential vector for fx-undo — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the fx-ls STEP-3 template
+/// each migration copies): the generated parser, the schema candidates, and
+/// the REAL runtime record evaluator above are the whole per-command surface.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_undo, &.{ "schemas/undo.dhall", "fx-core/schemas/undo.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -652,8 +841,12 @@ test "write inverse round-trip: overwrite restores prior dst bytes + mode" {
     try writeFileUnder(aa, tmp, "dst", "NEW");
 
     const entry = caslog.LogEntry{
-        .seq = 1, .ts = 0, .cwd = tmp, .cmd = "fx-cp",
-        .args_json = "{}", .effects = &.{eff},
+        .seq = 1,
+        .ts = 0,
+        .cwd = tmp,
+        .cmd = "fx-cp",
+        .args_json = "{}",
+        .effects = &.{eff},
     };
     try undoEntry(aa, state, entry);
     try std.testing.expectEqualStrings("OLD", try readAllUnder(aa, dst));
@@ -1190,6 +1383,88 @@ test "mkfifo inverse round-trip: unlinks the created fifo path" {
 }
 
 // ---------------------------------------------------------------------------
+// DIFFERENTIAL + evaluator tests (the U4 migration; fx-what template)
+// ---------------------------------------------------------------------------
+
+test "DIFFERENTIAL: generated parsePosix equals the Dhall-record form (matrix)" {
+    // --- the lazy-hide guards FIRST: the Some-carrying vector and the
+    // None vector must both mean what the POSIX side means ---
+    // no operand <-> { } (None = the LAST (highest-seq) entry; NOT seq 0)
+    try expectPosixEqualsRecord(&.{"fx-undo"}, "{ }");
+    // '3' <-> { seq = Some 3 }: the Optional-Some path, the coercion
+    try expectPosixEqualsRecord(&.{ "fx-undo", "3" }, "{ seq = Some 3 }");
+    // the None-carrying completion: the pre-renderfix blocker shape —
+    // `None Natural` must render, parse back, and mean the bare-argv
+    // defaults (undo the LAST entry), not "look up seq 0"
+    try expectPosixEqualsRecord(&.{"fx-undo"}, "{ seq = None Natural }");
+    // the operand after the '--' terminator (the generated parser's surface)
+    try expectPosixEqualsRecord(&.{ "fx-undo", "--", "7" }, "{ seq = Some 7 }");
+}
+
+test "evalDhallArgs: seq binds; None spellings keep it null (None is NOT 0)" {
+    const o = try evalDhallArgs("{ seq = Some 3 }", std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3), o.seq.?);
+
+    const n = try evalDhallArgs("{ seq = None Natural }", std.testing.allocator);
+    try std.testing.expect(n.seq == null);
+
+    // the semantic trap, at the evaluator level too: { } (no field) is
+    // None — selectEntry's null arm undoes the LAST entry — never Some 0
+    const e = try evalDhallArgs("{ }", std.testing.allocator);
+    try std.testing.expect(e.seq == null);
+}
+
+test "selectEntry: None means the LAST entry, never seq 0 (the Optional trap)" {
+    const entries = [_]LogEntry{
+        LogEntry{ .seq = 1, .ts = 0, .cwd = "/c", .cmd = "fx-touch", .args_json = "{}", .effects = &.{} },
+        LogEntry{ .seq = 5, .ts = 0, .cwd = "/c", .cmd = "fx-touch", .args_json = "{}", .effects = &.{} },
+        LogEntry{ .seq = 9, .ts = 0, .cwd = "/c", .cmd = "fx-touch", .args_json = "{}", .effects = &.{} },
+    };
+    // null (what a None parses to) selects the HIGHEST seq...
+    try std.testing.expectEqual(@as(u64, 9), (try selectEntry(&entries, null)).seq);
+    // ...Some names its exact entry...
+    try std.testing.expectEqual(@as(u64, 5), (try selectEntry(&entries, 5)).seq);
+    // ...and seq 0 names NOTHING (a coerced-to-0 None would fail loudly
+    // here instead of undoing the last entry silently)
+    try std.testing.expectError(error.NoEntry, selectEntry(&entries, 0));
+}
+
+test "jsonParseOpts: unknown key is a loud failure (the strict fx-du rule)" {
+    try std.testing.expect(jsonParseOpts("{\"typo\":true}") == null);
+    try std.testing.expect(jsonParseOpts("{\"seq\":\"3\"}") == null);
+    try std.testing.expect(jsonParseOpts("{\"seq\":3,\"ghost\":1}") == null);
+}
+
+test "DIFFERENTIAL: rejection parity — the generated parser fails loudly" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // a non-numeric operand: the Natural coercion failure (the hand
+    // parser's BadArg, now the generated parser's BadValue)
+    try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-undo", "x" }, gpa));
+    // unknown option; a SECOND positional
+    try std.testing.expectError(error.UnknownOption, parsePosixArgs(&.{ "fx-undo", "-Z" }, gpa));
+    try std.testing.expectError(error.UnexpectedOperand, parsePosixArgs(&.{ "fx-undo", "1", "2" }, gpa));
+
+    // the schema's own rejections (the record-form analogue): unknown
+    // field, wrong field type
+    const schema_src = cli.readSchemaFile(std.testing.allocator, &.{ "schemas/undo.dhall", "fx-core/schemas/undo.dhall" }) catch
+        @panic("cannot locate schemas/undo.dhall (run tests from the fx-core root)");
+    defer std.testing.allocator.free(schema_src);
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ typo = True }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ seq = -1 }"));
+    try std.testing.expectError(error.SchemaCheck, cli.completeSrc(gpa, schema_src, "{ seq = Some \"3\" }"));
+    // record-form rejection parity: a bare record literal infers its OWN
+    // type (there is no schema at the evaluator), so an unknown field or a
+    // wrong field type surfaces at the strict field walk (DhallFields) —
+    // never a silent default fallback.  (The schema-typed rejections are
+    // the SchemaCheck pins above.)
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ typo = True }", gpa));
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ seq = \"3\" }", gpa));
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1197,12 +1472,19 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const aa = init.arena.allocator();
 
-    // POSIX form only: optional positional SEQ = undo that entry; else last.
-    var seq: ?u64 = null;
-    if (args.len >= 2) {
-        seq = std.fmt.parseInt(u64, args[1], 10) catch {
-            std.debug.print("fx-undo: invalid seq '{s}'\n", .{args[1]});
-            return error.BadArg;
+    // The GENERATED parser (schemas/undo.dhall -> src/generated/cli_undo.zig)
+    // and the Dhall-record form share one dispatch, exactly like every other
+    // migrated command (the fx-du/fx-ls branch): a first argv token starting
+    // with '{' is the record form.
+    var opts: Options = undefined;
+    if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
+        opts = try evalDhallArgs(args[1], aa);
+    } else {
+        // the POSIX contract is pinned by the differential tests
+        // (expectPosixEqualsRecord + the direct generated-parser assertions)
+        opts = parsePosixArgs(args, aa) catch {
+            usage();
+            std.process.exit(2);
         };
     }
 
@@ -1217,7 +1499,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer caslog.freeLogEntries(aa, entries);
 
-    const entry = selectEntry(entries, seq) catch |e| {
+    // THE SEMANTIC TRAP: None (opts.seq == null) stays None — selectEntry's
+    // null arm undoes the LAST (highest-seq) entry.  Coercing the Optional
+    // to 0 here would look up seq 0 (no entry ever carries it) and fail
+    // with NoEntry instead of undoing the last entry.
+    const entry = selectEntry(entries, opts.seq) catch |e| {
         std.debug.print("fx-undo: no such entry\n", .{});
         return e;
     };

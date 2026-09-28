@@ -105,6 +105,14 @@ pub const Positional = struct {
     field: []const u8, // the ty field the operand binds
     display: []const u8, // usage operand name, e.g. "PATH"
     many: bool, // repeatable operand (binds a List field)
+    /// OPTIONAL arity remap (the seq shape): the operand TOTALS this slot
+    /// participates in — for total T the positionals whose counts contains
+    /// T (a counts-less positional participates in every total) bind the
+    /// T operands in declared order.  null when absent/None: the slot
+    /// fills strictly in walk order (the v1 rule every committed schema
+    /// uses).  A schema-level member, not a FlagKind ctor, so the 60
+    /// inline Flag/Positional aliases and 91 kind literals load unchanged.
+    counts: ?[]const u64 = null,
 };
 
 pub const Posix = struct {
@@ -286,6 +294,7 @@ fn posixDeinit(p: *Posix, gpa: Allocator) void {
     for (p.positionals) |pos| {
         gpa.free(pos.field);
         gpa.free(pos.display);
+        if (pos.counts) |c| gpa.free(c);
     }
     gpa.free(p.positionals);
     for (p.mutually_exclusive) |g| {
@@ -627,10 +636,32 @@ fn copyPosix(gpa: Allocator, t: *dhall.Term) Error!Posix {
             const many_v = recField(item, "many") orelse return error.SchemaShape;
             if (field_v.tag != .TmText or display_v.tag != .TmText) return error.SchemaShape;
             if (many_v.tag != .TmConst or many_v.as.c.kind != .C_BOOL) return error.SchemaShape;
+            // counts : Optional (List Natural) — the OPTIONAL arity remap
+            // (see Positional.counts).  Absent or None -> null (the strict
+            // walk order every pre-counts schema uses); Some [...] -> the
+            // operand totals this slot participates in.
+            var counts: ?[]const u64 = null;
+            if (recField(item, "counts")) |cnt| {
+                if (cnt.tag == .TmSome) {
+                    const lst = cnt.as.some.val orelse return error.SchemaShape;
+                    if (lst.tag != .TmNil and lst.tag != .TmCons) return error.SchemaShape;
+                    var nums = std.ArrayList(u64).empty;
+                    errdefer nums.deinit(gpa);
+                    var r = lst;
+                    while (r.tag == .TmCons) : (r = r.as.cons.tail.?) {
+                        const nm = r.as.cons.head orelse return error.SchemaShape;
+                        if (nm.tag != .TmConst or nm.as.c.kind != .C_NAT or nm.as.c.bnat != null)
+                            return error.SchemaShape;
+                        nums.append(gpa, nm.as.c.nat) catch return error.OutOfMemory;
+                    }
+                    counts = nums.toOwnedSlice(gpa) catch return error.OutOfMemory;
+                } else if (cnt.tag != .TmNone) return error.SchemaShape;
+            }
             positionals.append(gpa, .{
                 .field = try dupeStr(gpa, std.mem.span(field_v.as.text.?.lit.?)),
                 .display = try dupeStr(gpa, std.mem.span(display_v.as.text.?.lit.?)),
                 .many = many_v.as.c.b,
+                .counts = counts,
             }) catch return error.OutOfMemory;
         }
     } else return error.SchemaShape;
@@ -1021,9 +1052,13 @@ fn checkTerm(t: *dhall.Term, err: *dhall.DhallError) Error!*dhall.Term {
 
 /// Render a completed record Value (plus its ty, for union alternatives) as
 /// a Dhall record-literal source string — the exact form fx-* commands
-/// accept as their Dhall argv operand.  Field order follows the merged
-/// record's (dhall-c sorted) order, which is the same order term_to_json
-/// emits, so the rendered source and the runtime JSON agree by construction.
+/// accept as their Dhall argv operand.  Optional spellings are derived from
+/// ty (`Some <T> v`, and the ANNOTATED `None <T>` — never a bare `None`,
+/// which this dhall-c subset only parses annotated), so the rendered source
+/// re-parses standalone through the evalDhallArgs pipeline.  Field order
+/// follows the merged record's (dhall-c sorted) order, which is the same
+/// order term_to_json emits, so the rendered source and the runtime JSON
+/// agree by construction.
 pub fn renderDhallRecord(gpa: Allocator, value: *const Value, ty: *const TypeExpr) Error![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
@@ -1057,11 +1092,21 @@ fn renderValue(gpa: Allocator, out: *std.ArrayList(u8), v: *const Value, ty: *co
             };
             out.appendSlice(gpa, txt) catch return error.OutOfMemory;
         },
+        // Optional spellings derive from ty: a Some renders the payload
+        // against the INNER type, and a None renders ANNOTATED (`None <T>`)
+        // — a bare `None` does not parse in this dhall-c subset, so an
+        // unannotated render would kill the differential runner's record
+        // side for every None-carrying completion.
         .some => |inner| {
+            if (ty.* != .optional) return error.SchemaShape;
             out.appendSlice(gpa, "Some ") catch return error.OutOfMemory;
-            try renderValue(gpa, out, inner, ty);
+            try renderValue(gpa, out, inner, ty.optional);
         },
-        .none_ => out.appendSlice(gpa, "None") catch return error.OutOfMemory,
+        .none_ => {
+            if (ty.* != .optional) return error.SchemaShape;
+            out.appendSlice(gpa, "None ") catch return error.OutOfMemory;
+            try renderTypeInto(gpa, out, ty.optional);
+        },
         .union_ctor => |c| {
             // re-emit the constructor with its union type context from ty
             if (ty.* != .union_) return error.SchemaShape;
@@ -1089,10 +1134,11 @@ fn renderValue(gpa: Allocator, out: *std.ArrayList(u8), v: *const Value, ty: *co
             out.append(gpa, '}') catch return error.OutOfMemory;
         },
         .list => |items| {
+            if (ty.* != .list) return error.SchemaShape;
             out.append(gpa, '[') catch return error.OutOfMemory;
             for (items, 0..) |*item, i| {
                 if (i != 0) out.appendSlice(gpa, ", ") catch return error.OutOfMemory;
-                try renderValue(gpa, out, item, ty);
+                try renderValue(gpa, out, item, ty.list);
             }
             out.append(gpa, ']') catch return error.OutOfMemory;
         },
@@ -1147,10 +1193,13 @@ pub fn repairDhallRecordSpellings(
             (i + 4 == src.len or !isIdentByte(src[i + 4])))
         {
             // already annotated ("None Text", ...)?  The next non-space char
-            // of an annotated form is a letter.
+            // of an annotated form is a letter, or '<'/'(' — the payload
+            // types the renderer's annotated `None <T>` derives from ty can
+            // begin with (a union `<A|B>`, an application `(List T)`).
             var j = i + 4;
             while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-            const annotated = j < src.len and std.ascii.isAlphabetic(src[j]);
+            const annotated = j < src.len and
+                (std.ascii.isAlphabetic(src[j]) or src[j] == '<' or src[j] == '(');
             out.appendSlice(gpa, "None") catch return error.OutOfMemory;
             if (!annotated) out.appendSlice(gpa, spell.none_payload.?) catch return error.OutOfMemory;
             i += 4;
@@ -1323,12 +1372,13 @@ fn encodeJsonField(comptime VT: type, gpa: Allocator, out: *std.ArrayList(u8), v
             try out.appendSlice(gpa, "\":{}}");
         },
         .int => {
-            // u64 is Natural (the generator's mapping, tools/fx-clijson.zig
-            // zigType).  If a schema ever needs another int width, give it a
-            // distinct arm here — never let it fall through to a generic int.
-            if (VT != u64)
+            // u64 is Natural and i64 is Integer (the generator's mappings,
+            // tools/fx-clijson.zig zigType).  If a schema ever needs another
+            // int width, give it a distinct arm here — never let it fall
+            // through to a generic int.
+            if (VT != u64 and VT != i64)
                 @compileError(std.fmt.comptimePrint(
-                    "encodeJsonField: field '{s}' is not Natural (u64); add an arm for this int type",
+                    "encodeJsonField: field '{s}' is not Natural (u64) or Integer (i64); add an arm for this int type",
                     .{fname},
                 ));
             var nb: [32]u8 = undefined;
@@ -1573,6 +1623,18 @@ test "repairDhallRecordSpellings: bare None and [] annotated, annotated forms un
         defer gpa.free(out);
         try testing.expectEqualStrings(src, out);
     }
+    // an annotated None whose payload TYPE starts with '<' (a union, the
+    // shape renderDhallRecord emits for an Optional-union field) is left
+    // alone — never double-annotated
+    {
+        const out = try repairDhallRecordSpellings(
+            gpa,
+            "{ type_filter = None < Dir | File > }",
+            .{ .none_payload = " Natural" },
+        );
+        defer gpa.free(out);
+        try testing.expectEqualStrings("{ type_filter = None < Dir | File > }", out);
+    }
     // fast path: nothing to repair returns src itself (no allocation)
     {
         const src = "{ files = [ \"a\" ] }";
@@ -1614,6 +1676,245 @@ test "repairDhallRecordSpellings: end-to-end dhall eval of a repaired record" {
 fn envSchemaSrcForRepair(gpa: Allocator) [:0]u8 {
     return readSchemaFile(gpa, &.{ "schemas/env.dhall", "fx-core/schemas/env.dhall" }) catch
         @panic("cannot locate schemas/env.dhall (run tests from the fx-core root)");
+}
+
+// ---------------------------------------------------------------------------
+// renderfix tests: the Optional spellings the renderer derives from ty, the
+// PARSE-BACK proof, and the shared-runner round-trip on the exact shape that
+// was blocked (fx-find: name_glob = None Text, type_filter = Optional
+// < File | Dir >)
+// ---------------------------------------------------------------------------
+
+/// The dhall runtime pipeline every command's evalDhallArgs drives
+/// (parse -> infer -> normalize -> term_to_json), as one callable — this is
+/// the PARSE-BACK leg: it fails outright unless `src` re-parses standalone.
+fn termToJsonBytes(gpa: Allocator, src: [:0]const u8) Error![]u8 {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    arena.arena_reset(arena.dhall_arena.?);
+    const loader = import_mod.import_loader_new();
+    defer import_mod.import_loader_free(loader);
+    var p: dhall.Parser = std.mem.zeroes(dhall.Parser);
+    p.loader = loader;
+    var err: dhall.DhallError = undefined;
+    ast.dhall_error_clear(&err);
+    const t = parser.parse_source(&p, src, null, &err) orelse return error.DhallParse;
+    _ = typecheck.infer_type(&p, t, &err) orelse return error.DhallType;
+    normalize.normalize_clear_error();
+    const nf = normalize.normalize(t);
+    if (normalize.normalize_has_error()) return error.DhallNormalize;
+    var ob = std.ArrayList(u8).initCapacity(gpa, 4096) catch return error.OutOfMemory;
+    errdefer ob.deinit(gpa);
+    const out = ast.Out{ .b = &ob };
+    if (!serialize.term_to_json(out, nf, &err)) return error.DhallSerialize;
+    return ob.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
+fn findSchemaSrcForRender(gpa: Allocator) [:0]u8 {
+    return readSchemaFile(gpa, &.{ "schemas/find.dhall", "fx-core/schemas/find.dhall" }) catch
+        @panic("cannot locate schemas/find.dhall (run tests from the fx-core root)");
+}
+
+test "renderDhallRecord: Optional spellings derive from ty (annotated None, Some inner projection)" {
+    const gpa = testing.allocator;
+    const schema = findSchemaSrcForRender(gpa);
+    defer gpa.free(schema);
+
+    // all-None completion (fx-find '{ }'): every Optional renders ANNOTATED
+    // from ty — a bare `None` does not parse in this dhall-c subset, which
+    // is what killed every None-carrying differential vector
+    var c = try completeSrc(gpa, schema, "{ }");
+    defer c.deinit(gpa);
+    const rendered = try renderDhallRecord(gpa, &c.value, c.ty);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings(
+        "{maxdepth = None Natural, name_glob = None Text, root = \".\", rows = False, type_filter = None < Dir | File >}",
+        rendered,
+    );
+
+    // the Some side: the .some arm projects the Optional's INNER type, so a
+    // Some-of-union payload re-emits < Dir | File >.File through the
+    // union_ctor arm instead of erroring SchemaShape on the Optional ty
+    var c2 = try completeSrc(gpa, schema, "{ root = \"/tmp\", name_glob = Some \"*.c\", type_filter = Some < File | Dir >.File, maxdepth = Some 3 }");
+    defer c2.deinit(gpa);
+    const rendered2 = try renderDhallRecord(gpa, &c2.value, c2.ty);
+    defer gpa.free(rendered2);
+    try testing.expectEqualStrings(
+        "{maxdepth = Some 3, name_glob = Some \"*.c\", root = \"/tmp\", rows = False, type_filter = Some <Dir | File>.File}",
+        rendered2,
+    );
+}
+
+test "renderDhallRecord: the Optional spellings PARSE BACK through the dhall pipeline" {
+    const gpa = testing.allocator;
+    const schema = findSchemaSrcForRender(gpa);
+    defer gpa.free(schema);
+
+    // the None-carrying render must survive parse -> infer -> normalize and
+    // yield the canonical wire JSON — rendering a string is worthless if the
+    // bytes never re-parse (the lazy-hide the plan warns about)
+    {
+        var c = try completeSrc(gpa, schema, "{ }");
+        defer c.deinit(gpa);
+        const rendered = try renderDhallRecord(gpa, &c.value, c.ty);
+        defer gpa.free(rendered);
+        const rendered_z = try gpa.dupeZ(u8, rendered);
+        defer gpa.free(rendered_z);
+        const json = try termToJsonBytes(gpa, rendered_z);
+        defer gpa.free(json);
+        try testing.expectEqualStrings(
+            "{\"maxdepth\":null,\"name_glob\":null,\"root\":\".\",\"rows\":false,\"type_filter\":null}",
+            json,
+        );
+    }
+    // the Some-of-union render re-parses to the same wire shape term_to_json
+    // gives it straight from the schema (union as {"File":{}})
+    {
+        var c = try completeSrc(gpa, schema, "{ root = \"/tmp\", name_glob = Some \"*.c\", type_filter = Some < File | Dir >.File, maxdepth = Some 3 }");
+        defer c.deinit(gpa);
+        const rendered = try renderDhallRecord(gpa, &c.value, c.ty);
+        defer gpa.free(rendered);
+        const rendered_z = try gpa.dupeZ(u8, rendered);
+        defer gpa.free(rendered_z);
+        const json = try termToJsonBytes(gpa, rendered_z);
+        defer gpa.free(json);
+        try testing.expectEqualStrings(
+            "{\"maxdepth\":3,\"name_glob\":\"*.c\",\"root\":\"/tmp\",\"rows\":false,\"type_filter\":{\"File\":{}}}",
+            json,
+        );
+    }
+}
+
+// A test-local mirror of the generated cli_find module: the SAME Options
+// shape and the SAME --rows + ROOT-operand parsePosix surface.  fx-cli.zig
+// cannot @import src/generated/cli_find.zig — every generated file is its
+// own build module (the "file exists in modules X and Y" error build.zig's
+// uses_path dance avoids), so the shared runner is proven on this mirror.
+const FindProbe = struct {
+    pub const Options = struct {
+        maxdepth: ?u64 = null,
+        name_glob: ?[]const u8 = null,
+        root: []const u8 = ".",
+        rows: bool = false,
+        type_filter: ?enum { Dir, File } = null,
+    };
+
+    pub fn parsePosix(args: []const []const u8, gpa: Allocator) !Options {
+        var o = Options{};
+        var got_root = false;
+        var after_ddash = false;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (after_ddash) {
+                if (got_root) return error.UnexpectedOperand;
+                o.root = gpa.dupe(u8, a) catch return error.OutOfMemory;
+                got_root = true;
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--")) {
+                after_ddash = true;
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--rows")) {
+                o.rows = true;
+                continue;
+            }
+            if (a.len > 1 and a[0] == '-') return error.UnknownOption;
+            if (got_root) return error.UnexpectedOperand;
+            o.root = gpa.dupe(u8, a) catch return error.OutOfMemory;
+            got_root = true;
+        }
+        return o;
+    }
+};
+
+/// The record-form runtime evaluator for FindProbe: the dhall pipeline, then
+/// the canonical-JSON walk into Options (keys are the SCHEMA field names —
+/// the spelling the rendered record carries).  A walk strict enough that a
+/// mis-decoded field fails the runner's wire comparison, never passes it.
+fn findProbeEvalDhallArgs(src: [:0]const u8, gpa: Allocator) !FindProbe.Options {
+    const s = try termToJsonBytes(gpa, src);
+    defer gpa.free(s);
+
+    var o = FindProbe.Options{};
+    var i: usize = 0;
+    if (!fpTake(s, &i, '{')) return error.BadJson;
+    if (fpTake(s, &i, '}')) return o;
+    while (true) {
+        var kb: [16]u8 = undefined;
+        const key = try fpJsonString(s, &i, &kb);
+        if (!fpTake(s, &i, ':')) return error.BadJson;
+        if (std.mem.startsWith(u8, s[i..], "null")) {
+            i += 4; // None (Optional absent) — the field keeps its null default
+        } else if (i < s.len and s[i] == '"') {
+            var vb: [512]u8 = undefined;
+            const v = try fpJsonString(s, &i, &vb);
+            if (std.mem.eql(u8, key, "root")) {
+                o.root = try gpa.dupe(u8, v);
+            } else if (std.mem.eql(u8, key, "name_glob")) {
+                o.name_glob = try gpa.dupe(u8, v);
+            } else return error.BadJson;
+        } else if (std.mem.startsWith(u8, s[i..], "true") or std.mem.startsWith(u8, s[i..], "false")) {
+            const b = s[i] == 't';
+            i += if (b) 4 else 5;
+            if (!std.mem.eql(u8, key, "rows")) return error.BadJson;
+            o.rows = b;
+        } else if (i < s.len and s[i] == '{') {
+            // nullary union ctor: {"Tag":{}}
+            i += 1;
+            var tb: [8]u8 = undefined;
+            const tag = try fpJsonString(s, &i, &tb);
+            if (!fpTake(s, &i, ':') or !fpTake(s, &i, '{') or !fpTake(s, &i, '}') or !fpTake(s, &i, '}'))
+                return error.BadJson;
+            if (!std.mem.eql(u8, key, "type_filter")) return error.BadJson;
+            o.type_filter = if (std.mem.eql(u8, tag, "Dir")) .Dir else if (std.mem.eql(u8, tag, "File")) .File else return error.BadJson;
+        } else {
+            const start = i;
+            while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+            if (i == start) return error.BadJson;
+            const n = std.fmt.parseInt(u64, s[start..i], 10) catch return error.BadJson;
+            if (!std.mem.eql(u8, key, "maxdepth")) return error.BadJson;
+            o.maxdepth = n;
+        }
+        if (fpTake(s, &i, '}')) break;
+        if (!fpTake(s, &i, ',')) return error.BadJson;
+    }
+    return o;
+}
+
+fn fpTake(s: []const u8, i: *usize, ch: u8) bool {
+    if (i.* < s.len and s[i.*] == ch) {
+        i.* += 1;
+        return true;
+    }
+    return false;
+}
+
+/// Read a canonical term_to_json string (keys and Text values — the probe's
+/// vectors carry no escape sequences; escapes are pinned elsewhere).
+fn fpJsonString(s: []const u8, i: *usize, buf: []u8) ![]const u8 {
+    if (!fpTake(s, i, '"')) return error.BadJson;
+    const start = i.*;
+    while (i.* < s.len and s[i.*] != '"') i.* += 1;
+    if (i.* == s.len) return error.BadJson;
+    const len = i.* - start;
+    if (len > buf.len) return error.BadJson;
+    @memcpy(buf[0..len], s[start..i.*]);
+    i.* += 1; // closing quote
+    return buf[0..len];
+}
+
+test "RUNNER: expectPosixEqualsRecord round-trips a None-carrying record (the fx-find blocker)" {
+    // THE shared differential path, end to end: completeSrc -> renderDhallRecord
+    // -> evalDhallArgs -> encodeOptionsWire -> compare, on a schema whose
+    // every-default completion carries three None fields (name_glob = None
+    // Text among them).  Before the renderfix each vector died at the
+    // re-parse leg; these vectors prove the rendered bytes PARSE BACK and
+    // equal the POSIX side through the one runner every migration uses.
+    const candidates = &.{ "schemas/find.dhall", "fx-core/schemas/find.dhall" };
+    try expectPosixEqualsRecord(FindProbe, candidates, findProbeEvalDhallArgs, &.{"fx-find"}, "{ }");
+    try expectPosixEqualsRecord(FindProbe, candidates, findProbeEvalDhallArgs, &.{ "fx-find", "/tmp" }, "{ root = \"/tmp\" }");
+    try expectPosixEqualsRecord(FindProbe, candidates, findProbeEvalDhallArgs, &.{ "fx-find", "--rows", "/tmp" }, "{ root = \"/tmp\", rows = True }");
 }
 
 test "evalSchemaSrc: ls.dhall projects ty/dflt/posix" {
@@ -1883,6 +2184,18 @@ test "encodeOptionsWire: Optional Natural Some/None exact bytes vs dhall-c term_
     var w = try encodeOptionsWire(S, gpa, .{ .none_nat = null, .some_nat = 3 });
     defer w.deinit(gpa);
     try testing.expectEqualStrings("{\"none_nat\":null,\"some_nat\":3}", w.items);
+}
+
+test "encodeOptionsWire: Integer (i64) exact bytes vs dhall-c term_to_json" {
+    // i64 is the generator's Integer mapping (seq first/inc/last).  term_to_json
+    // renders an Integer as a plain signed decimal (no + prefix in JSON), so
+    // {d} on i64 must be the identical bytes — pinned by this anchor before the
+    // first Integer-carrying differential (fx-seq) relies on the runner.
+    const gpa = testing.allocator;
+    const S = struct { first: i64, inc: i64, last: i64 };
+    var w = try encodeOptionsWire(S, gpa, .{ .first = -2, .inc = 1, .last = 9 });
+    defer w.deinit(gpa);
+    try testing.expectEqualStrings("{\"first\":-2,\"inc\":1,\"last\":9}", w.items);
 }
 
 test "encodeOptionsWire: List Text exact bytes vs dhall-c term_to_json" {

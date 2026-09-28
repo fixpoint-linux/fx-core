@@ -3,8 +3,8 @@
 --
 --   ty    mirrors fx-why.zig's Options struct (fx-why.zig:42-49):
 --         `operand : []const u8`  the PKG to explain (Text).  The struct
---                         has NO default: the hand parser errors
---                         MissingOperand with zero argv (fx-why.zig:55)
+--                         has NO default: the missing-operand case is
+--                         checked in main() with zero argv
 --                         — a required positional.  v1 has no
 --                         required-operand vocabulary (README, known
 --                         limits), so the placeholder default "." stands
@@ -16,13 +16,12 @@
 --                         (/fx/store) at query time.
 --   dflt  placeholder operand "." (above); the rest are the struct's
 --         defaults verbatim.
---   posix fx-why.zig:53-71 parsePosixArgs:
+--   posix the generated parser (cli_why, the U5 migration):
 --         --as-of N   kind Value -> as_of (long-only).
 --         --store DIR kind Value -> store (long-only).
---         PKG         one single positional; the hand parser takes it
---                     from args[1] positionally and errors UnknownArg on
---                     any second operand — the generated single-slot
---                     binding matches (no skip-slot needed).
+--         PKG         one single positional; the generated single-slot
+--                     binding takes it and rejects a second operand with
+--                     UnexpectedOperand (no skip-slot needed).
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 

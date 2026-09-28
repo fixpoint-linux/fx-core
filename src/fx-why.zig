@@ -5,6 +5,7 @@
 // into the store db).
 //
 //   fx-why PKG [--as-of N] [--store DIR]
+//   fx-why '{ operand = "hello", as_of = Some 7, store = Some "/s" }'
 //
 // - PKG is a package name in the activation closure; the answer is its
 //   store dir, the dep-closure it pulls (topo order), the install targets
@@ -26,21 +27,34 @@
 //
 // The POSIX form is parsed by the GENERATED parser (src/generated/cli_why.zig,
 // emitted from schemas/why.dhall by src/tools/fx-clijson.zig — pure Zig, no
-// dhall at runtime; `zig build gen-cli-check` gates the regen).  Unlike the
-// other migrated commands, fx-why has NO Dhall-record arg form (no
-// evalDhallArgs): the hand parser was POSIX-only, so the migration swaps in
-// the generated parser and pins it with direct rejection/behavior tests
-// instead of the differential matrix.  Deliberate changes against the hand
-// parser: `--as-of N` / `--store DIR` bind by the generated parser's
-// vocabulary (inline --as-of=N AND the hand's two-token spelling), a
-// missing PKG is a runtime BadArgs in main (the schema's "." placeholder
-// default), and `--`-escaping a leading-dash PKG is accepted.
+// dhall at runtime; `zig build gen-cli-check` gates the regen).  The Dhall
+// record form is evaluated by evalDhallArgs below (parse -> infer ->
+// normalize -> term_to_json -> field walk, the fx-ls template).  The two are
+// proven equal field for field by the differential test — the drift-kill
+// proof every migrated command copies.  Deliberate generated-parser
+// vocabulary (kept from the original migration): `--as-of N` / `--store DIR`
+// bind inline (--as-of=N) AND as separate two-token spellings, a missing PKG
+// is a runtime check in main (the schema's "." placeholder default), and
+// `--`-escaping a leading-dash PKG is accepted.
 
 const std = @import("std");
+const dh = @import("dhall");
 const prov = @import("provenance");
 const st = @import("store");
 const cl = @import("closure");
 const cli_why = @import("cli-why");
+const cli = @import("fx-cli");
+
+const dhall = dh.dhall;
+const arena = dh.arena;
+const ast = dh.ast;
+const parser = dh.parser;
+const typecheck = dh.typecheck;
+const normalize = dh.normalize;
+const serialize = dh.serialize;
+const import_mod = dh.import_mod;
+
+const Allocator = std.mem.Allocator;
 
 /// Store root when --store is not given.  Same value as fxstore's
 /// DEFAULT_STORE_ROOT (main.zig, the cmd_query:430 precedent); fxstore's
@@ -50,23 +64,252 @@ const DEFAULT_STORE_ROOT = "/fx/store";
 
 // ---------------------------------------------------------------------------
 // CLI option model — GENERATED (single source of truth: schemas/why.dhall).
-// NO Dhall-record arg form: fx-why was POSIX-only, so there is no
-// evalDhallArgs; the differential-matrix step of the standard migration does
-// not apply (the rejection/behavior pins below take its place).
+// `operand` is a plain Text with the "." placeholder default (a positional
+// must bind a plain Text field): the required-operand check stays in main()
+// (README, known limits).  `as_of` keeps its real Optional Natural (None =
+// engine .current); `store` keeps Optional Text (None = DEFAULT_STORE_ROOT
+// at query time).
 // ---------------------------------------------------------------------------
 
 const Options = cli_why.Options;
 const parsePosixArgs = cli_why.parsePosix; // the generated POSIX parser
 
 fn usage() void {
-    std.debug.print(
-        "usage: fx-why PKG [--as-of N] [--store DIR]\n" ++
+    // no format args: the literal's `{ }` braces are Dhall record syntax,
+    // not placeholders, so the text goes through as a {s} argument
+    std.debug.print("{s}", .{
+        "usage: fx-why PKG [--as-of N] [--store DIR] | fx-why '{ operand = ... }'\n" ++
             "\n" ++
             "  PKG            package name to explain\n" ++
             "  --as-of=N      query snapshot version N (default: newest published)\n" ++
             "  --store=DIR    resolve store-relative origins against DIR\n",
-        .{},
-    );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Dhall arg evaluation -> Options
+// ---------------------------------------------------------------------------
+
+// Minimal JSON object parser (mirrors fx-what/fx-ls): extracts
+// operand:Text, as_of:Optional Natural (number or null), store:Text.
+// STRICT (the fx-du rule): an unknown key is a parse FAILURE, never a
+// silent skip — a schema/evaluator field mismatch must fail loudly, not
+// fall back to defaults.
+const JsonOpts = struct {
+    operand: ?[]const u8 = null,
+    as_of: ?u64 = null,
+    store: ?[]const u8 = null,
+};
+
+fn jsonSkipWs(s: []const u8, i: *usize) void {
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\t' or s[i.*] == '\n' or s[i.*] == '\r')) i.* += 1;
+}
+
+fn jsonExpect(s: []const u8, i: *usize, c: u8) bool {
+    jsonSkipWs(s, i);
+    if (i.* < s.len and s[i.*] == c) {
+        i.* += 1;
+        return true;
+    }
+    return false;
+}
+
+fn jsonParseString(s: []const u8, i: *usize, buf: []u8) ?[]const u8 {
+    if (!jsonExpect(s, i, '"')) return null;
+    var n: usize = 0;
+    while (i.* < s.len) : (i.* += 1) {
+        const c = s[i.*];
+        if (c == '"') {
+            i.* += 1;
+            return buf[0..n];
+        } else if (c == '\\') {
+            i.* += 1;
+            if (i.* >= s.len) return null;
+            const rep: u8 = switch (s[i.*]) {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' => 0x08,
+                'f' => 0x0C,
+                else => return null,
+            };
+            if (n >= buf.len) return null;
+            buf[n] = rep;
+            n += 1;
+        } else {
+            if (n >= buf.len) return null;
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    return null;
+}
+
+fn jsonParseOpts(s: []const u8, buf: []u8) ?JsonOpts {
+    var res = JsonOpts{};
+    var off: usize = 0;
+    var i: usize = 0;
+    if (!jsonExpect(s, &i, '{')) return null;
+    if (jsonExpect(s, &i, '}')) return res; // empty object
+    while (true) {
+        var keybuf: [64]u8 = undefined;
+        const key = jsonParseString(s, &i, &keybuf) orelse return null;
+        if (!jsonExpect(s, &i, ':')) return null;
+        jsonSkipWs(s, &i);
+        if (i < s.len and s[i] == '"') {
+            const val = jsonParseString(s, &i, buf[off..]) orelse return null;
+            if (std.mem.eql(u8, key, "operand")) {
+                res.operand = val;
+            } else if (std.mem.eql(u8, key, "store")) {
+                res.store = val;
+            } else {
+                return null; // unknown key -> could not parse fields
+            }
+            off += val.len;
+        } else if (i < s.len and std.ascii.isDigit(s[i])) {
+            const start = i;
+            while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+            const n = std.fmt.parseInt(u64, s[start..i], 10) catch return null;
+            if (!std.mem.eql(u8, key, "as_of")) return null; // unknown key
+            res.as_of = n;
+        } else if (i < s.len and std.mem.startsWith(u8, s[i..], "null")) {
+            i += 4; // None (Optional absent)
+        } else {
+            return null; // unknown value shape -> could not parse fields
+        }
+        if (!jsonExpect(s, &i, ',')) break;
+    }
+    if (!jsonExpect(s, &i, '}')) return null;
+    return res;
+}
+
+/// The REAL record evaluator: parse -> infer -> normalize -> term_to_json ->
+/// field walk (the fx-ls template) — the exact runtime path
+/// `fx-why '{ operand = "hello", as_of = Some 7 }'` takes.
+fn evalDhallArgs(src: [:0]const u8, gpa: Allocator) !Options {
+    if (arena.dhall_arena == null) arena.dhall_arena = arena.arena_new();
+    arena.arena_reset(arena.dhall_arena.?);
+
+    const loader = import_mod.import_loader_new();
+    defer import_mod.import_loader_free(loader);
+
+    var p: dhall.Parser = std.mem.zeroes(dhall.Parser);
+    p.loader = loader;
+    var err: dhall.DhallError = undefined;
+    ast.dhall_error_clear(&err);
+    const t = parser.parse_source(&p, src, null, &err);
+    if (t == null) {
+        std.debug.print("fx-why: dhall parse error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallParse;
+    }
+    const ty = typecheck.infer_type(&p, t.?, &err);
+    if (ty == null) {
+        std.debug.print("fx-why: dhall type error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallType;
+    }
+    normalize.normalize_clear_error();
+    const nf = normalize.normalize(t.?);
+    if (normalize.normalize_has_error()) {
+        err = normalize.normalize_get_error().*;
+        std.debug.print("fx-why: dhall normalize error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallNormalize;
+    }
+
+    var ob = std.ArrayList(u8).initCapacity(gpa, 4096) catch unreachable;
+    defer ob.deinit(gpa);
+    const out = ast.Out{ .b = &ob };
+    if (!serialize.term_to_json(out, nf, &err)) {
+        std.debug.print("fx-why: dhall serialize error: {s}\n", .{std.mem.sliceTo(&err.msg, 0)});
+        return error.DhallSerialize;
+    }
+
+    const buf = try gpa.alloc(u8, 65536);
+    defer gpa.free(buf);
+    const opts = jsonParseOpts(ob.items, buf) orelse {
+        std.debug.print("fx-why: could not parse dhall record fields from JSON: {s}\n", .{ob.items});
+        return error.DhallFields;
+    };
+
+    var o = Options{};
+    if (opts.operand) |op| o.operand = try gpa.dupe(u8, op);
+    o.as_of = opts.as_of; // absent (None/null) stays the null default
+    if (opts.store) |sr| o.store = try gpa.dupe(u8, sr);
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL TEST — the drift-kill proof (the fx-ls template)
+// ---------------------------------------------------------------------------
+//
+// For a matrix of POSIX argv vectors, the GENERATED parser must produce the
+// SAME Options as the Dhall-record form of the same user intent driven through
+// the schema completion ((dflt // user) : ty, fx-cli.completeSrc), rendered
+// back to a record literal (fx-cli.renderDhallRecord) and evaluated by THIS
+// file's evalDhallArgs — the exact runtime path `fx-why '{ ... }'` takes.
+// Both sides are re-encoded to the canonical term_to_json wire shape
+// (fx-cli.encodeOptionsWire) and compared as strings.
+
+/// One differential vector for fx-why — a one-line wrapper over the SHARED
+/// generic runner (fx-cli.expectPosixEqualsRecord; the fx-ls STEP-3 template
+/// each migration copies): the generated parser, the schema candidates, and
+/// the REAL runtime record evaluator above are the whole per-command surface.
+fn expectPosixEqualsRecord(argv: []const []const u8, user_record: [:0]const u8) !void {
+    return cli.expectPosixEqualsRecord(cli_why, &.{ "schemas/why.dhall", "fx-core/schemas/why.dhall" }, evalDhallArgs, argv, user_record);
+}
+
+test "DIFFERENTIAL: record form equals POSIX (the migration matrix)" {
+    // --- each field ALONE, against the no-flag POSIX spelling of the same
+    // intent: defaults stay defaults ({ } <-> bare, the "." placeholder),
+    // the PKG positional round-trips, and --as-of / --store actually REACH
+    // the evaluator (the lazy-hide guard: a dropped as_of/store would render
+    // the record side with null/absent values and the field-complete wire
+    // comparison would go red) ---
+    try expectPosixEqualsRecord(&.{"fx-why"}, "{ }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "p" }, "{ operand = \"p\" }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "--as-of", "7" }, "{ as_of = Some 7 }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "--store", "/s" }, "{ store = Some \"/s\" }");
+
+    // --- combined: the full surface, both flag spellings, flags before the
+    // positional, and the None-carrying completion (the pre-renderfix
+    // blocker shape: `None Natural` / `None Text` must render, parse, and
+    // mean the same defaults as the bare argv) ---
+    try expectPosixEqualsRecord(&.{ "fx-why", "hello", "--as-of=3", "--store=/var/fx/store" }, "{ operand = \"hello\", as_of = Some 3, store = Some \"/var/fx/store\" }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "hello", "--as-of", "3", "--store", "/var/fx/store" }, "{ operand = \"hello\", as_of = Some 3, store = Some \"/var/fx/store\" }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "--store=/s", "world" }, "{ operand = \"world\", store = Some \"/s\" }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "p" }, "{ operand = \"p\", as_of = None Natural, store = None Text }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "--as-of", "0" }, "{ as_of = Some 0 }");
+    try expectPosixEqualsRecord(&.{ "fx-why", "--", "-weird" }, "{ operand = \"-weird\" }");
+}
+
+test "evalDhallArgs: operand only, defaults intact" {
+    const o = try evalDhallArgs("{ operand = \"hello\" }", std.testing.allocator);
+    defer std.testing.allocator.free(o.operand);
+    try std.testing.expectEqualStrings("hello", o.operand);
+    try std.testing.expect(o.as_of == null);
+    try std.testing.expect(o.store == null);
+}
+
+test "evalDhallArgs: as_of and store bind; None spellings keep them null" {
+    const o = try evalDhallArgs("{ as_of = Some 7, store = Some \"/s\" }", std.testing.allocator);
+    defer std.testing.allocator.free(o.store.?);
+    try std.testing.expectEqual(@as(u64, 7), o.as_of.?);
+    try std.testing.expectEqualStrings("/s", o.store.?);
+    try std.testing.expectEqualStrings(".", o.operand); // the placeholder dflt
+
+    const n = try evalDhallArgs("{ as_of = None Natural, store = None Text }", std.testing.allocator);
+    try std.testing.expect(n.as_of == null);
+    try std.testing.expect(n.store == null);
+    try std.testing.expectEqualStrings(".", n.operand);
+}
+
+test "jsonParseOpts: unknown key is a loud failure (the strict fx-du rule)" {
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(jsonParseOpts("{\"typo\":true}", &buf) == null);
+    try std.testing.expect(jsonParseOpts("{\"as_of\":true}", &buf) == null);
+    try std.testing.expect(jsonParseOpts("{\"operand\":\"p\",\"ghost\":1}", &buf) == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,10 +383,19 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const a = init.arena.allocator();
 
-    const opts = parsePosixArgs(args, a) catch {
-        usage();
-        std.process.exit(2);
-    };
+    // The GENERATED parser (schemas/why.dhall -> src/generated/cli_why.zig)
+    // and the Dhall-record form share one dispatch, exactly like every other
+    // migrated command (the fx-du/fx-ls branch): a first argv token starting
+    // with '{' is the record form.
+    var opts: Options = undefined;
+    if (args.len >= 2 and args[1].len > 0 and args[1][0] == '{') {
+        opts = try evalDhallArgs(args[1], a);
+    } else {
+        opts = parsePosixArgs(args, a) catch {
+            usage();
+            std.process.exit(2);
+        };
+    }
     var out = std.ArrayList(u8).empty;
     var err_out = std.ArrayList(u8).empty;
     const rc = run(init.io, a, opts, &out, &err_out);
@@ -160,9 +412,9 @@ pub fn main(init: std.process.Init) !void {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// PARSER PINS — fx-why has NO Dhall-record arg form (no evalDhallArgs), so
-// the standard differential matrix does not apply; the generated parser is
-// pinned directly instead (same rejection classes the other migrations pin).
+// PARSER PINS — the generated POSIX parser's rejection/behavior classes,
+// pinned directly (the differential matrix above covers the EQUALITY of the
+// two arg forms; these pin the loud-failure surface).
 // ---------------------------------------------------------------------------
 
 test "parsePosix: operand + inline --as-of/--store, flags before operand" {
@@ -213,6 +465,14 @@ test "parsePosix: rejections" {
     // bad Natural in the inline value (the hand BadAsOf class)
     try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-why", "hello", "--as-of=x" }, aa));
     try std.testing.expectError(error.BadValue, parsePosixArgs(&.{ "fx-why", "hello", "--as-of=-1" }, aa));
+
+    // record-form rejection parity: a bare record literal infers its OWN
+    // type (there is no schema at the evaluator), so an unknown field or a
+    // wrong field type surfaces at the strict field walk (DhallFields) —
+    // never a silent default fallback
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ typo = True }", aa));
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ as_of = \"x\" }", aa));
+    try std.testing.expectError(error.DhallFields, evalDhallArgs("{ operand = \"p\", ghost = 1 }", aa));
 }
 
 test "run: empty operand is a clean runtime error (the placeholder default)" {

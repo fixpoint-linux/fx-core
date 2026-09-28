@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // command) are migrated; further STEP-3 commands grow this table.  The
     // meta_* fixtures live in meta_schemas below — they are NOT commands
     // and are never committed under src/generated/.
-    const gen_schemas = [_][]const u8{ "basename", "cat", "chgrp", "chmod", "chown", "cksum", "comm", "cp", "date", "df", "diff", "dirname", "du", "echo", "env", "expand", "find", "grep", "head", "hostname", "id", "link", "ln", "ls", "md5sum", "mkdir", "mkfifo", "mv", "nl", "paste", "ps", "realpath", "rm", "rmdir", "seq", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "sort", "sum", "tail", "tee", "top", "touch", "tree", "truncate", "uname", "uniq", "unlink", "wc", "what", "whoami", "why", "yes" };
+    const gen_schemas = [_][]const u8{ "basename", "cat", "chgrp", "chmod", "chown", "cksum", "comm", "cp", "date", "df", "diff", "dirname", "du", "echo", "env", "expand", "find", "grep", "head", "hostname", "id", "link", "ln", "ls", "log", "md5sum", "mkdir", "mkfifo", "mv", "nl", "paste", "ps", "realpath", "rm", "rmdir", "seq", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "sort", "sum", "tail", "tee", "top", "touch", "tree", "truncate", "uname", "uniq", "unlink", "undo", "wc", "what", "whoami", "why", "yes" };
     const gen_cli_step = b.step("gen-cli", "Regenerate src/generated/cli_<name>.zig from schemas/<name>.dhall (commit the result)");
     const gen_cli_check_step = b.step("gen-cli-check", "Verify committed src/generated/cli_*.zig match their schemas (regen no-op gate)");
     test_step.dependOn(gen_cli_check_step);
@@ -233,7 +233,7 @@ pub fn build(b: *std.Build) void {
     // installed artifacts changes: the meta outputs are cache-only, bind no
     // command, and never appear in a commit.
     // -----------------------------------------------------------------------
-    const meta_schemas = [_][]const u8{ "meta_values", "meta_many", "meta_noflags", "meta_boolflags" };
+    const meta_schemas = [_][]const u8{ "meta_values", "meta_many", "meta_noflags", "meta_boolflags", "meta_arity" };
     inline for (meta_schemas) |schema_name| {
         const out_rel = std.fmt.comptimePrint("cli_{s}.zig", .{schema_name});
         const schema_path = std.fmt.comptimePrint("schemas/{s}.dhall", .{schema_name});

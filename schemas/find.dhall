@@ -31,37 +31,35 @@
 --         struct-precedent) — the runtime keys converge when the
 --         schema-generated surface lands.  root/maxdepth already
 --         match.
---         RENDER CAVEAT (pre-existing, reported): fx-cli.zig's
---         renderValue passes the field's Optional type into the
---         union_ctor arm (fx-cli.zig:813-820), so rendering a
---         completed record with `type_filter = Some < File | Dir
---         >.File` errors SchemaShape — the differential harness will
---         need the .some arm to project the union inner type before
---         find migrates (None renders fine).
 --   dflt  the struct's defaults verbatim.
---   posix fx-find.zig:396-429 parsePosixArgs: ROOT is an optional
---         single positional — the hand parser is LAST-WINS on further
---         bare operands (each overwrites root, fx-find.zig:423-426);
---         the generated single-slot binding REJECTS a second (the
---         deliberate drift-killing strengthening, the fx-du/fx-tree
---         precedent).
---         The hand flags are the single-dash multi-char tokens
---         `-name GLOB` / `-type f|d` / `-maxdepth N`
---         (fx-find.zig:401-419), plus the long-only `--rows` (the
---         plain long form the generated vocabulary DOES model — same
---         token is a flags entry below so both parsers accept it).
+--   posix the GENERATED parser (fx-find.zig aliases
+--         parsePosixArgs = cli_find.parsePosix): ROOT is an optional
+--         single positional — a SECOND bare operand is REJECTED
+--         (error.UnexpectedOperand).  The hand parser this replaced
+--         was LAST-WINS on further bare operands; the single-slot
+--         binding is the deliberate drift-killing strengthening
+--         (the fx-du/fx-tree precedent), and no caller relied on the
+--         old behaviour (fx-shell passes at most one root token).
+--         The flags are the single-dash multi-char tokens
+--         `-name GLOB` / `-maxdepth N` (kind Value on the plain
+--         multi-char short) and `-type f|d` — the VALUE-CONSUMING
+--         ENUM SELECTOR: two flags entries sharing the `-type`
+--         token and the type_filter field, kind Enum carrying the
+--         union ctor in its payload and value = Some "<argv
+--         spelling>" (f -> File, d -> Dir).  The emitted merged arm
+--         consumes the next argv token, rejects an unknown value
+--         with error.BadValue ("is not one of: d, f" — the hand
+--         parser's BadType class, generated spelling) and a repeat
+--         `-type f -type d` with error.Conflict (the built-in
+--         seen-guard).  `--rows` stays the plain long it always was.
 --
---   VOCABULARY GAP (reported): `-name` / `-type` / `-maxdepth` are
---   single-dash MULTI-CHAR tokens — expressible neither as a short
---   (exactly "-<c>", fx-clijson.zig:417) nor as a long ("--<name>",
---   fx-clijson.zig:420); and `-type f|d` is additionally a VALUE-
---   CONSUMING ENUM SELECTOR, which no flag kind models (Enum is
---   argumentless, Value cannot bind a union, fx-clijson.zig:428-446 —
---   the nl gap).  flags therefore carries ONLY `--rows`; the
---   single-dash trio above stays hand-parser territory until the
---   vocabulary grows a single-dash long-word form (plus the nl
---   enum-selector kind), and the generated parser must not replace
---   fx-find's hand parser (the seq precedent).
+--   The FORMER VOCABULARY GAP (reported against the v1 generator) is
+--   CLOSED: the vocabulary now models a single-dash multi-char
+--   `short` token (never clustered) and, via Enum + value, the
+--   value-consuming enum selector.  cli_find.parsePosix takes over
+--   the whole POSIX surface and the hand parser is DELETED (the
+--   seq flip); the record side is differential-tested against it
+--   through the shared runner (fx-find.zig's matrix).
 
 let Flag = { short : Optional Text, long : Optional Text, field : Text, kind : < Flag | Value | Enum : Text >, value : Optional Text }
 
@@ -97,7 +95,12 @@ in
     }
 , posix =
     { flags =
-        [ { short = None Text, long = Some "--rows", field = "rows", kind = < Flag | Value | Enum : Text >.Flag, value = None Text } ] : List Flag
+        [ { short = Some "-name", long = None Text, field = "name_glob", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = Some "-maxdepth", long = None Text, field = "maxdepth", kind = < Flag | Value | Enum : Text >.Value, value = None Text }
+        , { short = Some "-type", long = None Text, field = "type_filter", kind = < Flag | Value | Enum : Text >.Enum "File", value = Some "f" }
+        , { short = Some "-type", long = None Text, field = "type_filter", kind = < Flag | Value | Enum : Text >.Enum "Dir", value = Some "d" }
+        , { short = None Text, long = Some "--rows", field = "rows", kind = < Flag | Value | Enum : Text >.Flag, value = None Text }
+        ] : List Flag
     , mutually_exclusive = [] : List (List Text)
     , positionals = [ { field = "root", display = "ROOT", many = False } ] : List Positional
     }
