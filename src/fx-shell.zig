@@ -39,15 +39,25 @@
 //     after only whitespace / `|` since the last token).  A `#` inside a
 //     token (`a#b`), inside quotes, or escaped (`\#`) is an ordinary byte.
 //     The comment runs to the end of the line.
-//   * `$` is a LOUD error (Dollar) with its byte offset wherever POSIX
-//     would interpolate it: unquoted, or inside DOUBLE quotes.  v1 has no
-//     variables and no environment expansion — passing `$X` through as a
-//     literal would be the silent behavior change this rule exists to kill
-//     (plan RISK 9).  To write a literal `$`: single-quote it (`'$x'`) or
-//     escape it (`\$`).
-//   * NO glob expansion in v1: `*`, `?`, `[` are ordinary token bytes
-//     (globbing would make outputs host-dependent; the CAS determinism
-//     thesis forbids it silently — a later unit may add it loudly).
+//   * `$` is EXPANSION SITE text, carried through verbatim (RUN mode expands
+//     it later, at the ONE pre-typecheck seam; RECORD mode rejects it loudly
+//     with a byte offset — see `HostStateInRecordMode`).  A LITERAL `$` is
+//     written `\$`, `'$X'`, or `"\$x"` and the tokenizer keeps it as the TWO
+//     bytes `\$` in the logical word (THE ESCAPED-WORD CONTRACT, shared with
+//     fx-vars.zig): a single-quoted `$` is rewritten to the same escape at
+//     its own byte offset, so one shared scan — fx-vars.expand — handles
+//     every spelling without a second lexer.  The contract is why a literal
+//     and a live `$` are never indistinguishable downstream.
+//   * NO glob expansion at this layer: `*`, `?`, `[` ride as ordinary token
+//     bytes and the GLOB SEAM (U3) expands them at the same place variables
+//     are handled, AFTER variable expansion — and the seam's own results are
+//     never re-scanned.  A LITERAL metacharacter follows the SAME
+//     ESCAPED-WORD CONTRACT as `$`: `\*`, `'*'`, `"\*"` and `"*"` all keep
+//     the two bytes `\*` in the logical word, and a bare `*` stays bare.  The
+//     seam strips the escape again (fx-glob.unescape) before the word becomes
+//     a child argv element, so `echo \*` prints `*` while `echo *` globs.  A
+//     LIVE metacharacter on a `|>` line is host state, rejected exactly like
+//     a `$`.
 //   * `--` is NOT consumed by the shell.  It passes through as an ordinary
 //     token to the stage; the stage's generated POSIX parser owns its
 //     end-of-options semantics.
@@ -78,6 +88,11 @@ const caslog = @import("fx-caslog.zig");
 // the per-binary decision table (role/argv_plan) — pure comptime data, no
 // arena; imported by path like fx-eval does (it carries no build wiring).
 const specs = @import("fx-stages.zig");
+// variables/environment (fxsh U2): the VarTable + expand half.  Pure `std`
+// only, imported by path like fx-stages (its tests ride the importing test
+// root — the same mechanism that runs fx-stages' table tests).
+const vars = @import("fx-vars.zig");
+const glob = @import("fx-glob.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -87,7 +102,6 @@ const Allocator = std.mem.Allocator;
 
 pub const TokenizeError = error{
     UnbalancedQuote,
-    Dollar,
     OrOr,
     AmpAmp,
     /// '|' met a caller that only accepts ONE stage's tokens (tokenize()).
@@ -181,6 +195,37 @@ const ScanState = enum {
     double,
 };
 
+/// THE ESCAPED-WORD CONTRACT (fxsh U2, extended to globs by U3).  The two
+/// lexers MUST stay in lockstep, so the rule is spelled ONCE here:
+///
+/// * `\$`   — a literal `$`   (consumed by fx-vars.expand)
+/// * `\*`, `\?`, `\[` — a literal glob metacharacter (honoured by
+///   fx-glob's `\X`-is-literal matcher; fx-glob.unescape removes the `\`
+///   before the token becomes a child argv element)
+/// * `\\`   — a LITERAL backslash (produced by the single/double-quote arms
+///   for a verbatim `\`; fx-glob.unescape and fx-vars.expand both collapse
+///   it to one byte).  Encoding it means `'\*'` reaches the logical word as
+///   `\\\*` — unambiguous, so no scanner can read it as a LIVE glob.
+///
+/// Every OTHER unquoted `\X` keeps the pre-existing behaviour (the backslash
+/// is consumed and X rides alone), so `a\ b` is still one token `a b` and an
+/// unquoted `a\nb` still becomes `anb`.  A double-quoted `"a\nb"` keeps the
+/// two bytes `\n` as its logical form `\\n` (unescaped back to `\n` for the
+/// child).
+///
+/// KNOWN COLLISION (pre-existing, documented not hidden): an unquoted `\\*`
+/// (escaped backslash + LIVE glob) still reaches the logical word as the
+/// bytes `\*` — indistinguishable from a literal `\*` — so it does not glob.
+/// Telling them apart needs a longer escape alphabet; the fix here closes the
+/// collision for QUOTED verbatim backslashes without changing the unquoted
+/// matrix.
+fn isContractEscape(c: u8) bool {
+    return switch (c) {
+        '$', '*', '?', '[' => true,
+        else => false,
+    };
+}
+
 /// Split a line into pipeline STAGES of argv tokens: `find . |> grep fx`
 /// becomes `[["find","."],["grep","fx"]]`.  All returned slices are
 /// gpa-owned (freeStageTokens).  Pure: no I/O, no engine, no arena.
@@ -244,10 +289,28 @@ pub fn tokenizeStages(gpa: Allocator, line: []const u8) TokenizeError![]StageTok
                         return fail(error.UnbalancedQuote, "dangling backslash at end of input", i);
                     has_cur = true;
                     state = .unquoted;
-                    cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                    // THE ESCAPED-WORD CONTRACT: a literal `$` stays escaped
+                    // (`\$`) in the logical word, so fx-vars.expand can tell
+                    // it from a live expansion site.  Every other byte is
+                    // unescaped as before.
+                    if (isContractEscape(line[i + 1])) {
+                        // keep both bytes: `\$` (fx-vars) or `\*` `\?` `\[`
+                        // (fx-glob) is how a LITERAL special byte is spelled
+                        cur.appendSlice(gpa, line[i .. i + 2]) catch return error.NoMem;
+                    } else {
+                        cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                    }
                     i += 2;
                 },
-                '$' => return fail(error.Dollar, "'$' interpolation is not in v1 — single-quote it or escape it as \\$", i),
+                '$' => {
+                    // a LIVE expansion site: carried verbatim; RUN mode
+                    // expands it at the pre-typecheck seam, RECORD mode
+                    // rejects it with this offset.
+                    has_cur = true;
+                    state = .unquoted;
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
                 '&' => {
                     if (i + 1 < line.len and line[i + 1] == '&')
                         return fail(error.AmpAmp, "'&&' is not a v1 operator", i);
@@ -303,10 +366,22 @@ pub fn tokenizeStages(gpa: Allocator, line: []const u8) TokenizeError![]StageTok
                 '\\' => {
                     if (i + 1 >= line.len)
                         return fail(error.UnbalancedQuote, "dangling backslash at end of input", i);
-                    cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                    // THE ESCAPED-WORD CONTRACT (see the .between arm): `\$`
+                    // stays escaped in the logical word.
+                    if (isContractEscape(line[i + 1])) {
+                        // keep both bytes: `\$` (fx-vars) or `\*` `\?` `\[`
+                        // (fx-glob) is how a LITERAL special byte is spelled
+                        cur.appendSlice(gpa, line[i .. i + 2]) catch return error.NoMem;
+                    } else {
+                        cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                    }
                     i += 2;
                 },
-                '$' => return fail(error.Dollar, "'$' interpolation is not in v1 — single-quote it or escape it as \\$", i),
+                '$' => {
+                    // a LIVE expansion site — verbatim (see the .between arm)
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
                 '&' => {
                     if (i + 1 < line.len and line[i + 1] == '&')
                         return fail(error.AmpAmp, "'&&' is not a v1 operator", i);
@@ -323,7 +398,23 @@ pub fn tokenizeStages(gpa: Allocator, line: []const u8) TokenizeError![]StageTok
                     state = .unquoted; // the token stays open (glue)
                     i += 1;
                 },
-                // VERBATIM: no \ escape, no $ error, no # comment, no | split
+                // VERBATIM: no escape, no # comment, no | split.  A literal
+                // special byte (`$` or a glob metacharacter) is rewritten to
+                // the CONTRACT's `\X` at its own byte offset (fx-vars.expand /
+                // fx-glob see ONE uniform spelling of "literal special"), and a
+                // LITERAL backslash is encoded as `\\` — so `'\*'` becomes the
+                // bytes `\\\*`, which no scanner can misread as a LIVE glob
+                // (the old `\\*` spelling collided with an escaped backslash
+                // and falsely rejected a quoted word).
+                '\\' => {
+                    cur.appendSlice(gpa, "\\\\") catch return error.NoMem;
+                    i += 1;
+                },
+                '$', '*', '?', '[' => {
+                    cur.append(gpa, '\\') catch return error.NoMem;
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
                 else => {
                     cur.append(gpa, c) catch return error.NoMem;
                     i += 1;
@@ -338,17 +429,45 @@ pub fn tokenizeStages(gpa: Allocator, line: []const u8) TokenizeError![]StageTok
                     if (i + 1 >= line.len)
                         return fail(error.UnbalancedQuote, "dangling backslash at end of input (inside double quotes)", i);
                     const n = line[i + 1];
-                    if (n == '"' or n == '\\') {
+                    if (n == '"') {
+                        cur.append(gpa, n) catch return error.NoMem;
+                    } else if (n == '$') {
+                        // THE CONTRACT's `\$`: a LITERAL dollar (the one byte
+                        // fx-vars.expand consumes).
+                        cur.appendSlice(gpa, "\\$") catch return error.NoMem;
+                    } else if (n == '\\') {
+                        // a LITERAL backslash, encoded `\\` so it can never be
+                        // misread as the prefix of a following escape marker.
+                        cur.appendSlice(gpa, "\\\\") catch return error.NoMem;
+                    } else if (n == '`') {
+                        // POSIX: `\`` is the escaped backtick.
                         cur.append(gpa, n) catch return error.NoMem;
                     } else {
-                        // POSIX-quoted: only \" and \\ are escapes; every
-                        // other backslash pair is preserved as written
-                        cur.append(gpa, '\\') catch return error.NoMem;
+                        // POSIX-quoted: only \" \\ \$ \` are escapes; every
+                        // OTHER backslash is LITERAL — encoded `\\`, with a
+                        // following glob metacharacter marked literal too
+                        // (`\*` -> `\\\*`: verbatim backslash + literal star).
+                        cur.appendSlice(gpa, "\\\\") catch return error.NoMem;
+                        if (n == '*' or n == '?' or n == '[')
+                            cur.append(gpa, '\\') catch return error.NoMem;
                         cur.append(gpa, n) catch return error.NoMem;
                     }
                     i += 2;
                 },
-                '$' => return fail(error.Dollar, "'$' inside double quotes would interpolate in POSIX shells — v1 has no variables; single-quote it or escape it", i),
+                '$' => {
+                    // POSIX: `$` interpolates inside double quotes too — so
+                    // it is a LIVE site here, carried verbatim (RUN mode
+                    // expands, RECORD mode rejects with the offset).
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
+                // POSIX: double quotes suppress GLOBBING, so a metacharacter
+                // here is literal — marked with the contract escape.
+                '*', '?', '[' => {
+                    cur.append(gpa, '\\') catch return error.NoMem;
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
                 else => {
                     cur.append(gpa, c) catch return error.NoMem;
                     i += 1;
@@ -433,6 +552,33 @@ pub const ShellError = TokenizeError || error{
     ControlInRecordMode,
     /// a redirect on a `|>` line (undecided semantics).
     RedirectInRecordMode,
+    /// a glob pattern could not be EXPANDED (an unreadable directory, say).
+    /// Distinct from RedirectInRecordMode's shape: this is a filesystem
+    /// failure at the GLOB SEAM, never silently downgraded to the
+    /// null-glob-off literal (that would run a command on the pattern text).
+    GlobFailed,
+    /// VARIABLES (or any host state) on a `|>` line: a `$` expansion site
+    /// (U2) or a `NAME=value` assignment appears on a line whose mode is
+    /// RECORD.  The derivation hash would silently depend on shell state the
+    /// manifest does not carry — not reproducible — so the line is rejected
+    /// LOUDLY, with the byte offset of the offending `$` (or assignment
+    /// word).  Mirrors RedirectInRecordMode: run it with `|` instead.
+    HostStateInRecordMode,
+    /// `VAR=value cmd` — a PREFIX assignment (assignments are only whole
+    /// statements in v1).  Loud, never silent: the assignment would have to
+    /// scope to one command and that semantic is not built.
+    PrefixAssignment,
+    /// an assignment/export statement a shell would accept but fxsh v1
+    /// does not build (e.g. `export` of an invalid NAME).
+    BadAssignment,
+    /// a whole-line assignment/export statement carries a redirect (`X=1 > f`):
+    /// the redirect has no command to attach to, and silently dropping it is
+    /// forbidden, so it is rejected loudly.
+    AssignmentRedirect,
+    /// `$` (or `${...}`) in a form v1 does not expand — `$$`, `$1`, `$(`,
+    /// `${X:-y}`, a lone trailing `$` (fx-vars' loud rejections, mapped
+    /// here with the byte offset of the offending `$`).
+    UnsupportedExpansion,
     /// a malformed redirect: no target token, or a redirect in a position that
     /// is neither the first command (for `<`) nor the last (`>` and friends).
     BadRedirect,
@@ -655,7 +801,6 @@ extern "c" fn fork() std.c.pid_t;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn _exit(status: c_int) noreturn;
 
-
 // ---------------------------------------------------------------------------
 // U9 — redirects (RUN mode only)
 // ---------------------------------------------------------------------------
@@ -673,18 +818,52 @@ extern "c" fn _exit(status: c_int) noreturn;
 //   < FILE   the FIRST stage's stdin
 //   > FILE   the LAST stage's stdout (truncate-create)
 //   >> FILE  the LAST stage's stdout (append)
-//   2> FILE  the LAST stage's stderr
+//   2> FILE  the LAST stage's stderr (truncate-create)
+//   2>> FILE the LAST stage's stderr (append)
 //   2>&1     the LAST stage's stderr onto its stdout
 // A redirect is recognised only as a WHOLE token (`>` alone), so a filename or
 // pattern containing '>' is unaffected.  In RECORD mode a redirect is REJECTED
 // loudly: what a redirected derivation MEANS is a design question, not an
 // oversight.
 
+/// Is this token one of the redirect operators?  THE single source for every
+/// list that must recognise them (parseRedirs, the chain stripper's top-level
+/// scan, its group-reject scan): `2>>` was missing from the group list while
+/// present in the others, and it fell out of a `( … )` group into the command's
+/// argv instead of being rejected.  Add a new operator HERE and nowhere else.
+pub fn isRedirOp(tok: []const u8) bool {
+    return redirClass(tok) != .not_redir;
+}
+
+/// Which redirect a token is.  `not_redir` for anything that is not an
+/// operator (so `isRedirOp(t)` and `redirClass(t) != .not_redir` agree by
+/// construction).
+pub const RedirClass = enum {
+    stdin,
+    stdout,
+    stdout_append,
+    stderr,
+    stderr_append,
+    stderr_to_stdout,
+    not_redir,
+};
+
+pub fn redirClass(tok: []const u8) RedirClass {
+    if (std.mem.eql(u8, tok, "<")) return .stdin;
+    if (std.mem.eql(u8, tok, ">")) return .stdout;
+    if (std.mem.eql(u8, tok, ">>")) return .stdout_append;
+    if (std.mem.eql(u8, tok, "2>")) return .stderr;
+    if (std.mem.eql(u8, tok, "2>>")) return .stderr_append;
+    if (std.mem.eql(u8, tok, "2>&1")) return .stderr_to_stdout;
+    return .not_redir;
+}
+
 pub const Redirs = struct {
     stdin: ?[]const u8 = null,
     stdout: ?[]const u8 = null,
     stdout_append: bool = false,
     stderr: ?[]const u8 = null,
+    stderr_append: bool = false,
     stderr_to_stdout: bool = false,
 
     pub fn any(self: Redirs) bool {
@@ -732,37 +911,44 @@ pub fn parseRedirs(gpa: Allocator, stages: []const StageTok) RedirError!struct {
         var i: usize = 0;
         while (i < st.toks.len) : (i += 1) {
             const t = st.toks[i];
-            const is_op = std.mem.eql(u8, t, ">") or std.mem.eql(u8, t, ">>") or
-                std.mem.eql(u8, t, "<") or std.mem.eql(u8, t, "2>") or
-                std.mem.eql(u8, t, "2>>") or std.mem.eql(u8, t, "2>&1");
-            if (!is_op) {
-                const dup = gpa.dupe(u8, t) catch return error.NoMem;
-                kept.append(gpa, dup) catch {
-                    gpa.free(dup);
-                    return error.NoMem;
-                };
-                continue;
+            switch (redirClass(t)) {
+                .not_redir => {
+                    const dup = gpa.dupe(u8, t) catch return error.NoMem;
+                    kept.append(gpa, dup) catch {
+                        gpa.free(dup);
+                        return error.NoMem;
+                    };
+                    continue;
+                },
+                .stderr_to_stdout => {
+                    redirs.stderr_to_stdout = true;
+                    continue;
+                },
+                // every other operator needs a target token
+                else => {},
             }
-            if (std.mem.eql(u8, t, "2>&1")) {
-                redirs.stderr_to_stdout = true;
-                continue;
-            }
-            // every other operator needs a target token
             if (i + 1 >= st.toks.len) return error.BadRedirect;
             const target = st.toks[i + 1];
             i += 1;
-            if (std.mem.eql(u8, t, "<")) {
-                redirs.stdin = target;
-            } else if (std.mem.eql(u8, t, ">")) {
-                redirs.stdout = target;
-                redirs.stdout_append = false;
-            } else if (std.mem.eql(u8, t, ">>")) {
-                redirs.stdout = target;
-                redirs.stdout_append = true;
-            } else if (std.mem.eql(u8, t, "2>")) {
-                redirs.stderr = target;
-            } else if (std.mem.eql(u8, t, "2>>")) {
-                redirs.stderr = target;
+            switch (redirClass(t)) {
+                .stdin => redirs.stdin = target,
+                .stdout => {
+                    redirs.stdout = target;
+                    redirs.stdout_append = false;
+                },
+                .stdout_append => {
+                    redirs.stdout = target;
+                    redirs.stdout_append = true;
+                },
+                .stderr => {
+                    redirs.stderr = target;
+                    redirs.stderr_append = false;
+                },
+                .stderr_append => {
+                    redirs.stderr = target;
+                    redirs.stderr_append = true;
+                },
+                else => unreachable, // handled above (2>&1 / not_redir)
             }
         }
         const kept_slice = kept.toOwnedSlice(gpa) catch return error.NoMem;
@@ -811,20 +997,33 @@ fn buildRunArgv(gpa: Allocator, stage: *const eval.Stage, bin_dir: []const u8) !
         argv.deinit(gpa);
     }
 
+    // Append a freshly-allocated NUL-terminated string, freeing it if the
+    // append itself fails: between the dupeZ/allocPrintSentinel and the append
+    // there is a window where the string is allocated but not yet in
+    // argv.items (the errdefer above frees only what made it INTO the list).
+    const appendZ = struct {
+        fn f(list: *std.ArrayList(?[*:0]const u8), alloc: Allocator, z: [*:0]const u8) error{OutOfMemory}!void {
+            list.append(alloc, z) catch |e| {
+                alloc.free(std.mem.span(z));
+                return e;
+            };
+        }
+    }.f;
+
     const bin = try std.fmt.allocPrintSentinel(gpa, "{s}/fx-{s}", .{ bin_dir, stage.name }, 0);
-    try argv.append(gpa, bin.ptr);
+    try appendZ(&argv, gpa, bin.ptr);
 
     // a text-operand stage takes its operand from STDIN in run mode: the lone
     // '-' convention (fx-cli.isStdinOperand) reads the value from fd 0.
     if (spec.role == .text_operand) {
         const dash = try gpa.dupeZ(u8, "-");
-        try argv.append(gpa, dash.ptr);
+        try appendZ(&argv, gpa, dash.ptr);
     }
 
     // the user's tokens, verbatim and in order
     for (stage.argv) |tok| {
         const z = try gpa.dupeZ(u8, tok);
-        try argv.append(gpa, z.ptr);
+        try appendZ(&argv, gpa, z.ptr);
     }
 
     // the plan token: rows-producing stages must be told to emit the declared
@@ -834,7 +1033,7 @@ fn buildRunArgv(gpa: Allocator, stage: *const eval.Stage, bin_dir: []const u8) !
     switch (spec.role) {
         .operand_rows, .generator_rows, .native => {
             const rows = try gpa.dupeZ(u8, "--rows");
-            try argv.append(gpa, rows.ptr);
+            try appendZ(&argv, gpa, rows.ptr);
         },
         else => {},
     }
@@ -899,9 +1098,9 @@ fn childExec(
         _ = std.c.close(eff_stdout);
     }
     // stderr last: `2>&1` must see the FINAL stdout, and an explicit `2> FILE`
-    // wins over the merge.
+    // (append or truncate) wins over the merge.
     if (is_last and redirs.stderr != null) {
-        const fd = openRedirTarget(redirs.stderr.?, false, false, zs, &zn);
+        const fd = openRedirTarget(redirs.stderr.?, redirs.stderr_append, false, zs, &zn);
         if (fd < 0) _exit(1);
         _ = std.c.dup2(fd, 2);
     } else if (want_stderr_to_stdout) {
@@ -1022,11 +1221,49 @@ pub fn run(
     return eval.run(plan, input, state_dir, bin_dir, gpa, io);
 }
 
+/// The shell's VARIABLE STATE, owned by the BINARY (one per REPL session /
+/// script run) and threaded through runLine.  The table is the truth;
+/// `last_status` is the PREVIOUS line's result (`$?`).  `export_environ`
+/// selects the exec mechanism: when true, exported names are also written
+/// into THIS process's environment (libc setenv) so the execvp'd children
+/// inherit them — MEASURED: glibc execvp resolves and inherits from the
+/// setenv-updated environ.  Tests leave it false (no test-process env
+/// mutation).
+pub const Vars = struct {
+    table: vars.VarTable,
+    last_status: u8 = 0,
+    export_environ: bool = false,
+};
+
+/// Push a just-applied assignment/export statement's EXPORTED names into the
+/// process environment (setenv, BEFORE any fork — allocation here is parent-
+/// side; the post-fork child code stays allocation-free).  Names the
+/// statement did not mark exported are skipped.
+fn syncExported(gpa: Allocator, v: *Vars, words: []const []const u8) !void {
+    const names = if (std.mem.eql(u8, words[0], "export") and words.len > 1) words[1..] else words;
+    for (names) |w| {
+        const name = if (vars.isAssignment(w)) |as| as.name else w;
+        if (!v.table.isExported(name)) continue;
+        const value = v.table.get(name) orelse "";
+        const nz = gpa.dupeZ(u8, name) catch return error.NoMem;
+        defer gpa.free(nz);
+        const vz = gpa.dupeZ(u8, value) catch return error.NoMem;
+        defer gpa.free(vz);
+        _ = setenv(nz.ptr, vz.ptr, 1);
+    }
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 /// Mode-aware pipeline execution: the ONE place a line is executed.  `|>`
 /// (record) CAS-interns every intermediate and returns a derivation; `|`
 /// (pipe) forks the stages together, streams, records nothing, and returns the
 /// last stage's exit status.  The plan was already typechecked by buildPlan —
 /// the mode changes only HOW it runs, never WHAT is accepted.
+///
+/// U2: `vs` is the shell's variable state (assignments, `$?`).  It lives in
+/// the BINARY (one table per REPL session / script run), not the tokenizer;
+/// `last_status` feeds `$?` for THIS line (the PREVIOUS line's result).
 pub fn runLine(
     gpa: Allocator,
     line: []const u8,
@@ -1034,6 +1271,7 @@ pub fn runLine(
     state_dir: []const u8,
     bin_dir: []const u8,
     io: std.Io,
+    vs: ?*Vars,
 ) !Outcome {
     // The full LINE grammar (control flow + subshells).  tokenizeStages is the
     // pipeline-only view; parseLine is the line view the shell actually runs.
@@ -1061,6 +1299,10 @@ pub fn runLine(
         const redirs = la.alloc(Redirs, chain.pipes.len) catch return error.NoMem;
         @memset(redirs, .{});
         try stripRedirsFromChain(la, &chain, redirs);
+        // The targets left the chain, so neither the glob seam nor the vars
+        // seam will see them: both passes run on them explicitly in the RUN
+        // section below (expandRedirTargets then unescapeRedirTargets), AFTER
+        // the assignment fast-path and the record/control rejections.
 
         const has_record = chainHasRecord(&chain);
         const has_control = chainHasControl(&chain);
@@ -1079,6 +1321,30 @@ pub fn runLine(
             );
             return error.RedirectInRecordMode;
         }
+        // Host state (U2): `$` sites and assignments are RUN-mode only.  A
+        // `|>` line carrying either is rejected LOUDLY at the byte offset of
+        // the first offender — the derivation hash must not silently depend
+        // on shell state the manifest does not carry.
+        if (has_record) {
+            if (chainHostStateOffender(&chain)) |hit| {
+                switch (hit.kind) {
+                    .expansion => std.debug.print(
+                        "fx-shell: '$' expansion at byte {d} is not supported on a '|>' (record) line — the derivation would depend on shell state and not be reproducible; use '|' to just run it\n",
+                        .{hit.off},
+                    ),
+                    .assignment => std.debug.print(
+                        "fx-shell: assignment at byte {d} is not supported on a '|>' (record) line — the derivation would depend on shell state and not be reproducible; use '|' to just run it\n",
+                        .{hit.off},
+                    ),
+                    .glob => std.debug.print(
+                        "fx-shell: a glob metacharacter at byte {d} is not supported on a '|>' (record) line — the derivation would depend on the working directory's contents and not be reproducible; quote it to keep it literal, or use '|' to just run it\n",
+                        .{hit.off},
+                    ),
+                }
+                last_error = .{ .offset = hit.off, .message = "'$'/assignment/glob on a '|>' (record) line is host state — not reproducible; use '|'" };
+                return error.HostStateInRecordMode;
+            }
+        }
 
         if (has_record) {
             // A single recorded pipeline.  chainHasControl just proved there is
@@ -1087,6 +1353,9 @@ pub fn runLine(
             // the per-stage | / |> operator).
             const orig = try tokenizeStages(gpa, line);
             defer freeStageTokens(gpa, orig);
+            // the manifest carries THESE bytes, so the contract escapes come
+            // off here (BEFORE parseRedirs, so a redirect target is covered too)
+            try unescapeStageToks(gpa, orig);
             const rec = try parseRedirs(gpa, orig);
             defer freeRedirStages(gpa, rec.stages);
             const plan = try buildPlanTokens(gpa, rec.stages);
@@ -1097,37 +1366,96 @@ pub fn runLine(
             return runByMode(.record, plan, input, state_dir, bin_dir, redirs[0], gpa, io);
         }
 
-        // RUN mode: the chain executor (pipes, &&, ||, subshells, redirects)
-        return .{ .streamed = try runChain(gpa, &chain, bin_dir, redirs) };
-    }
+        // RUN mode.  A command emptied by redirect stripping (`> f`, `< f`,
+        // `2>&1`) has NOTHING to run: loud, never an index-out-of-bounds
+        // crash (the parser rejects a truly empty command; this is only the
+        // redirect-only shape).
+        if (emptyCommandIn(&chain)) {
+            std.debug.print(
+                "fx-shell: a command is only a redirect with no command to run (e.g. '> f')\n",
+                .{},
+            );
+            last_error = .{ .offset = 0, .message = "a redirect with no command to run (EmptyCommand)" };
+            return error.EmptyCommand;
+        }
 
-    const stage_toks = try tokenizeStages(gpa, line);
-    defer freeStageTokens(gpa, stage_toks);
-    const mode = lineMode(stage_toks);
+        // Variables first: a whole-line assignment / export statement never
+        // becomes a pipeline (`VAR=v |> cmd` was already rejected above, so
+        // here the statement is exactly one pipeline of one command).
+        if (vs) |v| {
+            if (chain.pipes.len == 1 and chain.pipes[0].cmds.len == 1) {
+                switch (chain.pipes[0].cmds[0]) {
+                    .words => |ws| {
+                        // H1: a whole-line assignment/export statement cannot
+                        // carry a redirect in v1 — the redirect would have no
+                        // command to attach to.  Reject BEFORE applyAssignment
+                        // mutates the table, LOUDLY: silently dropping the
+                        // redirect (`X=1 > f` leaving f uncreated) violates
+                        // the never-silent rule.
+                        if (isAssignmentStatement(ws.words) and anyRedirs(redirs)) {
+                            std.debug.print(
+                                "fx-shell: an assignment/export statement cannot carry a redirect in v1 — the redirect would have no command to attach to; put it on a real command\n",
+                                .{},
+                            );
+                            last_error = .{ .offset = ws.offs[0], .message = "an assignment/export statement cannot carry a redirect" };
+                            return error.AssignmentRedirect;
+                        }
+                        if (try applyAssignment(gpa, ws.words, &v.table)) {
+                            if (v.export_environ) try syncExported(gpa, v, ws.words);
+                            return .{ .streamed = 0 };
+                        }
+                        // a FIRST word that is an assignment before a real
+                        // command is a PREFIX assignment: loud, never silent
+                        // (ws.words is non-empty: the EmptyCommand guard above
+                        // already rejected the redirect-only shape).
+                        if (vars.isAssignment(ws.words[0]) != null) {
+                            std.debug.print(
+                                "fx-shell: a prefix assignment ('{s} cmd') is not supported in v1 — assignments are whole statements; put it on its own line\n",
+                                .{ws.words[0]},
+                            );
+                            last_error = .{ .offset = ws.offs[0], .message = "prefix assignment is not supported (assignments are whole statements)" };
+                            return error.PrefixAssignment;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            // expand BEFORE the typecheck so the arity guards judge the REAL
+            // (post-expansion) argv; results are never re-scanned (POSIX).
+            // The chain is arena-backed — expand with the SAME arena (the
+            // fn's doc: mixing allocators is the classic Invalid free).
+            try expandChainVars(la, &chain, &v.table, v.last_status);
+            // H2: redirect targets are shell words too — expand their `$`
+            // sites with the SAME table before they become path bytes (the
+            // vars seam runs AFTER stripRedirsFromChain, so they would
+            // otherwise leave the chain unexpanded).
+            try expandRedirTargets(la, redirs, &v.table, v.last_status);
+        }
 
-    // Redirects are a RUN-mode feature.  What a REDIRECTED DERIVATION means is
-    // a design question (should the write land in the effect log? should the
-    // bytes be part of the derivation?), so record mode rejects one loudly
-    // rather than silently picking an answer.
-    const parsed = try parseRedirs(gpa, stage_toks);
-    defer freeRedirStages(gpa, parsed.stages);
-    if (parsed.redirs.any() and mode == .record) {
-        std.debug.print(
-            "fx-shell: a redirect is not supported on a '|>' (record) line — what a redirected derivation means is undecided; use '|' to just run it\n",
-            .{},
-        );
-        return error.RedirectInRecordMode;
-    }
+        // U3: GLOBS last (POSIX order: parameter expansion, then pathname
+        // expansion).  Unconditional — a glob is filesystem state, not shell
+        // state, so it applies whether or not this line has a variable table.
+        // The expansion also STRIPS the contract escapes from non-glob words
+        // (`\*` -> `*`), so it is the single place a word becomes its final
+        // argv bytes.
+        try expandChainGlobs(la, io, std.Io.Dir.cwd(), &chain);
+        // The targets never reach the glob seam, so their contract escapes
+        // come off here (AFTER the var pass — `\$` is fx-vars' escape, not
+        // fx-glob's, and a verbatim backslash `\\` collapses to one byte).
+        try unescapeRedirTargets(la, redirs);
 
-    // Build from the REDIRECT-STRIPPED tokens (re-tokenizing the raw line here
-    // would feed `>`/`>>` back in as if they were stage names).  The typecheck
-    // is identical in both modes: the operator never changes what is accepted.
-    const plan = try buildPlanTokens(gpa, parsed.stages);
-    defer {
-        for (plan) |*st| freeStage(gpa, st);
-        gpa.free(plan); // freeStage frees each stage's argv, not the slice
+        // The chain executor (pipes, &&, ||, subshells, redirects).
+        // Type-check FIRST, with the SAME predicate the record path uses
+        // (buildStageInner's argv arity guards + adjacent shapeCompatible), so
+        // an ill-typed pipeline is rejected before anything forks.  Groups
+        // recurse.  The arena resets once per line (L1), success OR error, so
+        // a REPL's repeated rejections cannot grow it.
+        defer pipeline.resetArena();
+        try typecheckChain(gpa, &chain);
+        const status = try runChain(gpa, &chain, bin_dir, redirs);
+        if (vs) |v| v.last_status = status;
+        return .{ .streamed = status };
     }
-    return runByMode(mode, plan, input, state_dir, bin_dir, parsed.redirs, gpa, io);
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,15 +1504,23 @@ test "tokenizer: quote/escape/--/empty-arg matrix (the U4 gate)" {
         // single quotes: verbatim, ONE token despite spaces/backslashes
         .{ .in = "echo 'a b'", .want = &.{&.{ "echo", "a b" }} },
         .{ .in = "echo 'a b'  ", .want = &.{&.{ "echo", "a b" }} },
-        .{ .in = "echo 'a\\b'", .want = &.{&.{ "echo", "a\\b" }} },
-        .{ .in = "echo 'a$b #c'", .want = &.{&.{ "echo", "a$b #c" }} },
+        // a verbatim backslash is encoded `\\` in the logical word (so `'\*'`
+        // cannot be misread as a live glob) — the child gets `a\b`.
+        .{ .in = "echo 'a\\b'", .want = &.{&.{ "echo", "a\\\\b" }} },
+        // single quotes: verbatim, ONE token despite spaces/backslashes.
+        // A `$` inside them is a LITERAL and the ESCAPED-WORD CONTRACT (U2)
+        // keeps it as the two bytes `\$` — so the want below is a\\$b, not
+        // a$b (the tokenizer rewrites the quote form to the escape).
+        .{ .in = "echo 'a$b #c'", .want = &.{&.{ "echo", "a\\$b #c" }} },
         .{ .in = "echo 'it \"works\"'", .want = &.{&.{ "echo", "it \"works\"" }} },
         // double quotes: verbatim except \" and \\
         .{ .in = "echo \"a b\"", .want = &.{&.{ "echo", "a b" }} },
         .{ .in = "echo \"a\\\"b\"", .want = &.{&.{ "echo", "a\"b" }} },
-        .{ .in = "echo \"a\\\\b\"", .want = &.{&.{ "echo", "a\\b" }} },
+        // `\\` is a literal backslash, encoded `\\` in the logical word
+        .{ .in = "echo \"a\\\\b\"", .want = &.{&.{ "echo", "a\\\\b" }} },
         // POSIX-quoted: a backslash before a non-" non-\ byte is preserved
-        .{ .in = "echo \"a\\nb\"", .want = &.{&.{ "echo", "a\\nb" }} },
+        // (encoded `\\` in the logical word; the child gets `a\nb`)
+        .{ .in = "echo \"a\\nb\"", .want = &.{&.{ "echo", "a\\\\nb" }} },
         .{ .in = "echo \"it's\"", .want = &.{&.{ "echo", "it's" }} },
         // empty quoted arguments ARE tokens; quotes GLUE
         .{ .in = "echo ''", .want = &.{&.{ "echo", "" }} },
@@ -1194,7 +1530,7 @@ test "tokenizer: quote/escape/--/empty-arg matrix (the U4 gate)" {
         .{ .in = "echo ''x\"\"", .want = &.{&.{ "echo", "x" }} },
         // backslash outside quotes escapes the NEXT byte verbatim
         .{ .in = "echo a\\ b", .want = &.{&.{ "echo", "a b" }} },
-        .{ .in = "echo a\\$b", .want = &.{&.{ "echo", "a$b" }} },
+        .{ .in = "echo a\\$b", .want = &.{&.{ "echo", "a\\$b" }} },
         .{ .in = "echo a\\|b", .want = &.{&.{ "echo", "a|b" }} },
         .{ .in = "echo \\n", .want = &.{&.{ "echo", "n" }} },
         .{ .in = "echo a'b'c", .want = &.{&.{ "echo", "abc" }} },
@@ -1314,17 +1650,147 @@ test "tokenizer: # starts a comment only at token-START position" {
     for (cases) |case| try expectStages(gpa, case);
 }
 
-test "tokenizer: $ is a LOUD error exactly where POSIX would interpolate" {
+test "tokenizer: $ rides as expansion-site text; literals keep the \\<dollar> escape (U2)" {
     const gpa = testing.allocator;
-    // unquoted: offset of the $
-    try expectTokError(gpa, "echo $HOME", error.Dollar, 5);
-    try expectTokError(gpa, "echo a$b", error.Dollar, 6);
-    // inside DOUBLE quotes (an interpolation site in POSIX)
-    try expectTokError(gpa, "echo \"a$b\"", error.Dollar, 7);
-    // escaped ($ literal, no error) and single-quoted (verbatim) are fine
-    try expectStages(gpa, .{ .in = "echo \\$x", .want = &.{&.{ "echo", "$x" }} });
-    try expectStages(gpa, .{ .in = "echo '$x'", .want = &.{&.{ "echo", "$x" }} });
+    // A LIVE `$` is carried verbatim — expansion is mode-aware and happens
+    // LATER (run mode expands at the pre-typecheck seam; record mode rejects
+    // with the byte offset, see the record-mode tests).
+    try expectStages(gpa, .{ .in = "echo $HOME", .want = &.{&.{ "echo", "$HOME" }} });
+    try expectStages(gpa, .{ .in = "echo a$b", .want = &.{&.{ "echo", "a$b" }} });
+    try expectStages(gpa, .{ .in = "echo \"a$b\"", .want = &.{&.{ "echo", "a$b" }} });
+    try expectStages(gpa, .{ .in = "echo ${X}y", .want = &.{&.{ "echo", "${X}y" }} });
+    // THE ESCAPED-WORD CONTRACT: a literal `$` keeps the `\$` escape in the
+    // logical word — the SAME two bytes for all three spellings — so
+    // fx-vars.expand can tell it from a live site.  (Asymmetry: `\$X` and
+    // `$X` tokenize DIFFERENTLY.)
+    try expectStages(gpa, .{ .in = "echo \\$x", .want = &.{&.{ "echo", "\\$x" }} });
+    try expectStages(gpa, .{ .in = "echo '$x'", .want = &.{&.{ "echo", "\\$x" }} });
     try expectStages(gpa, .{ .in = "echo \"\\$x\"", .want = &.{&.{ "echo", "\\$x" }} });
+    // a mixed word: literal part, live part
+    try expectStages(gpa, .{ .in = "echo \\$x/$x", .want = &.{&.{ "echo", "\\$x/$x" }} });
+    // the SECOND lexer (tokLine) agrees byte-for-byte (RISK 3: lockstep)
+    {
+        const toks = try tokLine(gpa, "echo \\$x '$y' \"$z\" $w");
+        defer freeToks(gpa, toks);
+        try testing.expectEqual(@as(usize, 5), toks.len);
+        try testing.expectEqualStrings("echo", toks[0].word.bytes);
+        try testing.expectEqualStrings("\\$x", toks[1].word.bytes);
+        try testing.expectEqualStrings("\\$y", toks[2].word.bytes);
+        try testing.expectEqualStrings("$z", toks[3].word.bytes);
+        try testing.expectEqualStrings("$w", toks[4].word.bytes);
+        // word offsets point at the ORIGINAL line bytes (diagnostics)
+        try testing.expectEqual(@as(usize, 5), toks[1].word.off);
+        try testing.expectEqual(@as(usize, 9), toks[2].word.off);
+        try testing.expectEqual(@as(usize, 14), toks[3].word.off);
+        try testing.expectEqual(@as(usize, 19), toks[4].word.off);
+    }
+}
+
+test "tokenizer: glob metacharacters follow the ESCAPED-WORD CONTRACT (U3)" {
+    const gpa = testing.allocator;
+    // LIVE (unquoted) metacharacters ride VERBATIM — the glob seam expands
+    // them, and nothing else marks them.
+    try expectStages(gpa, .{ .in = "echo *", .want = &.{&.{ "echo", "*" }} });
+    try expectStages(gpa, .{ .in = "echo a*.txt", .want = &.{&.{ "echo", "a*.txt" }} });
+    try expectStages(gpa, .{ .in = "echo ?", .want = &.{&.{ "echo", "?" }} });
+    try expectStages(gpa, .{ .in = "echo [ab]c", .want = &.{&.{ "echo", "[ab]c" }} });
+
+    // LITERAL: the escape, single-quote and double-quote spellings all keep
+    // the contract escape — the SAME two bytes `\X` — so fx-glob.unescape can
+    // strip it before the word reaches a child and fx-glob.hasMeta sees a
+    // literal.  (Asymmetry: `\*` and `*` tokenize DIFFERENTLY.)
+    try expectStages(gpa, .{ .in = "echo \\*", .want = &.{&.{ "echo", "\\*" }} });
+    try expectStages(gpa, .{ .in = "echo '*'", .want = &.{&.{ "echo", "\\*" }} });
+    try expectStages(gpa, .{ .in = "echo \"*\"", .want = &.{&.{ "echo", "\\*" }} });
+    try expectStages(gpa, .{ .in = "echo \\?", .want = &.{&.{ "echo", "\\?" }} });
+    try expectStages(gpa, .{ .in = "echo '?'", .want = &.{&.{ "echo", "\\?" }} });
+    try expectStages(gpa, .{ .in = "echo \"?\"", .want = &.{&.{ "echo", "\\?" }} });
+    try expectStages(gpa, .{ .in = "echo \\[ab]", .want = &.{&.{ "echo", "\\[ab]" }} });
+    try expectStages(gpa, .{ .in = "echo '[ab]'", .want = &.{&.{ "echo", "\\[ab]" }} });
+    try expectStages(gpa, .{ .in = "echo \"[ab]\"", .want = &.{&.{ "echo", "\\[ab]" }} });
+    // a mixed word: the literal `\*` glues onto a live `*`
+    try expectStages(gpa, .{ .in = "a\\*b*", .want = &.{&.{"a\\*b*"}} });
+
+    // The pre-existing NON-meta backslash matrix is untouched by the extension
+    try expectStages(gpa, .{ .in = "echo a\\ b", .want = &.{&.{ "echo", "a b" }} });
+    // double-quoted `\n` keeps its backslash — encoded `\\` in the logical word
+    try expectStages(gpa, .{ .in = "echo \"a\\nb\"", .want = &.{&.{ "echo", "a\\\\nb" }} });
+    try expectStages(gpa, .{ .in = "echo a\\nb", .want = &.{&.{ "echo", "anb" }} });
+
+    // LOCKSTEP (plan RISK 3): both lexers byte-for-byte AND offset-for-offset
+    // over the whole glob matrix.  A divergence here is exactly the class of
+    // bug where globs work on simple lines but not on `&&` lines.
+    const lines = [_][]const u8{
+        "echo *",
+        "echo \\*",
+        "echo '*'",
+        "echo \"*\"",
+        "echo a*.txt",
+        "echo ?",
+        "echo \\? '?' \"?\"",
+        "echo [ab]c",
+        "echo \\[ab] '[ab]' \"[ab]\"",
+        "a\\*b*",
+        "echo \\*\\?\\[ x*",
+        "echo a\\ b \"a\\nb\" a\\nb",
+        "echo \\$x $y 'z*' \"w?\"",
+        // H3: a quote-internal backslash before a contract char (the cases the
+        // old single-quote rewrite double-escaped).  Both lexers must agree
+        // that a quoted verbatim backslash is `\\` and the special stays
+        // literal — never a live glob / live `$`.
+        "echo 'a\\*.txt'",
+        "echo '\\$X'",
+        "echo \"a\\*b\"",
+        "echo \"\\\\*\"",
+        "echo \"\\\\\\$X\"",
+    };
+    for (lines) |line| {
+        const stages = try tokenizeStages(gpa, line);
+        defer freeStageTokens(gpa, stages);
+        const toks = try tokLine(gpa, line);
+        defer freeToks(gpa, toks);
+
+        var want = std.ArrayList([]const u8).empty;
+        defer want.deinit(gpa);
+        for (stages) |st| for (st.toks) |t| try want.append(gpa, t);
+
+        var n: usize = 0;
+        for (toks) |t| switch (t) {
+            .word => |w| {
+                try testing.expect(n < want.items.len);
+                try testing.expectEqualStrings(want.items[n], w.bytes);
+                n += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(want.items.len, n);
+
+        // Offsets (tokLine only — tokenizeStages carries none) must be a
+        // strictly increasing run of positions in the LINE, each landing on a
+        // non-blank source byte.  A rewrite (a quote becoming the two-byte
+        // escape) must not move the OFFSET: diagnostics point at the source.
+        var prev: ?usize = null;
+        for (toks) |t| switch (t) {
+            .word => |w| {
+                try testing.expect(w.off < line.len);
+                try testing.expect(line[w.off] != ' ' and line[w.off] != '\t');
+                if (prev) |q| try testing.expect(w.off > q);
+                prev = w.off;
+            },
+            else => {},
+        };
+    }
+    // ... and the two explicit offset cases (the pattern's first byte)
+    {
+        const toks = try tokLine(gpa, "echo \\*");
+        defer freeToks(gpa, toks);
+        try testing.expectEqualStrings("\\*", toks[1].word.bytes);
+        try testing.expectEqual(@as(usize, 5), toks[1].word.off);
+        const quoted = try tokLine(gpa, "echo '*'");
+        defer freeToks(gpa, quoted);
+        try testing.expectEqualStrings("\\*", quoted[1].word.bytes);
+        try testing.expectEqual(@as(usize, 5), quoted[1].word.off); // the quote
+    }
 }
 
 test "tokenizer: unbalanced quote/dangling backslash carry the byte offset" {
@@ -1712,6 +2178,7 @@ test "redirects: operators are stripped from the stage tokens into Redirs" {
         try testing.expectEqualStrings(c.red.stdout orelse "", parsed.redirs.stdout orelse "");
         try testing.expectEqual(c.red.stdout_append, parsed.redirs.stdout_append);
         try testing.expectEqualStrings(c.red.stderr orelse "", parsed.redirs.stderr orelse "");
+        try testing.expectEqual(c.red.stderr_append, parsed.redirs.stderr_append);
         try testing.expectEqual(c.red.stderr_to_stdout, parsed.redirs.stderr_to_stdout);
     }
 }
@@ -1723,6 +2190,88 @@ test "redirects: a dangling operator is a loud error" {
     const toks = try tokenizeStages(gpa, "sort >");
     defer freeStageTokens(gpa, toks);
     try testing.expectError(error.BadRedirect, parseRedirs(gpa, toks));
+}
+
+test "redirects: 2>> appends and 2> truncates — the flags must differ" {
+    // The original bug: parseRedirs stored `2>` and `2>>` identically and the
+    // child-exec sites hardcoded append=false, so `2>>` silently TRUNCATED its
+    // target.  Assert the append FLAG flips, not merely that parsing succeeds.
+    const gpa = testing.allocator;
+    const Case = struct { in: []const u8, want_append: bool };
+    const cases = [_]Case{
+        .{ .in = "sort 2> err", .want_append = false },
+        .{ .in = "sort 2>> err", .want_append = true },
+    };
+    for (cases) |c| {
+        const toks = try tokenizeStages(gpa, c.in);
+        defer freeStageTokens(gpa, toks);
+        const parsed = try parseRedirs(gpa, toks);
+        defer freeRedirStages(gpa, parsed.stages);
+        try testing.expectEqualStrings("err", parsed.redirs.stderr.?);
+        try testing.expectEqual(c.want_append, parsed.redirs.stderr_append);
+    }
+
+    // and through the chain stripper (the &&-chain / group path): the flags
+    // must come out the same as parseRedirs gives for the plain pipeline.
+    // NOTE: the stripper's targets BORROW the chain's words (it frees only the
+    // operator tokens), so copy what we need out BEFORE freeing the chain.
+    for (cases) |c| {
+        var got_append: bool = undefined;
+        var got_err: ?[]const u8 = undefined;
+        {
+            var ch = try parseLine(gpa, c.in);
+            defer freeChain(gpa, &ch);
+            const redirs = try gpa.alloc(Redirs, ch.pipes.len);
+            defer gpa.free(redirs);
+            for (redirs) |*r| r.* = .{};
+            try stripRedirsFromChain(gpa, &ch, redirs);
+            got_append = redirs[0].stderr_append;
+            got_err = redirs[0].stderr;
+        }
+        // the stripper's targets are owned by the Redirs (freeRedirs's contract)
+        try testing.expectEqualStrings("err", got_err.?);
+        gpa.free(got_err.?);
+        try testing.expectEqual(c.want_append, got_append);
+    }
+}
+
+test "redirects: a redirect inside a group is rejected for EVERY operator" {
+    // `2>>` used to be missing from the group-reject list, so
+    // `( seq 1 2 2>> g.txt )` let the operator ride into the command's argv
+    // instead of being rejected.  Single-sourcing the operator list means one
+    // table drives this scan; enumerate every operator so a regression in any
+    // one of them fails here.
+    const gpa = testing.allocator;
+    for ([_][]const u8{ ">", ">>", "<", "2>", "2>>", "2>&1" }) |op| {
+        const line = try std.fmt.allocPrint(gpa, "( cat f {s} out )", .{op});
+        defer gpa.free(line);
+        // `2>&1` carries no target; reshape it into a valid-looking group
+        const probe = if (std.mem.eql(u8, op, "2>&1")) "( cat f 2>&1 )" else line;
+        var c = try parseLine(gpa, probe);
+        defer freeChain(gpa, &c);
+        const redirs = try gpa.alloc(Redirs, c.pipes.len);
+        defer gpa.free(redirs);
+        for (redirs) |*r| r.* = .{};
+        try testing.expectError(error.BadRedirect, stripRedirsFromChain(gpa, &c, redirs));
+    }
+}
+
+test "redirects: isRedirOp / redirClass agree with every list's needs" {
+    // the single-sourced predicate: every operator classifies, every
+    // non-operator (incl. a filename containing '>') does not
+    try testing.expectEqual(RedirClass.stdin, redirClass("<"));
+    try testing.expectEqual(RedirClass.stdout, redirClass(">"));
+    try testing.expectEqual(RedirClass.stdout_append, redirClass(">>"));
+    try testing.expectEqual(RedirClass.stderr, redirClass("2>"));
+    try testing.expectEqual(RedirClass.stderr_append, redirClass("2>>"));
+    try testing.expectEqual(RedirClass.stderr_to_stdout, redirClass("2>&1"));
+    for ([_][]const u8{ "a>b", ">>x", "x", "", "2 >&1" }) |t| {
+        try testing.expectEqual(RedirClass.not_redir, redirClass(t));
+        try testing.expect(!isRedirOp(t));
+    }
+    for ([_][]const u8{ "<", ">", ">>", "2>", "2>>", "2>&1" }) |t| {
+        try testing.expect(isRedirOp(t));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,10 +2295,13 @@ test "redirects: a dangling operator is a loud error" {
 // (and why this is a separate pre-built representation rather than running the
 // parser in the child).
 
-/// One token of the LINE lexer.  Words carry their quotes already resolved;
-/// the operators are structural.
+/// One token of the LINE lexer.  Words carry their quotes already resolved
+/// (a literal `$` per the ESCAPED-WORD CONTRACT: the two bytes `\$`), plus
+/// the word's byte offset into the source line — the one piece of position
+/// information RECORD-mode rejection (and expansion diagnostics) needs and
+/// that a resolved byte slice cannot recover.  The operators are structural.
 pub const Tok = union(enum) {
-    word: []const u8,
+    word: struct { bytes: []const u8, off: usize },
     pipe,
     record,
     andand,
@@ -1760,10 +2312,12 @@ pub const Tok = union(enum) {
 
 pub const ChainOp = enum { and_, or_ };
 
-/// A command: either a real argv, or a `( … )` group.  `group` is a pointer
-/// into the heap so a subshell nests arbitrarily.
+/// A command: either a real argv (with each word's byte offset into the
+/// source line, parallel to `words` — the record-mode `$` rejection and
+/// expansion diagnostics report ORIGINAL line offsets), or a `( … )` group.
+/// `group` is a pointer into the heap so a subshell nests arbitrarily.
 pub const Cmd = union(enum) {
-    words: []const []const u8,
+    words: struct { words: []const []const u8, offs: []const usize },
     group: *Chain,
 };
 
@@ -1781,8 +2335,9 @@ pub fn freeChain(gpa: Allocator, c: *const Chain) void {
     for (c.pipes) |p| {
         for (p.cmds) |cmd| switch (cmd) {
             .words => |ws| {
-                for (ws) |w| gpa.free(w);
-                gpa.free(ws);
+                for (ws.words) |w| gpa.free(w);
+                gpa.free(ws.words);
+                gpa.free(ws.offs);
             },
             .group => |g| {
                 freeChain(gpa, g);
@@ -1796,7 +2351,6 @@ pub fn freeChain(gpa: Allocator, c: *const Chain) void {
     gpa.free(c.ops);
 }
 
-
 /// Any redirection anywhere in the line?  (record mode rejects a redirect)
 fn anyRedirs(rs: []const Redirs) bool {
     for (rs) |r| if (r.any()) return true;
@@ -1807,8 +2361,8 @@ fn anyRedirs(rs: []const Redirs) bool {
 /// them into `redirs`.  Operates on the chain (not the pipeline-only token
 /// view) so a line using && / || / a subshell still gets its redirects
 /// recognised.  v1 keeps the classic simple-shell reading: `<` binds the first
-/// command of the first pipeline, `>`/`>>`/`2>`/`2>&1` the last command of the
-/// LAST pipeline.  A redirect INSIDE a `( … )` group is rejected — the
+/// command of the first pipeline, `>`/`>>`/`2>`/`2>>`/`2>&1` the last command
+/// of the LAST pipeline.  A redirect INSIDE a `( … )` group is rejected — the
 /// grouping/redirect interaction is undecided in v1.
 pub fn stripRedirsFromChain(gpa: Allocator, c: *Chain, redirs: []Redirs) ShellError!void {
     if (c.pipes.len == 0) return;
@@ -1821,58 +2375,78 @@ pub fn stripRedirsFromChain(gpa: Allocator, c: *Chain, redirs: []Redirs) ShellEr
                     const is_last_cmd = ci + 1 == p.cmds.len;
                     var kept = std.ArrayList([]const u8).empty;
                     errdefer kept.deinit(gpa);
+                    // the byte offsets of the KEPT words, parallel to `kept`
+                    var kept_offs = std.ArrayList(usize).empty;
+                    errdefer kept_offs.deinit(gpa);
                     var i: usize = 0;
-                    while (i < ws.len) : (i += 1) {
-                        const t = ws[i];
-                        const is_op = std.mem.eql(u8, t, ">") or std.mem.eql(u8, t, ">>") or
-                            std.mem.eql(u8, t, "<") or std.mem.eql(u8, t, "2>") or
-                            std.mem.eql(u8, t, "2>>") or std.mem.eql(u8, t, "2>&1");
-                        if (!is_op) {
-                            kept.append(gpa, t) catch return error.NoMem;
-                            continue;
+                    while (i < ws.words.len) : (i += 1) {
+                        const t = ws.words[i];
+                        switch (redirClass(t)) {
+                            .not_redir => {
+                                kept.append(gpa, t) catch return error.NoMem;
+                                kept_offs.append(gpa, ws.offs[i]) catch return error.NoMem;
+                                continue;
+                            },
+                            .stderr_to_stdout => {
+                                if (!is_last_cmd) return error.BadRedirect;
+                                redirs[pi].stderr_to_stdout = true;
+                                gpa.free(t);
+                                continue;
+                            },
+                            // every other operator needs a target token
+                            else => {},
                         }
-                        if (!is_first_cmd and !is_last_cmd) return error.BadRedirect;
-                        if (std.mem.eql(u8, t, "2>&1")) {
-                            if (!is_last_cmd) return error.BadRedirect;
-                            redirs[pi].stderr_to_stdout = true;
-                            gpa.free(t);
-                            continue;
-                        }
-                        if (i + 1 >= ws.len) return error.BadRedirect;
-                        const target = ws[i + 1];
+                        if (i + 1 >= ws.words.len) return error.BadRedirect;
+                        const target = ws.words[i + 1];
                         i += 1;
-                        if (std.mem.eql(u8, t, "<")) {
-                            if (!is_first_cmd) return error.BadRedirect;
-                            redirs[pi].stdin = target;
-                        } else if (std.mem.eql(u8, t, ">") or std.mem.eql(u8, t, ">>")) {
-                            if (!is_last_cmd) return error.BadRedirect;
-                            redirs[pi].stdout = target;
-                            redirs[pi].stdout_append = std.mem.eql(u8, t, ">>");
-                        } else {
-                            if (!is_last_cmd) return error.BadRedirect;
-                            redirs[pi].stderr = target;
+                        switch (redirClass(t)) {
+                            .stdin => {
+                                if (!is_first_cmd) return error.BadRedirect;
+                                redirs[pi].stdin = target;
+                            },
+                            .stdout => {
+                                if (!is_last_cmd) return error.BadRedirect;
+                                redirs[pi].stdout = target;
+                                redirs[pi].stdout_append = false;
+                            },
+                            .stdout_append => {
+                                if (!is_last_cmd) return error.BadRedirect;
+                                redirs[pi].stdout = target;
+                                redirs[pi].stdout_append = true;
+                            },
+                            .stderr => {
+                                if (!is_last_cmd) return error.BadRedirect;
+                                redirs[pi].stderr = target;
+                                redirs[pi].stderr_append = false;
+                            },
+                            .stderr_append => {
+                                if (!is_last_cmd) return error.BadRedirect;
+                                redirs[pi].stderr = target;
+                                redirs[pi].stderr_append = true;
+                            },
+                            else => unreachable, // handled above (2>&1 / not_redir)
                         }
                         gpa.free(t);
                     }
-                    // the leftover slice becomes the command's argv
+                    // the leftover slices become the command's argv
                     const kept_slice = kept.toOwnedSlice(gpa) catch return error.NoMem;
-                    // free the OLD slice array only: the surviving tokens are
+                    const offs_slice = kept_offs.toOwnedSlice(gpa) catch return error.NoMem;
+                    // free the OLD slice arrays only: the surviving tokens are
                     // the same pointers (now owned by kept_slice) and the
                     // redirect tokens + their targets were freed above.
-                    gpa.free(ws);
+                    gpa.free(ws.words);
+                    gpa.free(ws.offs);
                     // mutate the cmd in place (the chain owns the slice)
                     const cmds_mut = @constCast(p.cmds);
-                    cmds_mut[ci] = .{ .words = kept_slice };
+                    cmds_mut[ci] = .{ .words = .{ .words = kept_slice, .offs = offs_slice } };
                 },
                 .group => {
                     // a redirect inside a group is out of scope in v1
                     const inner = cmd.group;
                     for (inner.pipes) |ip| {
                         for (ip.cmds) |ic| switch (ic) {
-                            .words => |iws| for (iws) |iw| {
-                                if (std.mem.eql(u8, iw, ">") or std.mem.eql(u8, iw, ">>") or
-                                    std.mem.eql(u8, iw, "<") or std.mem.eql(u8, iw, "2>") or
-                                    std.mem.eql(u8, iw, "2>&1")) return error.BadRedirect;
+                            .words => |iws| for (iws.words) |iw| {
+                                if (redirClass(iw) != .not_redir) return error.BadRedirect;
                             },
                             else => {},
                         };
@@ -1888,7 +2462,7 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
     var out = std.ArrayList(Tok).empty;
     errdefer {
         for (out.items) |t| switch (t) {
-            .word => |w| gpa.free(w),
+            .word => |w| gpa.free(w.bytes),
             else => {},
         };
         out.deinit(gpa);
@@ -1897,14 +2471,17 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
     errdefer cur.deinit(gpa);
     var has_cur = false;
     var quote_off: usize = 0;
+    // where the currently-open word STARTED (Tok.word.off): run-mode
+    // expansion and record-mode rejection report offsets into the line
+    var word_off: usize = 0;
     var state: ScanState = .between;
 
     // flush the open word (if any) as a token
     const flush = struct {
-        fn f(g: Allocator, list: *std.ArrayList(Tok), buf: *std.ArrayList(u8), has: *bool) error{NoMem}!void {
+        fn f(g: Allocator, list: *std.ArrayList(Tok), buf: *std.ArrayList(u8), has: *bool, off: usize) error{NoMem}!void {
             if (!has.*) return;
             const w = buf.toOwnedSlice(g) catch return error.NoMem;
-            list.append(g, .{ .word = w }) catch {
+            list.append(g, .{ .word = .{ .bytes = w, .off = off } }) catch {
                 g.free(w);
                 return error.NoMem;
             };
@@ -1938,7 +2515,7 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
                     emit = .rparen;
                 }
                 if (emit) |e| {
-                    try flush(gpa, &out, &cur, &has_cur);
+                    try flush(gpa, &out, &cur, &has_cur, word_off);
                     out.append(gpa, e) catch return error.NoMem;
                     state = .between;
                     i += step;
@@ -1946,7 +2523,7 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
                 }
                 switch (c) {
                     ' ', '\t', '\r', '\n' => {
-                        if (state == .unquoted) try flush(gpa, &out, &cur, &has_cur);
+                        if (state == .unquoted) try flush(gpa, &out, &cur, &has_cur, word_off);
                         state = .between;
                         i += 1;
                     },
@@ -1957,6 +2534,7 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
                     },
                     '\'', '"' => {
                         quote_off = i;
+                        if (!has_cur) word_off = i;
                         state = if (c == '\'') .single else .double;
                         has_cur = true; // the empty quoted arg IS a token
                         i += 1;
@@ -1964,13 +2542,30 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
                     '\\' => {
                         if (i + 1 >= line.len)
                             return fail(error.UnbalancedQuote, "dangling backslash at end of input", i);
+                        if (!has_cur) word_off = i;
                         has_cur = true;
                         state = .unquoted;
-                        cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                        // THE ESCAPED-WORD CONTRACT (same rule as
+                        // tokenizeStages): `\$` stays escaped in the word.
+                        if (isContractEscape(line[i + 1])) {
+                            // keep both bytes (the ESCAPED-WORD CONTRACT)
+                            cur.appendSlice(gpa, line[i .. i + 2]) catch return error.NoMem;
+                        } else {
+                            cur.append(gpa, line[i + 1]) catch return error.NoMem;
+                        }
                         i += 2;
                     },
-                    '$' => return fail(error.Dollar, "'$' interpolation is not in v1 — single-quote it or escape it as \\$", i),
+                    '$' => {
+                        // a LIVE expansion site — carried verbatim (RUN mode
+                        // expands, RECORD mode rejects with the offset).
+                        if (!has_cur) word_off = i;
+                        has_cur = true;
+                        state = .unquoted;
+                        cur.append(gpa, c) catch return error.NoMem;
+                        i += 1;
+                    },
                     else => {
+                        if (!has_cur) word_off = i;
                         has_cur = true;
                         state = .unquoted;
                         cur.append(gpa, c) catch return error.NoMem;
@@ -1981,6 +2576,19 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
             .single => switch (c) {
                 '\'' => {
                     state = .unquoted;
+                    i += 1;
+                },
+                // VERBATIM except the CONTRACT: a `$` or glob metacharacter
+                // becomes the escaped `\X` at its own byte offset, and a
+                // LITERAL backslash is encoded `\\` (tokenizeStages does the
+                // same — the two lexers must stay in lockstep).
+                '\\' => {
+                    cur.appendSlice(gpa, "\\\\") catch return error.NoMem;
+                    i += 1;
+                },
+                '$', '*', '?', '[' => {
+                    cur.append(gpa, '\\') catch return error.NoMem;
+                    cur.append(gpa, c) catch return error.NoMem;
                     i += 1;
                 },
                 else => {
@@ -1997,15 +2605,38 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
                     if (i + 1 >= line.len)
                         return fail(error.UnbalancedQuote, "dangling backslash at end of input (inside double quotes)", i);
                     const n = line[i + 1];
-                    if (n == '"' or n == '\\') {
+                    if (n == '"') {
+                        cur.append(gpa, n) catch return error.NoMem;
+                    } else if (n == '$') {
+                        // THE CONTRACT's `\$` (tokenizeStages does the same)
+                        cur.appendSlice(gpa, "\\$") catch return error.NoMem;
+                    } else if (n == '\\') {
+                        // a LITERAL backslash, encoded `\\` (see tokenizeStages)
+                        cur.appendSlice(gpa, "\\\\") catch return error.NoMem;
+                    } else if (n == '`') {
                         cur.append(gpa, n) catch return error.NoMem;
                     } else {
-                        cur.append(gpa, '\\') catch return error.NoMem;
+                        // only \" \\ \$ \` are escapes; every other backslash
+                        // is LITERAL — encoded `\\`, marking a following glob
+                        // metacharacter literal too.
+                        cur.appendSlice(gpa, "\\\\") catch return error.NoMem;
+                        if (n == '*' or n == '?' or n == '[')
+                            cur.append(gpa, '\\') catch return error.NoMem;
                         cur.append(gpa, n) catch return error.NoMem;
                     }
                     i += 2;
                 },
-                '$' => return fail(error.Dollar, "'$' inside double quotes would interpolate in POSIX shells — v1 has no variables; single-quote it or escape it", i),
+                '$' => {
+                    // POSIX: a live site inside double quotes too — verbatim
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
+                // POSIX: double quotes suppress GLOBBING (see tokenizeStages)
+                '*', '?', '[' => {
+                    cur.append(gpa, '\\') catch return error.NoMem;
+                    cur.append(gpa, c) catch return error.NoMem;
+                    i += 1;
+                },
                 else => {
                     cur.append(gpa, c) catch return error.NoMem;
                     i += 1;
@@ -2015,14 +2646,14 @@ pub fn tokLine(gpa: Allocator, line: []const u8) TokenizeError![]Tok {
     }
     if (state == .single or state == .double)
         return fail(error.UnbalancedQuote, "unterminated quote (opened here; no matching close before end of input)", quote_off);
-    try flush(gpa, &out, &cur, &has_cur);
+    try flush(gpa, &out, &cur, &has_cur, word_off);
     cur.deinit(gpa);
     return out.toOwnedSlice(gpa) catch return error.NoMem;
 }
 
 pub fn freeToks(gpa: Allocator, toks: []Tok) void {
     for (toks) |t| switch (t) {
-        .word => |w| gpa.free(w),
+        .word => |w| gpa.free(w.bytes),
         else => {},
     };
     gpa.free(toks);
@@ -2124,29 +2755,36 @@ const Parser = struct {
             for (words.items) |w| self.gpa.free(w);
             words.deinit(self.gpa);
         }
+        var offs = std.ArrayList(usize).empty;
+        errdefer offs.deinit(self.gpa);
         while (self.peek()) |tt| {
             switch (tt) {
                 .word => |w| {
                     self.i += 1;
-                    const dup = self.gpa.dupe(u8, w) catch return error.NoMem;
+                    const dup = self.gpa.dupe(u8, w.bytes) catch return error.NoMem;
                     words.append(self.gpa, dup) catch {
                         self.gpa.free(dup);
                         return error.NoMem;
                     };
+                    offs.append(self.gpa, w.off) catch return error.NoMem;
                 },
                 else => break,
             }
         }
         if (words.items.len == 0) return error.EmptyCommand;
-        return .{ .words = words.toOwnedSlice(self.gpa) catch return error.NoMem };
+        return .{ .words = .{
+            .words = words.toOwnedSlice(self.gpa) catch return error.NoMem,
+            .offs = offs.toOwnedSlice(self.gpa) catch return error.NoMem,
+        } };
     }
 };
 
 fn freeCmd(gpa: Allocator, c: Cmd) void {
     switch (c) {
         .words => |ws| {
-            for (ws) |w| gpa.free(w);
-            gpa.free(ws);
+            for (ws.words) |w| gpa.free(w);
+            gpa.free(ws.words);
+            gpa.free(ws.offs);
         },
         .group => |g| {
             freeChain(gpa, g);
@@ -2197,6 +2835,378 @@ fn chainHasControl(c: *const Chain) bool {
     return false;
 }
 
+/// A command left with ZERO words after redirect stripping (`> f`, `< f`,
+/// `2>&1` alone) is empty.  The parser already rejects a truly empty command;
+/// this is only the redirect-only shape stripRedirsFromChain produces — the
+/// caller turns it into a LOUD EmptyCommand instead of indexing words[0].
+fn emptyCommandIn(c: *const Chain) bool {
+    for (c.pipes) |p| {
+        for (p.cmds) |cmd| switch (cmd) {
+            .group => |g| if (emptyCommandIn(g)) return true,
+            .words => |ws| if (ws.words.len == 0) return true,
+        };
+    }
+    return false;
+}
+
+/// THE RUN-MODE EXPANSION SEAM (fxsh U2).  Walks every command of the chain
+/// (recursing into groups) and expands `$NAME` / `${NAME}` / `$?` in every
+/// word via fx-vars.expand, IN PLACE: the word is replaced by its expansion
+/// and the chain's byte offsets stay those of the ORIGINAL words (errors
+/// after this point still point at real line bytes).  A word with no `$`
+/// (after contract-escaping) is left untouched — same pointer, zero cost.
+///
+/// ORDER (plan RISK 4): this runs BEFORE expandChainGlobs (U3) and BEFORE
+/// typecheckChain / flatten, so buildStageInner's argv arity guards judge the
+/// POST-expansion argv.  A `$VAR` whose VALUE contains a glob metacharacter
+/// IS globbed by the later pass — POSIX/bash-consistent, since pathname
+/// expansion applies to the results of parameter expansion.  What is never
+/// re-scanned is the glob pass's OWN output (a matched filename is a literal
+/// argv element).
+///
+/// The OFFSET RULE for diagnostics: fx-vars.last_error.offset is relative to
+/// the WORD, so it is translated to line coordinates by adding the word's
+/// own line offset (ws.offs[i]) before this fn returns.
+///
+/// `alloc` MUST be the allocator the chain was built with (runLine's line
+/// arena): the replaced words are freed with it, and the expansions it
+/// produces die with it — mixing allocators here is the classic "Invalid
+/// free" (an arena word freed through gpa panics).
+fn expandChainVars(alloc: Allocator, c: *const Chain, table: *const vars.VarTable, last_status: u8) ShellError!void {
+    for (c.pipes) |p| {
+        for (p.cmds) |cmd| {
+            switch (cmd) {
+                .group => |g| try expandChainVars(alloc, g, table, last_status),
+                .words => |*ws| {
+                    // cmds are const through the chain; expansion REPLACES
+                    // words in place, which is the whole point of running it
+                    // before anything else consumes the chain
+                    const words_mut = @constCast(ws.words);
+                    for (words_mut, 0..) |word, i| {
+                        if (std.mem.indexOfScalar(u8, word, '$') == null) continue;
+                        const expanded = vars.expand(alloc, word, table, last_status) catch |e| {
+                            return expandFail(e, ws.offs[i]);
+                        };
+                        alloc.free(word);
+                        words_mut[i] = expanded;
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// THE RUN-MODE GLOB SEAM (fxsh U3).  Walks every command of the chain
+/// (recursing into groups) and rewrites each word through fx-glob, IN PLACE
+/// in the chain: a word with NO live metacharacter comes back as itself with
+/// the contract escapes stripped (`\*` -> `*`, `\?` -> `?`, `\[` -> `[` — via
+/// fx-glob.unescape), and a word WITH one becomes N argv tokens, byte-SORTED
+/// (fx-glob.expand).  One word may therefore change the argv LENGTH, which is
+/// exactly why this runs BEFORE typecheckChain (plan RISK 4: an arity guard
+/// computed on the un-expanded argv misses a post-expansion overflow).
+///
+/// ORDER (POSIX, and the U2 seam's doc): AFTER expandChainVars — a `$VAR`
+/// whose VALUE contains `*` is globbed, because POSIX applies pathname
+/// expansion to the results of parameter expansion.  What is NOT re-scanned
+/// is this pass's OWN output: a matched filename is a literal argv element
+/// and is never re-globbed.
+///   KNOWN SIMPLIFICATION: `"$X"` and `$X` are the same live site to the
+/// tokenizer (U2 does not carry the quoted/unquoted bit), so a quoted
+/// expansion that expands to a pattern still globs, where POSIX would not.
+///
+/// The result words are `alloc`-owned (runLine's line arena), and the
+/// per-word byte offsets keep pointing at the PATTERN's offset in the source
+/// line, so later diagnostics still name a real byte.
+fn expandChainGlobs(alloc: Allocator, io: std.Io, cwd: std.Io.Dir, c: *const Chain) ShellError!void {
+    for (c.pipes) |p| {
+        // `p` is a copy, but p.cmds points at the shared (arena) command
+        // array: taking the elements BY POINTER is what makes the rewritten
+        // word lists visible to the executor.
+        const cmds_mut = @constCast(p.cmds);
+        for (cmds_mut) |*cmd| {
+            switch (cmd.*) {
+                .group => |g| try expandChainGlobs(alloc, io, cwd, g),
+                .words => |*ws| {
+                    var out = std.ArrayList([]const u8).empty;
+                    var offs = std.ArrayList(usize).empty;
+                    // Nothing is freed until BOTH new slices exist: the chain
+                    // must never hold a dangling word, because an error return
+                    // leaves freeChain to walk exactly this array.
+                    errdefer {
+                        for (out.items) |m| alloc.free(m);
+                        out.deinit(alloc);
+                        offs.deinit(alloc);
+                    }
+                    for (ws.words, 0..) |word, i| {
+                        const matches = glob.expand(alloc, io, word, cwd) catch |e| return globFail(e, ws.offs[i]);
+                        defer alloc.free(matches); // the strings moved into `out`
+                        for (matches) |m| {
+                            out.append(alloc, m) catch return error.NoMem;
+                            offs.append(alloc, ws.offs[i]) catch return error.NoMem;
+                        }
+                    }
+                    // EXACT-size the slices: freeChain frees them by LENGTH, so
+                    // a capacity-sized buffer would be a mismatched free.
+                    const new_words = out.toOwnedSlice(alloc) catch return error.NoMem;
+                    const new_offs = offs.toOwnedSlice(alloc) catch {
+                        alloc.free(new_words);
+                        return error.NoMem;
+                    };
+                    // the replaced words (parse-tree spelling or the vars
+                    // pass's output) and the old offs slice are unreferenced
+                    // now — hand them back on the SAME allocator, exactly as
+                    // expandChainVars does.
+                    for (ws.words) |w| alloc.free(w);
+                    alloc.free(ws.words);
+                    alloc.free(ws.offs);
+                    ws.words = new_words;
+                    ws.offs = new_offs;
+                },
+            }
+        }
+    }
+}
+
+/// A glob failure that is NOT "this branch does not match" (an unreadable
+/// directory, for instance) is LOUD, never swallowed into the null-glob-off
+/// literal — silently running `rm` on the pattern is the failure mode that
+/// buys.  The byte offset points at the offending pattern word.
+fn globFail(e: glob.Error, word_off: usize) ShellError {
+    std.debug.print(
+        "fx-shell: glob expansion of the pattern at byte {d} failed: {s}\n",
+        .{ word_off, @errorName(e) },
+    );
+    last_error = .{
+        .offset = word_off,
+        .message = "the glob pattern could not be expanded (unreadable directory?) — not treating it as a literal",
+    };
+    return switch (e) {
+        error.OutOfMemory => error.NoMem,
+        else => error.GlobFailed,
+    };
+}
+
+/// Strip the CONTRACT ESCAPES from every token of a TOKENIZER view.  The
+/// RECORD path hashes these bytes into the derivation, so `echo '*' |> cat`
+/// must record the literal `*` and not the marker `\*`, and `echo \$X |> sort`
+/// must record `$X` — the SAME bytes running the line would print (H4).  This
+/// path runs NO fx-vars.expand, so it uses the RECORD unescaper, which also
+/// consumes `\$` (fx-glob.unescape deliberately leaves it for fx-vars on the
+/// RUN path).  Called BEFORE parseRedirs, so a redirect target taken out of
+/// these tokens is unescaped with the rest.
+fn unescapeStageToks(gpa: Allocator, stages: []StageTok) ShellError!void {
+    for (stages) |*st| {
+        for (st.toks) |*t| {
+            const u = glob.unescapeRecord(gpa, t.*) catch return error.NoMem;
+            if (u.len == t.*.len) {
+                gpa.free(u); // nothing stripped: keep the original allocation
+                continue;
+            }
+            gpa.free(t.*);
+            t.* = u;
+        }
+    }
+}
+
+/// Strip the CONTRACT ESCAPES from a redirect target, which stripRedirsFromChain
+/// takes OUT of the chain and therefore away from the glob seam — without this
+/// `> 'o*ut'` would create a file literally named `o\*ut`.  v1 does NOT glob
+/// a redirect target (POSIX would, and errors when more than one name
+/// matches); the promise kept here is the smaller one: the target is the
+/// literal path the user wrote.
+fn unescapeRedirTargets(alloc: Allocator, redirs: []Redirs) ShellError!void {
+    for (redirs) |*r| {
+        if (r.stdin) |t| r.stdin = try unescapeTarget(alloc, t);
+        if (r.stdout) |t| r.stdout = try unescapeTarget(alloc, t);
+        if (r.stderr) |t| r.stderr = try unescapeTarget(alloc, t);
+    }
+}
+
+fn unescapeTarget(alloc: Allocator, t: []const u8) ShellError![]const u8 {
+    const u = glob.unescape(alloc, t) catch return error.NoMem;
+    if (u.len == t.len) {
+        alloc.free(u); // nothing stripped: keep the original allocation
+        return t;
+    }
+    alloc.free(t);
+    return u;
+}
+
+/// H2: expand `$` sites in a redirect target with the RUN-mode variable
+/// table, exactly as expandChainVars does for chain words.  Called AFTER the
+/// assignment fast-path and expandChainVars, with the same table — `cat < $F`
+/// must read the file the variable names, never open the literal bytes `$F`.
+/// A target with no `$` is left untouched (same pointer, zero cost).
+fn expandRedirTargets(alloc: Allocator, redirs: []Redirs, table: *const vars.VarTable, last_status: u8) ShellError!void {
+    for (redirs) |*r| {
+        if (r.stdin) |t| r.stdin = try expandRedirTarget(alloc, t, table, last_status);
+        if (r.stdout) |t| r.stdout = try expandRedirTarget(alloc, t, table, last_status);
+        if (r.stderr) |t| r.stderr = try expandRedirTarget(alloc, t, table, last_status);
+    }
+}
+
+fn expandRedirTarget(alloc: Allocator, t: []const u8, table: *const vars.VarTable, last_status: u8) ShellError![]const u8 {
+    // the `$` scan is the same gate expandChainVars uses: a `\$` still
+    // contains a `$` byte, and fx-vars.expand consumes it correctly.
+    if (std.mem.indexOfScalar(u8, t, '$') == null) return t;
+    const expanded = vars.expand(alloc, t, table, last_status) catch |e| {
+        return expandFail(e, 0); // the target's own byte offset is not tracked
+    };
+    alloc.free(t);
+    return expanded;
+}
+
+/// Map an fx-vars ExpandError onto the seam's error set, translating the
+/// word-relative offset fx-vars published into LINE coordinates first (the
+/// caller knows the word's own offset; the failing `$` sits at word_off +
+/// vars.last_error.offset).
+fn expandFail(e: vars.ExpandError, word_off: usize) ShellError {
+    last_error = .{
+        .offset = word_off + vars.last_error.offset,
+        .message = vars.last_error.message,
+    };
+    return switch (e) {
+        error.NoMem => error.NoMem,
+        else => error.UnsupportedExpansion,
+    };
+}
+
+/// Reject host state on a RECORD line: any `$` expansion site, any LIVE glob
+/// metacharacter, or any `NAME=value` assignment word, anywhere in the chain
+/// (groups included).  FIRST offender wins, reported with its byte offset.
+/// This is the never-silent rule for `|>`: a derivation whose argv silently
+/// depended on shell state (or on the filesystem) the manifest does not carry
+/// would not be reproducible.
+///
+/// A QUOTED or ESCAPED metacharacter is not host state: the tokenizer marked
+/// it with the contract escape (`\*`), so `glob.metaOff` — the SAME scanner
+/// that decides what `expand` would glob — does not see it, and `echo '*' |>
+/// cat` stays legal.
+fn chainHostStateOffender(c: *const Chain) ?struct { off: usize, kind: enum { expansion, assignment, glob } } {
+    for (c.pipes) |p| {
+        for (p.cmds) |cmd| {
+            switch (cmd) {
+                .group => |g| if (chainHostStateOffender(g)) |hit| return hit,
+                .words => |ws| {
+                    for (ws.words, 0..) |word, i| {
+                        // offset of the FIRST offending byte in the word: a
+                        // `$` that is not the contract's escaped literal, or a
+                        // live glob metacharacter.  ONE scan, both kinds, so
+                        // the earliest offender wins.
+                        var j: usize = 0;
+                        while (j < word.len) : (j += 1) {
+                            if (word[j] == '\\' and j + 1 < word.len) {
+                                j += 1; // the escaped byte (incl. `\$`) is literal
+                                continue;
+                            }
+                            if (word[j] == '$') return .{ .off = ws.offs[i] + j, .kind = .expansion };
+                        }
+                        if (glob.metaOff(word)) |mj| return .{ .off = ws.offs[i] + mj, .kind = .glob };
+                        // M1: only a word in COMMAND position can be an
+                        // assignment — `echo a=1`'s argument is data, not
+                        // shell state, and must not be rejected.
+                        if (i == 0) {
+                            if (vars.isAssignment(word) != null)
+                                return .{ .off = ws.offs[i], .kind = .assignment };
+                        }
+                    }
+                },
+            }
+        }
+    }
+    return null;
+}
+
+/// Is `cmd_words` a whole-line assignment/export STATEMENT (BEFORE applying)?
+/// Mirrors applyAssignment's dispatch exactly: `export` + names, or every word
+/// an `NAME=value` assignment.  Used to reject a redirect on a statement
+/// without mutating the table first.
+fn isAssignmentStatement(cmd_words: []const []const u8) bool {
+    if (cmd_words.len == 0) return false;
+    if (std.mem.eql(u8, cmd_words[0], "export") and cmd_words.len > 1) return true;
+    for (cmd_words) |w| {
+        if (vars.isAssignment(w) == null) return false;
+    }
+    return true;
+}
+
+/// Apply a whole-line ASSIGNMENT or EXPORT statement (RUN mode): every word
+/// of the single command must be an assignment (`NAME=value`), or the single
+/// word must be `export` followed by names / `NAME=value` words.  Returns
+/// true when the command WAS one (and applies it); false when it is a normal
+/// pipeline command (prefix assignments like `VAR=v cmd` are rejected by the
+/// caller, never silently dropped).  Status 0.
+pub fn applyAssignment(gpa: Allocator, cmd_words: []const []const u8, table: *vars.VarTable) ShellError!bool {
+    if (cmd_words.len == 0) return false;
+
+    // `export NAME[=v] ...`: names must be valid; a value is optional (the
+    // bare name marks whatever the table holds, creating empty-EXPORTED if
+    // unset — the fx-vars simplification).
+    if (std.mem.eql(u8, cmd_words[0], "export") and cmd_words.len > 1) {
+        for (cmd_words[1..]) |w| {
+            if (vars.isAssignment(w)) |as| {
+                // the VALUE is shell state: strip the tokenizer's literal
+                // escapes (`\*`, `\$`, `\\`), or `export X='a*b'` / `X='$y'`
+                // would hand a child the bytes `a\*b` / `\$y`.  unescapeRecord
+                // consumes `\$` too — assignment values run no fx-vars.expand.
+                const value = glob.unescapeRecord(gpa, as.value) catch return error.NoMem;
+                defer gpa.free(value);
+                table.set(as.name, value) catch return error.NoMem;
+                table.markExported(as.name) catch return error.NoMem;
+            } else if (vars.isValidName(w)) {
+                table.markExported(w) catch return error.NoMem;
+            } else {
+                std.debug.print("fx-shell: export: '{s}' is not a valid NAME or NAME=value\n", .{w});
+                last_error = .{ .offset = 0, .message = "export needs NAME or NAME=value words" };
+                return error.BadAssignment;
+            }
+        }
+        return true;
+    }
+
+    // bare assignment statement: EVERY word must be one (`a=1 b=2` sets both)
+    for (cmd_words) |w| {
+        if (vars.isAssignment(w) == null) return false;
+    }
+    for (cmd_words) |w| {
+        const as = vars.isAssignment(w).?;
+        // see the export branch: values run no fx-vars.expand, so `\$` must
+        // come off here too.
+        const value = glob.unescapeRecord(gpa, as.value) catch return error.NoMem;
+        defer gpa.free(value);
+        table.set(as.name, value) catch return error.NoMem;
+    }
+    return true;
+}
+
+/// Type-check every pipeline of a RUN-mode chain with the SAME predicate the
+/// record path uses: buildStageInner's argv arity guards plus the adjacent
+/// shapeCompatible check.  Groups recurse so `( ls . | wc )` rejects exactly
+/// like the bare `ls . | wc` it wraps.  A group's output shape is NOT
+/// statically tracked here (record mode rejects groups outright, so there is
+/// no record-path predicate to mirror), so a word command after a group starts
+/// a fresh adjacent-pair thread.  Does NOT reset the pipeline arena — the
+/// caller does once per chain (L1), mirroring buildPlanTokens.
+fn typecheckChain(gpa: Allocator, c: *const Chain) ShellError!void {
+    for (c.pipes) |p| {
+        var prev_out: ?pipeline.Shape = null;
+        for (p.cmds) |cmd| switch (cmd) {
+            .words => |ws| {
+                const r = try buildStageInner(gpa, ws.words, prev_out);
+                // buildStageInner duplicates argv into gpa memory even though a
+                // type-check never runs the Stage — free it here; the
+                // arena-backed input/output Shapes stay valid until resetArena.
+                freeStage(gpa, &r.stage);
+                prev_out = r.output;
+            },
+            .group => |g| {
+                try typecheckChain(gpa, g);
+                prev_out = null;
+            },
+        };
+    }
+}
+
 // --- flattening: build EVERY argv before any fork -------------------------
 
 const FlatCmd = struct {
@@ -2221,6 +3231,7 @@ const FlatChain = struct {
 
 fn flattenChain(gpa: Allocator, c: *const Chain, bin_dir: []const u8, redirs: []const Redirs) anyerror!FlatChain {
     var pipes = try gpa.alloc(FlatPipeline, c.pipes.len);
+    errdefer gpa.free(pipes);
     var built: usize = 0;
     errdefer for (pipes[0..built]) |p| freeFlatPipeline(gpa, p);
     for (c.pipes, 0..) |p, i| {
@@ -2235,14 +3246,15 @@ fn flattenChain(gpa: Allocator, c: *const Chain, bin_dir: []const u8, redirs: []
 
 fn flattenPipeline(gpa: Allocator, p: Pipeline, bin_dir: []const u8, redirs: Redirs) anyerror!FlatPipeline {
     var cmds = try gpa.alloc(FlatCmd, p.cmds.len);
+    errdefer gpa.free(cmds);
     var built: usize = 0;
     errdefer for (cmds[0..built]) |c| freeFlatCmd(gpa, c);
     for (p.cmds, 0..) |cmd, i| {
         cmds[i] = switch (cmd) {
             .words => |ws| blk: {
                 const st = eval.Stage{
-                    .name = ws[0],
-                    .argv = ws[1..],
+                    .name = ws.words[0],
+                    .argv = ws.words[1..],
                     .shape_in = .{ .tag = .lines },
                     .shape_out = .{ .tag = .lines },
                 };
@@ -2346,7 +3358,7 @@ fn runFlatPipeline(gpa: Allocator, p: *const FlatPipeline) anyerror!u8 {
             }
             if (i == n - 1) {
                 if (p.redirs.stderr) |path| {
-                    const fd = openRedirTarget(path, false, false, zs, &zn);
+                    const fd = openRedirTarget(path, p.redirs.stderr_append, false, zs, &zn);
                     if (fd < 0) _exit(1);
                     _ = std.c.dup2(fd, 2);
                 } else if (p.redirs.stderr_to_stdout) {
@@ -2462,4 +3474,338 @@ test "record mode is rejected when the line has control flow" {
     defer freeChain(gpa, &ok);
     try testing.expect(!chainHasControl(&ok));
     try testing.expect(chainHasRecord(&ok));
+}
+
+test "run-mode typecheck: chain pipelines get the record predicate (recursively)" {
+    // RUN mode executes through the chain grammar (parseLine -> runChain), so
+    // the typecheck must walk every PIPELINE of the chain and recurse into
+    // `( )` groups — the U0 fix.  Before it, a `|` line skipped the typecheck
+    // entirely (`ls | wc` ran and printed bytes).  Pinned without forking:
+    // typecheckChain is the exact predicate runLine applies pre-fork.
+    const gpa = testing.allocator;
+    const ok = struct {
+        fn f(g: Allocator, line: []const u8) !void {
+            defer pipeline.resetArena();
+            var c = try parseLine(g, line);
+            defer freeChain(g, &c);
+            try typecheckChain(g, &c);
+        }
+    }.f;
+    const reject = struct {
+        fn f(g: Allocator, line: []const u8, want: anyerror) !void {
+            defer pipeline.resetArena();
+            var c = try parseLine(g, line);
+            defer freeChain(g, &c);
+            try testing.expectError(want, typecheckChain(g, &c));
+        }
+    }.f;
+
+    // legal chains must still pass
+    try ok(gpa, "find . | grep .");
+    try ok(gpa, "sort -r | head -n 2");
+    try ok(gpa, "echo hi | wc");
+    // the same ill-typed pair rejects in run mode, bare AND wrapped in a group
+    try reject(gpa, "ls . | wc", error.ShapeMismatch);
+    try reject(gpa, "( ls . | wc )", error.ShapeMismatch);
+    // the arity guard (never fired in run mode before U0) now rejects
+    try reject(gpa, "ls . --rows | head", error.RowsReserved);
+    // an unknown stage rejects with the record-path error name
+    try reject(gpa, "fx-echo hi", error.UnknownCommand);
+}
+
+test "glob seam: run-mode argv expands sorted, escapes strip (U3)" {
+    // The seam is exercised WITHOUT forking: parse a line, run the glob pass
+    // against a tmpdir handle, then read the chain's argv back.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var t = testing.tmpDir(.{ .iterate = true });
+    defer t.cleanup();
+    // created OUT of sorted order, so a readdir-order result would differ
+    for ([_][]const u8{ "zz.txt", "aa.txt", "mm.txt", "xab" }) |n|
+        try t.dir.writeFile(io, .{ .sub_path = n, .data = "x" });
+
+    const Case = struct { line: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        // sorted, and one word became four argv tokens
+        .{ .line = "echo *", .want = &.{ "echo", "aa.txt", "mm.txt", "xab", "zz.txt" } },
+        .{ .line = "echo *.txt", .want = &.{ "echo", "aa.txt", "mm.txt", "zz.txt" } },
+        // literal spellings: the escape is STRIPPED for the child, no glob
+        .{ .line = "echo \\*", .want = &.{ "echo", "*" } },
+        .{ .line = "echo '*'", .want = &.{ "echo", "*" } },
+        .{ .line = "echo \"*\"", .want = &.{ "echo", "*" } },
+        .{ .line = "echo \\?", .want = &.{ "echo", "?" } },
+        .{ .line = "echo x\\[ab]y", .want = &.{ "echo", "x[ab]y" } },
+        // no match -> the LITERAL pattern (null-glob off), escapes stripped
+        .{ .line = "echo nomatch*", .want = &.{ "echo", "nomatch*" } },
+        .{ .line = "echo \\*.nope", .want = &.{ "echo", "*.nope" } },
+        // the asymmetry, same bytes on the line, different argv
+        .{ .line = "echo *ab", .want = &.{ "echo", "xab" } },
+        .{ .line = "echo '*ab'", .want = &.{ "echo", "*ab" } },
+        // the pre-existing non-meta backslash behaviour is untouched
+        .{ .line = "echo a\\ b", .want = &.{ "echo", "a b" } },
+        .{ .line = "echo \"a\\nb\"", .want = &.{ "echo", "a\\nb" } },
+        .{ .line = "echo a\\nb", .want = &.{ "echo", "anb" } },
+        // every command of a chain, groups included
+        .{ .line = "( echo *.txt )", .want = &.{ "echo", "aa.txt", "mm.txt", "zz.txt" } },
+        .{ .line = "echo *.txt && echo *ab", .want = &.{ "echo", "aa.txt", "mm.txt", "zz.txt", "echo", "xab" } },
+    };
+    for (cases) |c| {
+        var chain = try parseLine(gpa, c.line);
+        defer freeChain(gpa, &chain);
+        try expandChainGlobs(gpa, io, t.dir, &chain);
+        var got = std.ArrayList([]const u8).empty;
+        defer got.deinit(gpa);
+        try chainWords(gpa, &chain, &got);
+        try testing.expectEqual(c.want.len, got.items.len);
+        for (c.want, got.items) |w, g| try testing.expectEqualStrings(w, g);
+    }
+}
+
+/// Every word of every command of a chain, in execution order (groups
+/// recursed) — the seam tests read the argv back through this.
+fn chainWords(gpa: Allocator, c: *const Chain, out: *std.ArrayList([]const u8)) !void {
+    for (c.pipes) |p| for (p.cmds) |cmd| switch (cmd) {
+        .group => |g| try chainWords(gpa, g, out),
+        .words => |ws| for (ws.words) |w| try out.append(gpa, w),
+    };
+}
+
+test "record mode: a LIVE glob is host state, a quoted one is not (U3)" {
+    // `|>` must be reproducible: a pattern's value depends on the working
+    // directory, so it is rejected LOUDLY with the byte offset of the first
+    // live metacharacter — while a QUOTED/ESCAPED one is ordinary literal
+    // argv and stays legal.
+    const gpa = testing.allocator;
+    const Rej = struct { line: []const u8, off: usize };
+    const rejected = [_]Rej{
+        .{ .line = "echo *.txt |> cat", .off = 5 },
+        .{ .line = "echo a?b |> cat", .off = 6 },
+        .{ .line = "echo x[abc]y |> cat", .off = 6 },
+        .{ .line = "echo a |> cat *.md", .off = 14 },
+    };
+    for (rejected) |r| {
+        var c = try parseLine(gpa, r.line);
+        defer freeChain(gpa, &c);
+        const hit = chainHostStateOffender(&c) orelse return error.TestUnexpectedResult;
+        try testing.expect(hit.kind == .glob);
+        try testing.expectEqual(r.off, hit.off);
+        // the offset really points at a metacharacter in the source line
+        try testing.expect(r.off < r.line.len and (r.line[r.off] == '*' or r.line[r.off] == '?' or r.line[r.off] == '['));
+    }
+
+    const allowed = [_][]const u8{
+        "echo '*' |> cat",
+        "echo \\* |> cat",
+        "echo \"*\" |> cat",
+        "echo '*.md' |> cat",
+        "echo x\\[y] |> cat",
+        "echo 'a?b' |> cat",
+        "echo plain |> cat",
+        // H3: a quote-internal backslash before a contract char is VERBATIM —
+        // never a live glob / live `$`, so never host state.
+        "echo 'a\\*.txt' |> cat",
+        "echo '\\$X' |> cat",
+        "echo \"a\\*b\" |> cat",
+        // M1: an assignment-shaped ARGUMENT is data, not shell state.
+        "echo a=1 |> cat",
+        "echo 'x=y' |> cat",
+    };
+    for (allowed) |line| {
+        var c = try parseLine(gpa, line);
+        defer freeChain(gpa, &c);
+        if (chainHostStateOffender(&c)) |hit| {
+            std.debug.print("record-mode: '{s}' wrongly rejected at byte {d}\n", .{ line, hit.off });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "escapes never leak into argv: record tokens, redirects, assignments (U3)" {
+    const gpa = testing.allocator;
+    // 1. the RECORD path's token view IS the manifest argv: the contract
+    //    escapes must be gone before it is hashed
+    {
+        const stages = try tokenizeStages(gpa, "echo 'a*b' x\\?y |> cat");
+        defer freeStageTokens(gpa, stages);
+        try unescapeStageToks(gpa, stages);
+        try testing.expectEqualStrings("echo", stages[0].toks[0]);
+        try testing.expectEqualStrings("a*b", stages[0].toks[1]);
+        try testing.expectEqualStrings("x?y", stages[0].toks[2]);
+        try testing.expectEqualStrings("cat", stages[1].toks[0]);
+    }
+    // 2. redirect targets leave the chain before the glob seam
+    {
+        var r = [_]Redirs{.{ .stdout = try gpa.dupe(u8, "o\\*ut"), .stdin = try gpa.dupe(u8, "\\[in") }};
+        try unescapeRedirTargets(gpa, &r);
+        defer {
+            if (r[0].stdout) |t| gpa.free(t);
+            if (r[0].stdin) |t| gpa.free(t);
+        }
+        try testing.expectEqualStrings("o*ut", r[0].stdout.?);
+        try testing.expectEqualStrings("[in", r[0].stdin.?);
+    }
+    // 3. assignment / export VALUES are shell state (and go to children)
+    {
+        var table = vars.VarTable.init(gpa);
+        defer table.deinit();
+        try testing.expect(try applyAssignment(gpa, &.{"X=a\\*b"}, &table));
+        try testing.expectEqualStrings("a*b", table.get("X").?);
+        try testing.expect(try applyAssignment(gpa, &.{ "export", "Y=q\\?r", "Z=plain" }, &table));
+        try testing.expectEqualStrings("q?r", table.get("Y").?);
+        try testing.expectEqualStrings("plain", table.get("Z").?);
+        // a literal `$` in a value must not leak its escape (values run no
+        // fx-vars.expand, so the RECORD unescaper strips `\$` here too)
+        try testing.expect(try applyAssignment(gpa, &.{"D=\\$y"}, &table));
+        try testing.expectEqualStrings("$y", table.get("D").?);
+    }
+}
+
+test "C1/H1: a redirect-only line and an assignment redirect are loud, never a crash" {
+    // C1: `> f` left the command with ZERO words after redirect stripping and
+    // the next line indexed ws.words[0] -> panic (exit 134).  Now a LOUD
+    // EmptyCommand.  runLine reaches it before any fork/IO.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    for ([_][]const u8{ "> f", "< f", "2>&1" }) |line| {
+        try testing.expectError(error.EmptyCommand, runLine(gpa, line, "", "", "", io, null));
+    }
+
+    // H1: a whole-line assignment/export statement carrying a redirect is
+    // LOUDLY rejected, never silently dropped (`X=1 > f` must not vanish).
+    var table = vars.VarTable.init(gpa);
+    defer table.deinit();
+    var v = Vars{ .table = table, .last_status = 0, .export_environ = false };
+    try testing.expectError(error.AssignmentRedirect, runLine(gpa, "X=1 > f", "", "", "", io, &v));
+    try testing.expectError(error.AssignmentRedirect, runLine(gpa, "export X=1 2>> e", "", "", "", io, &v));
+    // the rejected lines must not have mutated the table (rejected BEFORE apply)
+    try testing.expect(v.table.get("X") == null);
+    // a redirect on a REAL command is not an assignment and still parses
+    // (this line typechecks/fails elsewhere, but it must not be EmptyCommand)
+    var c = try parseLine(gpa, "cat > f");
+    defer freeChain(gpa, &c);
+    try testing.expect(!emptyCommandIn(&c));
+}
+
+test "H2: redirect targets are variable-expanded, escape-contract intact" {
+    const gpa = testing.allocator;
+    var table = vars.VarTable.init(gpa);
+    defer table.deinit();
+    try table.set("F", "real.txt");
+
+    // a LIVE `$` expands (the H2 bug: it used to be opened as the literal bytes)
+    {
+        var r = [_]Redirs{.{ .stdin = try gpa.dupe(u8, "$F") }};
+        defer {
+            if (r[0].stdin) |t| gpa.free(t);
+        }
+        try expandRedirTargets(gpa, &r, &table, 0);
+        try testing.expectEqualStrings("real.txt", r[0].stdin.?);
+    }
+    // an escaped `\$` is a literal dollar, not an expansion site
+    {
+        var r = [_]Redirs{.{ .stdout = try gpa.dupe(u8, "o\\$F") }};
+        defer {
+            if (r[0].stdout) |t| gpa.free(t);
+        }
+        try expandRedirTargets(gpa, &r, &table, 0);
+        try testing.expectEqualStrings("o$F", r[0].stdout.?);
+    }
+    // a single-quoted verbatim backslash + literal dollar -> `\$F`
+    // (`\\\$F` is the logical word the tokenizer builds for `'\$F'`)
+    {
+        var r = [_]Redirs{.{ .stdin = try gpa.dupe(u8, "\\\\\\$F") }};
+        defer {
+            if (r[0].stdin) |t| gpa.free(t);
+        }
+        try expandRedirTargets(gpa, &r, &table, 0);
+        try testing.expectEqualStrings("\\$F", r[0].stdin.?);
+    }
+    // an unsupported `$` form is loud, not a silent literal
+    {
+        var r = [_]Redirs{.{ .stdin = try gpa.dupe(u8, "$$") }};
+        defer {
+            if (r[0].stdin) |t| gpa.free(t);
+        }
+        try testing.expectError(error.UnsupportedExpansion, expandRedirTargets(gpa, &r, &table, 0));
+    }
+}
+
+test "H3: a quote-internal backslash before a contract char is VERBATIM" {
+    const gpa = testing.allocator;
+    // the single-quote arm must encode a verbatim backslash as `\\`, so `'\*'`
+    // reaches the logical word as `\\\*` — which glob.metaOff reads as NO live
+    // metacharacter (the old `\\*` spelling collided and falsely globbed).
+    try expectStages(gpa, .{ .in = "echo 'a\\*.txt'", .want = &.{&.{ "echo", "a\\\\\\*.txt" }} });
+    try expectStages(gpa, .{ .in = "echo '\\$X'", .want = &.{&.{ "echo", "\\\\\\$X" }} });
+    // double quotes: `\*` is a verbatim backslash + literal star, `\\` a
+    // verbatim backslash.
+    try expectStages(gpa, .{ .in = "echo \"a\\*b\"", .want = &.{&.{ "echo", "a\\\\\\*b" }} });
+    // the escaped-star marker `\*` (unquoted) is UNCHANGED: one backslash.
+    try expectStages(gpa, .{ .in = "echo \\*", .want = &.{&.{ "echo", "\\*" }} });
+
+    // and the bytes unescape back to exactly what POSIX prints
+    {
+        const got = try glob.unescapeRecord(gpa, "a\\\\\\*.txt");
+        defer gpa.free(got);
+        try testing.expectEqualStrings("a\\*.txt", got);
+    }
+    {
+        const got = try glob.unescapeRecord(gpa, "\\\\\\$X");
+        defer gpa.free(got);
+        try testing.expectEqualStrings("\\$X", got);
+    }
+}
+
+test "H4: the record path strips `\\$` so the manifest bytes == RUN bytes" {
+    const gpa = testing.allocator;
+    // `echo \$X |> sort` must record `$X`, the SAME bytes `echo \$X` prints.
+    const stages = try tokenizeStages(gpa, "echo \\$X |> sort");
+    defer freeStageTokens(gpa, stages);
+    try unescapeStageToks(gpa, stages);
+    try testing.expectEqualStrings("$X", stages[0].toks[1]);
+}
+
+test "M1: only COMMAND-position words can be assignments on a record line" {
+    const gpa = testing.allocator;
+    // a whole-line assignment in command position is still host state
+    {
+        var c = try parseLine(gpa, "X=1 |> cat");
+        defer freeChain(gpa, &c);
+        const hit = chainHostStateOffender(&c) orelse return error.TestUnexpectedResult;
+        try testing.expect(hit.kind == .assignment);
+        try testing.expectEqual(@as(usize, 0), hit.off);
+    }
+    // an assignment-shaped ARGUMENT is data, not shell state
+    for ([_][]const u8{ "echo a=1 |> cat", "echo 'x=y' |> cat" }) |line| {
+        var c = try parseLine(gpa, line);
+        defer freeChain(gpa, &c);
+        if (chainHostStateOffender(&c)) |hit| {
+            std.debug.print("M1: '{s}' wrongly rejected at byte {d}\n", .{ line, hit.off });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "flatten: a failing buildRunArgv still frees the slices (the leak fix)" {
+    // buildRunArgv can fail inside the flatten loop AFTER the pipes/cmds slice
+    // is allocated; the errdefer must free the SLICE itself, not just its
+    // contents.  The backing allocator is testing.allocator, so anything
+    // flattenChain leaks (contents OR the slice) is reported at test end and
+    // fails this test.  Before the errdefer gpa.free fix, the pipes/cmds slice
+    // leaked on exactly this path.
+    const gpa = testing.allocator;
+    var c = try parseLine(gpa, "sort -r | head -n 2");
+    defer freeChain(gpa, &c);
+    const redirs = try gpa.alloc(Redirs, c.pipes.len);
+    @memset(redirs, .{});
+    defer gpa.free(redirs);
+
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const fa = failing.allocator();
+        if (flattenChain(fa, &c, "/bin", redirs)) |flat| {
+            freeFlatChain(fa, flat);
+        } else |_| {}
+    }
 }

@@ -20,10 +20,13 @@
 //                         the first non-zero status); exit = that status
 //   fxsh                  interactive REPL (prompt + in-memory history)
 //
-// v1 deliberately has NO variables, NO env interpolation, NO globbing and no
-// redirection (see fx-shell.zig's tokenizer notes; `$` is a loud error so it
-// can never silently pass through).  Line editing is canonical-mode (no raw
-// termios): the typed-pipeline core is the point, not the readline.
+// v1 deliberately has NO globbing and no redirection semantics beyond the raw
+// fd kind (see fx-shell.zig's tokenizer notes).  It DOES have variables and
+// environment expansion (U2): `VAR=value`, `export NAME`, `$VAR` / `${VAR}` /
+// `$?` — RUN mode only; a `|>` (record) line carrying any of them is rejected
+// loudly (a derivation must not silently depend on shell state).  Line editing
+// is canonical-mode (no raw termios): the typed-pipeline core is the point,
+// not the readline.
 
 const std = @import("std");
 const shell = @import("fx-shell.zig");
@@ -36,6 +39,22 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
+
+/// The process's shell variable state (U2): one table per fxsh run, seeded
+/// from the inherited environment (so `$PATH` etc. expand) and threaded
+/// through every line.  `export_environ = true` here — this IS the shell
+/// binary, and exported names must reach the execvp'd children (setenv in
+/// the parent, pre-fork; glibc execvp inherits the setenv-updated environ,
+/// MEASURED).  Tests use a plain table without the env write.
+fn shellVars(gpa: Allocator) !shell.Vars {
+    return .{
+        .table = try vars.VarTable.initFromCEnviron(gpa, std.c.environ),
+        .last_status = 0,
+        .export_environ = true,
+    };
+}
+
+const vars = @import("fx-vars.zig");
 
 const O_RDONLY: c_int = 0;
 
@@ -91,7 +110,9 @@ pub fn main(init: std.process.Init) !u8 {
     // fd 0 for a RUN-mode pipeline's first stage; "" for a record pipeline's
     // initial input (a source-first line needs none).
     if (args.len >= 3 and std.mem.eql(u8, args[1], "-c")) {
-        return runLine(gpa, io, state_dir, bin, args[2]);
+        var vs = shellVars(gpa) catch return 1;
+        defer vs.table.deinit();
+        return runLine(gpa, io, state_dir, bin, args[2], &vs);
     }
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
         return runScript(gpa, io, state_dir, bin, args[1]);
@@ -112,9 +133,10 @@ fn resolveBinDir(gpa: Allocator, io: std.Io) !?[]u8 {
 }
 
 /// Run ONE line.  Returns its status: a RUN line's last-stage exit code, or 0
-/// when a RECORD line's derivation is produced.
-fn runLine(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, line: []const u8) !u8 {
-    var outcome = shell.runLine(gpa, line, "", state_dir, bin, io) catch |e| {
+/// when a RECORD line's derivation is produced (or an assignment/export
+/// statement was applied — those are shell state, not pipelines).
+fn runLine(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, line: []const u8, vs: *shell.Vars) !u8 {
+    var outcome = shell.runLine(gpa, line, "", state_dir, bin, io, vs) catch |e| {
         return reportErr(e);
     };
     defer shell.freeOutcome(gpa, &outcome);
@@ -178,11 +200,16 @@ fn runScript(
 
     var lineno: usize = 0;
     var lines = std.mem.splitScalar(u8, src, '\n');
+    // one variable table for the WHOLE script: an assignment on line 1 is
+    // visible on line 2, exactly like a real shell script
+    var vs = shellVars(gpa) catch return 1;
+    defer vs.table.deinit();
     while (lines.next()) |raw| {
         lineno += 1;
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-        const st = runLine(gpa, io, state_dir, bin, line) catch |e| return reportErr(e);
+        const st = runLine(gpa, io, state_dir, bin, line, &vs) catch |e| return reportErr(e);
+        vs.last_status = st;
         if (st != 0) {
             std.debug.print("fxsh: {s}:{d}: non-zero status {d} (errexit)\n", .{ path, lineno, st });
             return st;
@@ -198,6 +225,10 @@ fn repl(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, a: A
     _ = a;
     const stdout = std.Io.File.stdout();
     var last: u8 = 0;
+    // one variable table for the WHOLE session (`$?`, assignments, export)
+    var vs = shellVars(gpa) catch return 1;
+    defer vs.table.deinit();
+    vs.last_status = 0;
     var buf: [4096]u8 = undefined;
     // pending = the un-consumed tail of the last read (a line may straddle
     // reads, and one read may carry several lines)
@@ -214,7 +245,7 @@ fn repl(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, a: A
             if (n == 0) {
                 // EOF: run any trailing unterminated line, then stop
                 if (pending.items.len > 0) {
-                    last = try execLine(gpa, io, state_dir, bin, pending.items);
+                    last = try execLine(gpa, io, state_dir, bin, pending.items, &vs);
                 }
                 return last;
             }
@@ -234,14 +265,17 @@ fn repl(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, a: A
         // own commands, not pipeline stages (dispatching them would report an
         // unknown stage).
         if (std.mem.eql(u8, line, "exit") or std.mem.eql(u8, line, "quit")) return last;
-        last = runLine(gpa, io, state_dir, bin, line) catch |e| reportErr(e);
+        last = runLine(gpa, io, state_dir, bin, line, &vs) catch |e| reportErr(e);
+        vs.last_status = last;
     }
 }
 
 /// One REPL line: 'exit'/'quit' handled by the caller; anything else is a
 /// pipeline.  Kept separate so the EOF tail path reuses it.
-fn execLine(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, line: []const u8) !u8 {
-    return runLine(gpa, io, state_dir, bin, line) catch |e| reportErr(e);
+fn execLine(gpa: Allocator, io: std.Io, state_dir: []const u8, bin: []const u8, line: []const u8, vs: *shell.Vars) !u8 {
+    const st = runLine(gpa, io, state_dir, bin, line, vs) catch |e| reportErr(e);
+    vs.last_status = st;
+    return st;
 }
 
 // ---------------------------------------------------------------------------
