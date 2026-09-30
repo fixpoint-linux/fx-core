@@ -309,19 +309,25 @@ semantic core is the operator, which IS the declaration of intent:
     a |> b    RECORD  CAS-interns every intermediate — the line becomes a
                       REPLAYABLE DERIVATION (what fx-compose does).
 
-Both modes typecheck identically: the operator changes HOW a line runs, never
-WHAT is accepted (`ls | wc` and `ls |> wc` are both rejected).  Recording is a
-WHOLE-LINE property — you cannot hash an intermediate that never materialised,
-so one `|>` puts the line in record mode.
+Both modes typecheck with the SAME predicate: every pipeline of the chain is
+checked (argv arity guards + adjacent shape compatibility, recursing into
+`( … )` groups) **before anything runs**, so the operator changes HOW a line
+runs, never WHAT is accepted (`ls | wc` and `ls |> wc` are both rejected).  A
+line that runs is therefore also a line that would typecheck.  This is a
+TIGHTENING for run mode: `ls | wc` used to run and now rejects, exactly like
+its `|>` spelling.  Recording is a WHOLE-LINE property — you cannot hash an
+intermediate that never materialised, so one `|>` puts the line in record mode.
 
-**Known provenance hole (deliberate).** Redirects (`<`, `>`, `>>`, `2>`, `2>&1`)
-are RAW: they write files **without** a derivation-log entry, so a file created
-by `fxsh -c 'seq 1 3 > f'` has no `fx-why` record, unlike the same file created
-by `fx-cp`.  This keeps `|` honest — if a `|`-line sometimes mutated the global
-effect log, it would not be "just run" any more.  A redirect on a `|>` line is
-therefore REJECTED loudly rather than guessing what a redirected derivation
-means; the natural future landing spot is "a redirect inside a record line
-becomes part of the derivation" (not implemented).
+**Known provenance hole (deliberate).** Redirects (`<`, `>`, `>>`, `2>`, `2>>`,
+`2>&1`) are RAW: they write files **without** a derivation-log entry, so a file
+created by `fxsh -c 'seq 1 3 > f'` has no `fx-why` record, unlike the same file
+created by `fx-cp`.  Within that, the fd kind is POSIX: `2> FILE` truncates and
+`2>> FILE` appends (the latter was silently truncating before and is now fixed
+at every site).  This keeps `|` honest — if a `|`-line sometimes mutated the
+global effect log, it would not be "just run" any more.  A redirect on a `|>`
+line is therefore REJECTED loudly rather than guessing what a redirected
+derivation means; the natural future landing spot is "a redirect inside a
+record line becomes part of the derivation" (not implemented).
 
 **Control flow** (U10).  Above the pipeline there is a small line grammar:
 
@@ -341,8 +347,49 @@ The tree is FLATTENED before any fork (every child argv is built in the parent),
 so a subshell child only forks/dup2s/waits and never allocates — the same
 async-signal-safety rule the redirect path documents.
 
-v1 deliberately has NO variables, NO env interpolation and NO globbing (a `$` is
-a loud error, never a silent pass-through).
+**Variables and globs** (fxsh U2/U3) are **run-mode** features: `|`-lines have
+them, `|>`-lines reject them — a recorded derivation must not silently absorb
+host state, or its hash would be incomplete.
+
+RUN mode expands `$VAR` / `${VAR}` / `$?` (undefined expands to EMPTY; a
+literal `$` is written `\$`, `'$X'` or `"\$x"`), takes whole-line `VAR=value`
+assignments and `export NAME` (exported names reach child processes), and
+globs `*`, `?` and `[...]` against the working directory (matches SORTED,
+null-glob OFF — no match leaves the word literal — and dotfiles stay hidden
+unless the component starts with `.`).  A redirect target is a shell word
+too: its `$` sites are expanded with the same table (`F=real.txt` then
+`cat < $F` reads real.txt).  Quoted or escaped metacharacters are literal:
+`echo '*'` prints `*`, and a verbatim backslash is PRESERVED — `echo "a\*b"`
+prints `a\*b` (POSIX/bash), and a quoted backslash before a metacharacter
+never reads as a live glob on either operator (`'a\*.txt' |> cat` records
+instead of falsely rejecting).  A literal `$` survives into a `|>` derivation
+byte-identically, so replay equals run.
+
+RECORD mode rejects all three kinds LOUDLY, at the byte offset of the first
+offender: a `$` expansion, an assignment, or a LIVE glob metacharacter on a
+`|>` line is host state (shell variables, or the working directory's
+contents) that the manifest does not carry — so `echo '*' |> cat` is fine
+while `echo * |> cat` rejects.  In v1 neither feature exists between `|` and
+`|>`: RUN mode simply has them and RECORD mode refuses them.
+
+**Limitations** (v1, honest gaps — each one rejects LOUDLY where it is a
+rejection):
+
+- No `;` statement separator: one line is one chain.
+- `VAR=value` and `export NAME` are WHOLE-LINE statements: a prefix
+  `X=1 cmd` or a chain segment `X=1 && cmd` is a loud error, never a
+  silent prefix.  (`export NAME` without a value marks an already-set
+  name exported; `export` alone is just an unknown stage.)
+- No field splitting of expansions: `X='a b'` makes `$X` ONE argument.
+- No parameter operators (`${X:-y}`, `${#X}`, …), no `$$`, no `$1`, no
+  `$( … )` command substitution — every unsupported `$` form is a loud
+  error, never a silent pass-through.
+- An assignment/export statement cannot carry a redirect: `X=1 > f` is a
+  loud error (exit 2) rejected BEFORE the variable table is touched — `f`
+  is not created and the redirect is never silently dropped.
+- A redirect inside a group `( … > f )` is rejected.
+- A redirect on a `|>` line is rejected (unchanged — see the provenance
+  hole above).
 
 ### fx-compose — concrete design (what it actually is)
 
