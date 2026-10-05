@@ -632,7 +632,19 @@ fn buildStageInner(
     }
     const name = tokens[0];
     const spec = specs.lookup(name) orelse {
-        std.debug.print("fx-shell: unknown stage '{s}' (not one of the {d} pipeline stages)\n", .{ name, specs.all.len });
+        // The refusal IS the contract (fx-sh.zig's header): a stage runs only
+        // if its command DECLARES a typed signature, which is what lets the
+        // whole line be typechecked before anything forks.  There is
+        // deliberately NO PATH fallback — raw-execing a binary with no
+        // declared shape would accept lines the typecheck cannot judge, i.e.
+        // silently drop the property "a line that runs is a line that
+        // typechecks".  Say that here, plus the two things a user trips over:
+        // the stage namespace is NOT the binary namespace (the stage is `ls`,
+        // the binary is `fx-ls`), and the count is the registry's.
+        std.debug.print(
+            "fx-shell: unknown stage '{s}' (not one of the {d} pipeline stages): a stage runs only when its command declares a typed signature, so the line can be typechecked before anything runs — fxsh does NOT execute arbitrary PATH binaries. The stage name has no 'fx-' prefix (the binary fx-ls is the stage `ls`).\n",
+            .{ name, specs.all.len },
+        );
         return error.UnknownCommand;
     };
     const argv = tokens[1..];
