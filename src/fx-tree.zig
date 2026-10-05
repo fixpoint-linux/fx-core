@@ -68,6 +68,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const wire = @import("fx-wire");
 const cli_tree = @import("cli-tree");
@@ -85,16 +86,14 @@ const import_mod = dh.import_mod;
 const dl = @cImport({
     @cInclude("dl.h");
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration
-    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
-    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
-    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
-    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
-    // glibc headers already define `struct stat` and asm/stat.h would be a
-    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
-    // (gnu gets them from sys/stat.h itself).
+    // S_IFMT/S_ISDIR/... macros only on musl: the `struct stat` itself now
+    // lives in fx-stat.zig.  (musl's sys/stat.h does not survive translate-c —
+    // struct timespec -> opaque — and on i386 the kernel <asm/stat.h> is a
+    // DIFFERENT struct, the old 16-bit-field one, not the byte-identical
+    // drop-in it is on x86_64.)  Glibc keeps sys/stat.h: it already defines
+    // `struct stat`, and asm/stat.h would be a redefinition.
     if (builtin.target.abi.isMusl()) {
-        @cInclude("asm/stat.h");
-        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros
     } else {
         @cInclude("sys/stat.h");
     }
@@ -114,19 +113,10 @@ const O_TRUNC: c_int = 0o1000;
 extern fn close(fd: c_int) c_int;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 
-/// The mtime (i64 seconds) from either struct-stat shape: kernel (musl)
-/// `st_mtime` flat scalar vs glibc `st_mtim.tv_sec`.  Same offset (88) —
-/// the comptime guard in fx-caslog pins both; mirrored here because this
-/// file carries its own @cImport (a distinct translate-c type per file).
-fn statMtimeSec(st: *const dl.struct_stat) i64 {
-    if (builtin.target.abi.isMusl()) {
-        return @bitCast(st.st_mtime);
-    } else {
-        return st.st_mtim.tv_sec;
-    }
-}
+/// The mtime seconds — fx-stat.zig owns the three struct-stat shapes.
+const statMtimeSec = fxstat.mtimeSec;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
@@ -488,7 +478,7 @@ test "jsonParseOpts full record" {
     try std.testing.expectEqualStrings("/tmp", o.root.?);
     try std.testing.expect(o.all);
     try std.testing.expect(o.dirs_only);
-    try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
 }
 
 test "jsonParseOpts None maxdepth and defaults" {
@@ -525,7 +515,7 @@ test "evalDhallArgs record with Some 2" {
     try std.testing.expectEqualStrings("/tmp", o.root);
     try std.testing.expect(o.all);
     try std.testing.expect(o.dirs_only);
-    try std.testing.expectEqual(@as(?usize, 2), o.maxdepth);
+    try std.testing.expectEqual(@as(?u64, 2), o.maxdepth);
 }
 
 test "evalDhallArgs None maxdepth keeps defaults" {
@@ -720,7 +710,7 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
         // Classify WITHOUT following symlinks: a symlink to a directory is
         // a file leaf here (listed, counted as a file, not descended), which
         // also makes symlink cycles unreachable (du precedent).
-        var st: dl.struct_stat = undefined;
+        var st: fxstat.Stat = undefined;
         if (fstatat(dir_fd, @as([*:0]const u8, @ptrCast(&entry.*.d_name)), &st, AT_SYMLINK_NOFOLLOW) != 0) {
             continue;
         }

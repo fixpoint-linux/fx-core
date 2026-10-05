@@ -24,6 +24,7 @@
 // Honest cuts: no flags (GNU link has none beyond --help/--version).
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_link = @import("cli-link");
@@ -51,7 +52,7 @@ const O_RDONLY: c_int = 0;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
@@ -240,9 +241,9 @@ fn doLink(gpa: Allocator, old: []const u8, new: []const u8, effects: *std.ArrayL
     const zold = std.posix.toPosixPath(old) catch return error.BadPath;
     const znew = std.posix.toPosixPath(new) catch return error.BadPath;
 
-    var src_st: dl.struct_stat = undefined;
+    var src_st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &zold, &src_st, AT_SYMLINK_NOFOLLOW) != 0) return error.Missing;
-    var new_st: dl.struct_stat = undefined;
+    var new_st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &znew, &new_st, AT_SYMLINK_NOFOLLOW) == 0) return error.FileExists;
 
     if (link(&zold, &znew) != 0) return error.LinkFailed;
@@ -444,7 +445,7 @@ fn testRmTreeZ(zpath: [:0]const u8) void {
 
 fn exists(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     return fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) == 0;
 }
 
@@ -471,8 +472,8 @@ test "link creates a hard link + same-inode source/dst are one inode" {
     // Same inode (both names reach the same file).
     const zs = std.posix.toPosixPath(src) catch return error.BadPath;
     const zd = std.posix.toPosixPath(dst) catch return error.BadPath;
-    var ss: dl.struct_stat = undefined;
-    var ds: dl.struct_stat = undefined;
+    var ss: fxstat.Stat = undefined;
+    var ds: fxstat.Stat = undefined;
     _ = fstatat(AT_FDCWD, &zs, &ss, 0);
     _ = fstatat(AT_FDCWD, &zd, &ds, 0);
     try std.testing.expectEqual(ss.st_ino, ds.st_ino);

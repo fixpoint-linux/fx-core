@@ -53,6 +53,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const wire = @import("fx-wire");
 const cli_df = @import("cli-df");
@@ -68,16 +69,14 @@ const serialize = dh.serialize;
 const import_mod = dh.import_mod;
 
 const c = @cImport({
-    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
-    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
-    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
-    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
-    // glibc headers already define `struct stat` and asm/stat.h would be a
-    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
-    // (gnu gets them from sys/stat.h itself).
+    // S_IFMT/S_ISDIR/... macros only on musl: the `struct stat` itself now
+    // lives in fx-stat.zig.  (musl's sys/stat.h does not survive translate-c —
+    // struct timespec -> opaque — and on i386 the kernel <asm/stat.h> is a
+    // DIFFERENT struct, the old 16-bit-field one, not the byte-identical
+    // drop-in it is on x86_64.)  Glibc keeps sys/stat.h: it already defines
+    // `struct stat`, and asm/stat.h would be a redefinition.
     if (builtin.target.abi.isMusl()) {
-        @cInclude("asm/stat.h");
-        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros
     } else {
         @cInclude("sys/stat.h");
     }
@@ -86,12 +85,27 @@ const c = @cImport({
 // ---------------------------------------------------------------------------
 // LOCAL struct statvfs (musl demotes the header's struct to opaque under
 // translate-c: its anonymous-bitfield padding member `unsigned :8*(...)`
-// cannot be expressed in Zig; see the comptime guard below).  The layout is
-// musl/glibc-identical on x86_64 (MEASURED on the host: sizeof=112,
-// fsblkcnt_t/fsfilcnt_t = unsigned long; the differential df run in the
-// acceptance test is the runtime oracle).  Hand externs for the libc calls.
+// cannot be expressed in Zig; see the comptime guard below).  Hand externs for
+// the libc calls.
+//
+// TWO shapes, both MEASURED on this host from the target's own
+// <sys/statvfs.h> with `zig cc`, not guessed:
+//
+//   long == 8 (x86_64 musl AND glibc): sizeof 112 — bsize 0 frsize 8 blocks 16
+//     bfree 24 bavail 32 files 40 ffree 48 favail 56 fsid 64 flag 72 namemax 80
+//     f_type 88; fsblkcnt_t/fsfilcnt_t = unsigned long.
+//   long == 4 (i386 musl): sizeof 96 — bsize 0 frsize 4 blocks 8 bfree 16
+//     bavail 24 files 32 ffree 40 favail 48 fsid 56 pad 60 flag 64 namemax 68
+//     f_type 72; fsblkcnt_t/fsfilcnt_t are 64-bit here while fsid/flag/namemax
+//     stay `unsigned long` (4), and musl's `unsigned :8*(2*sizeof(int)-
+//     sizeof(long))` member becomes a real 4-byte hole at 60.  Reading these
+//     with the 64-bit shape would silently report 4x/garbage block counts.
+//
+// The differential df run in the acceptance test is the runtime oracle.
 // ---------------------------------------------------------------------------
-pub const Statvfs = extern struct {
+const statvfs_long_is_64 = @sizeOf(c_ulong) == 8;
+
+pub const Statvfs = if (statvfs_long_is_64) extern struct {
     f_bsize: c_ulong,
     f_frsize: c_ulong,
     f_blocks: c_ulong,
@@ -105,31 +119,44 @@ pub const Statvfs = extern struct {
     f_namemax: c_ulong,
     f_type: c_uint,
     __reserved: [5]c_int,
+} else extern struct {
+    f_bsize: c_ulong,
+    f_frsize: c_ulong,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: c_ulong,
+    __pad0: c_ulong, // musl's zero-width-or-4-byte padding member lands here
+    f_flag: c_ulong,
+    f_namemax: c_ulong,
+    f_type: c_uint,
+    __reserved: [5]c_int,
 };
 extern fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
-extern fn stat(path: [*:0]const u8, buf: *c.struct_stat) c_int;
+const stat = fxstat.stat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn fstatvfs(fd: c_int, buf: *Statvfs) c_int;
 
-// STAT LAYOUT GUARD (same class as fx-caslog's): a drifted statvfs layout
+// STATVFS LAYOUT GUARD (same class as fx-stat.zig's): a drifted statvfs layout
 // would silently produce wrong df numbers, not a compile error.
 comptime {
-    if (@sizeOf(Statvfs) != 112)
-        @compileError("struct statvfs layout drift: expected x86_64 sizeof 112");
-    const expect = .{
-        .{ "f_bsize", 0 },
-        .{ "f_frsize", 8 },
-        .{ "f_blocks", 16 },
-        .{ "f_bfree", 24 },
-        .{ "f_bavail", 32 },
-        .{ "f_files", 40 },
-        .{ "f_ffree", 48 },
-        .{ "f_favail", 56 },
-        .{ "f_fsid", 64 },
-        .{ "f_flag", 72 },
-        .{ "f_namemax", 80 },
-        .{ "f_type", 88 },
+    const offs = if (statvfs_long_is_64) .{
+        .{ "f_bsize", 0 },  .{ "f_frsize", 8 },  .{ "f_blocks", 16 },
+        .{ "f_bfree", 24 }, .{ "f_bavail", 32 }, .{ "f_files", 40 },
+        .{ "f_ffree", 48 }, .{ "f_favail", 56 }, .{ "f_fsid", 64 },
+        .{ "f_flag", 72 },  .{ "f_namemax", 80 }, .{ "f_type", 88 },
+    } else .{
+        .{ "f_bsize", 0 },  .{ "f_frsize", 4 },  .{ "f_blocks", 8 },
+        .{ "f_bfree", 16 }, .{ "f_bavail", 24 }, .{ "f_files", 32 },
+        .{ "f_ffree", 40 }, .{ "f_favail", 48 }, .{ "f_fsid", 56 },
+        .{ "f_flag", 64 },  .{ "f_namemax", 68 }, .{ "f_type", 72 },
     };
-    for (expect) |e| {
+    const want: usize = if (statvfs_long_is_64) 112 else 96;
+    if (@sizeOf(Statvfs) != want)
+        @compileError("struct statvfs layout drift: sizeof mismatch");
+    for (offs) |e| {
         if (@offsetOf(Statvfs, e[0]) != e[1])
             @compileError("struct statvfs layout drift: " ++ e[0] ++ " offset mismatch");
     }
@@ -534,7 +561,7 @@ fn collectPathRow(gpa: Allocator, path: []const u8, mounts_buf: []u8, out: *std.
     // itself when /proc is unreadable or nothing matches.
     var fs: []const u8 = path;
     var mount: []const u8 = path;
-    var sb: c.struct_stat = undefined;
+    var sb: fxstat.Stat = undefined;
     if (stat(pz.ptr, &sb) == 0) {
         var raw = std.ArrayList(RawMount).empty;
         defer raw.deinit(gpa);
@@ -542,7 +569,7 @@ fn collectPathRow(gpa: Allocator, path: []const u8, mounts_buf: []u8, out: *std.
         for (raw.items) |m| {
             const mz = try gpa.dupeZ(u8, m.mount);
             defer gpa.free(mz);
-            var ms: c.struct_stat = undefined;
+            var ms: fxstat.Stat = undefined;
             if (stat(mz.ptr, &ms) == 0 and ms.st_dev == sb.st_dev) {
                 fs = m.fs;
                 mount = m.mount;

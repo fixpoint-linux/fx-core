@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const cli_diff = @import("cli-diff");
 const cli = @import("fx-cli");
@@ -32,23 +33,21 @@ const import_mod = dh.import_mod;
 
 const dl = @cImport({
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration
-    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
-    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
-    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
-    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
-    // glibc headers already define `struct stat` and asm/stat.h would be a
-    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
-    // (gnu gets them from sys/stat.h itself).
+    // S_IFMT/S_ISDIR/... macros only on musl: the `struct stat` itself now
+    // lives in fx-stat.zig.  (musl's sys/stat.h does not survive translate-c —
+    // struct timespec -> opaque — and on i386 the kernel <asm/stat.h> is a
+    // DIFFERENT struct, the old 16-bit-field one, not the byte-identical
+    // drop-in it is on x86_64.)  Glibc keeps sys/stat.h: it already defines
+    // `struct stat`, and asm/stat.h would be a redefinition.
     if (builtin.target.abi.isMusl()) {
-        @cInclude("asm/stat.h");
-        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros
     } else {
         @cInclude("sys/stat.h");
     }
     @cInclude("fcntl.h"); // O_RDONLY
 });
 
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 
@@ -630,7 +629,7 @@ fn walkCollect(gpa: Allocator, dir_fd: c_int, prefix: []const u8, list: *std.Arr
         const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
 
-        var st: dl.struct_stat = undefined;
+        var st: fxstat.Stat = undefined;
         const nz = @as([*:0]const u8, @ptrCast(&entry.*.d_name));
         if (fstatat(dir_fd, nz, &st, 0) != 0) continue;
 
@@ -722,7 +721,7 @@ const PathKind = enum { file, dir };
 fn classifyPath(gpa: Allocator, path: []const u8) !PathKind {
     const z = try gpa.dupeZ(u8, path);
     defer gpa.free(z);
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(posix.AT.FDCWD, z.ptr, &st, 0) != 0) {
         return error.Missing;
     }

@@ -28,6 +28,7 @@
 // stat BEFORE the chmod, so the effect always records what the state was.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_chmod = @import("cli-chmod");
@@ -51,7 +52,7 @@ const Effect = caslog.Effect;
 const AT_FDCWD: c_int = -100;
 
 extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
@@ -401,7 +402,7 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
 /// The .chmod effect: records the PRIOR mode (e.mode = pre-mutation mode) and
 /// the target's kind.  Separated from the mutation so the effect construction
 /// is testable independent of the chmod syscall.
-fn buildChmodEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat) Effect {
+fn buildChmodEffect(gpa: Allocator, path: []const u8, st: *const fxstat.Stat) Effect {
     const prior_mode: u32 = @intCast(st.st_mode & 0o7777);
     return Effect{
         .op = .chmod,
@@ -417,7 +418,7 @@ fn buildChmodEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat)
 /// .chmod effect.
 fn walkChmod(gpa: Allocator, path: []const u8, target_mode: u32, effects: *std.ArrayList(Effect)) ChmodErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return error.StatFailed;
     if ((st.st_mode & 0o7777) == target_mode) return; // idempotent no-op
     const eff = buildChmodEffect(gpa, path, &st);
@@ -548,7 +549,7 @@ fn testTmpDir(gpa: Allocator) ![]const u8 {
 
 fn currentMode(path: []const u8) ?u32 {
     const z = std.posix.toPosixPath(path) catch return null;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return null;
     return @intCast(st.st_mode & 0o7777);
 }

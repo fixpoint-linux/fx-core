@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const cli_find = @import("generated/cli_find.zig");
 const cli = @import("fx-cli");
@@ -64,16 +65,14 @@ const import_mod = dh.import_mod;
 const dl = @cImport({
     @cInclude("dl.h");
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration (std.posix dir API removed in 0.16)
-    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
-    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
-    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
-    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
-    // glibc headers already define `struct stat` and asm/stat.h would be a
-    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
-    // (gnu gets them from sys/stat.h itself).
+    // S_IFMT/S_ISDIR/... macros only on musl: the `struct stat` itself now
+    // lives in fx-stat.zig.  (musl's sys/stat.h does not survive translate-c —
+    // struct timespec -> opaque — and on i386 the kernel <asm/stat.h> is a
+    // DIFFERENT struct, the old 16-bit-field one, not the byte-identical
+    // drop-in it is on x86_64.)  Glibc keeps sys/stat.h: it already defines
+    // `struct stat`, and asm/stat.h would be a redefinition.
     if (builtin.target.abi.isMusl()) {
-        @cInclude("asm/stat.h");
-        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros
     } else {
         @cInclude("sys/stat.h");
     }
@@ -84,19 +83,10 @@ extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 
-/// The mtime (i64 seconds) from either struct-stat shape: kernel (musl)
-/// `st_mtime` flat scalar vs glibc `st_mtim.tv_sec`.  Same offset (88) —
-/// the comptime guard in fx-caslog pins both; mirrored here because this
-/// file carries its own @cImport (a distinct translate-c type per file).
-fn statMtimeSec(st: *const dl.struct_stat) i64 {
-    if (builtin.target.abi.isMusl()) {
-        return @bitCast(st.st_mtime);
-    } else {
-        return st.st_mtim.tv_sec;
-    }
-}
+/// The mtime seconds — fx-stat.zig owns the three struct-stat shapes.
+const statMtimeSec = fxstat.mtimeSec;
 
 const Allocator = std.mem.Allocator;
 
@@ -747,15 +737,20 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
         const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
 
-        // Build child full path.
-        const child_path = std.fs.path.join(ctx.gpa, &.{ dir_path, name }) catch {
+        // Build child full path.  joinZ, not join: the path is handed to
+        // dl_intern_str as a C string below — with a plain join the interner
+        // read past the allocation's end (a HEAP OVER-READ) and interned the
+        // path plus whatever heap bytes followed it, so fx-find printed paths
+        // with garbage suffixes (deterministic per allocation pattern, and
+        // present on every target — found by scripts/difftest-stat.sh).
+        const child_path = std.fs.path.joinZ(ctx.gpa, &.{ dir_path, name }) catch {
             ctx.err_out = true;
             return;
         };
         defer ctx.gpa.free(child_path);
 
         // stat to classify.
-        var st: dl.struct_stat = undefined;
+        var st: fxstat.Stat = undefined;
         if (fstatat(dir_fd, @as([*:0]const u8, @ptrCast(&entry.*.d_name)), &st, 0) != 0) {
             continue;
         }
@@ -848,7 +843,7 @@ fn rowsWalkDir(ctx: *RowsWalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, rel_
             std.fs.path.join(ctx.gpa, &.{ rel_path, name }) catch return error.Oom;
         defer ctx.gpa.free(child_rel);
 
-        var st: dl.struct_stat = undefined;
+        var st: fxstat.Stat = undefined;
         // nativeFind semantics: lstat the child (NOFOLLOW) — a symlink
         // classifies as a non-dir (File row), which also rules out cycles.
         if (fstatat(dir_fd, @as([*:0]const u8, @ptrCast(&entry.*.d_name)), &st, std.posix.AT.SYMLINK_NOFOLLOW) != 0) continue;
@@ -928,7 +923,7 @@ fn collectRowsEntries(gpa: Allocator, opts: Options) !std.ArrayList(RowEntry) {
         if (tf != .Dir) root_emit = false;
     }
     if (root_emit) {
-        var rst: dl.struct_stat = undefined;
+        var rst: fxstat.Stat = undefined;
         const root_z = try gpa.dupeZ(u8, opts.root);
         defer gpa.free(root_z);
         if (fstatat(std.posix.AT.FDCWD, root_z.ptr, &rst, 0) == 0) {
@@ -1011,16 +1006,13 @@ fn collectCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_i
 
 // Local timespec shape (C ABI: two isize fields) — do NOT @cInclude time.h
 // (the fx-touch idiom).
-const Timespec = extern struct {
-    sec: isize,
-    nsec: isize,
-};
-extern fn utimensat(dirfd: c_int, pathname: [*:0]const u8, times: ?[*]const Timespec, flags: c_int) c_int;
+const Timespec = fxstat.Timespec;
+const utimensat = fxstat.utimensat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
 fn setMtime(path_z: [:0]const u8, sec: isize) !void {
-    const ts = [_]Timespec{ .{ .sec = sec, .nsec = 0 }, .{ .sec = sec, .nsec = 0 } };
+    const ts = [_]Timespec{ .{ .tv_sec = sec, .tv_nsec = 0 }, .{ .tv_sec = sec, .tv_nsec = 0 } };
     if (utimensat(std.posix.AT.FDCWD, path_z.ptr, &ts, 0) != 0) return error.UtimeFailed;
 }
 

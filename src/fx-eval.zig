@@ -25,6 +25,7 @@
 // state dir (the caslog test idiom) so no binaries spawn and $HOME is untouched.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const pipeline = @import("fx-pipeline.zig");
 const caslog = @import("fx-caslog.zig");
@@ -59,7 +60,7 @@ const Shape = pipeline.Shape;
 extern fn close(fd: c_int) c_int;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, path: [*:0]const u8, buf: *caslog.dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 
 // ---------------------------------------------------------------------------
@@ -262,7 +263,7 @@ pub fn nativeFind(stage: *const Stage, input: []const u8, state_dir: []const u8,
         var sbuf: [std.posix.PATH_MAX]u8 = undefined;
         const sz = std.fmt.bufPrintZ(&sbuf, "{s}", .{state_dir}) catch null;
         if (sz) |z| {
-            var st_state: caslog.dl.struct_stat = undefined;
+            var st_state: fxstat.Stat = undefined;
             if (fstatat(std.posix.AT.FDCWD, z.ptr, &st_state, 0) == 0) {
                 skip_dev = @intCast(st_state.st_dev);
                 skip_ino = @intCast(st_state.st_ino);
@@ -311,7 +312,7 @@ const FindWalkCtx = struct {
 
 fn findWalkDir(ctx: *FindWalkCtx, dir_fd: std.posix.fd_t, rel_path: []const u8) anyerror!void {
     // Emit the directory itself (rel_path="" => the root, as ".").
-    var st: caslog.dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(dir_fd, ".", &st, 0) == 0) {
         const is_dir = (st.st_mode & caslog.dl.S_IFMT) == caslog.dl.S_IFDIR;
         const disp = if (rel_path.len == 0) "." else rel_path;
@@ -331,7 +332,7 @@ fn findWalkDir(ctx: *FindWalkCtx, dir_fd: std.posix.fd_t, rel_path: []const u8) 
     while (caslog.dl.readdir(it)) |entry| {
         const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        var st2: caslog.dl.struct_stat = undefined;
+        var st2: fxstat.Stat = undefined;
         // AT_SYMLINK_NOFOLLOW: never follow a symlink — a cyclic symlink
         // (ln -s . a) would otherwise recurse until stack overflow (B2).
         if (fstatat(dir_fd, @as([*:0]const u8, @ptrCast(&entry.*.d_name)), &st2, std.posix.AT.SYMLINK_NOFOLLOW) != 0) continue;

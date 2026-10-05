@@ -29,6 +29,7 @@
 // the log entry is appended after the mutations.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_rm = @import("cli-rm");
@@ -57,7 +58,7 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn unlink(path: [*:0]const u8) c_int;
 extern fn unlinkat(dirfd: c_int, pathname: [*:0]const u8, flags: c_int) c_int;
 extern fn rmdir(path: [*:0]const u8) c_int;
@@ -341,7 +342,7 @@ fn rmTree(gpa: Allocator, state_dir: []const u8, dir_fd: c_int, dir_path: []cons
         const name = std.mem.sliceTo(entry.*.d_name[0..256], 0);
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
 
-        var st: dl.struct_stat = undefined;
+        var st: fxstat.Stat = undefined;
         const nz = @as([*:0]const u8, @ptrCast(&entry.*.d_name));
         if (fstatat(dir_fd, nz, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             if (failed.* == null) failed.* = error.UnlinkFailed;
@@ -462,7 +463,7 @@ fn rmTree(gpa: Allocator, state_dir: []const u8, dir_fd: c_int, dir_path: []cons
 /// rmdir of the dir itself.
 fn rmOne(gpa: Allocator, state_dir: []const u8, path: []const u8, recursive: bool, effects: *std.ArrayList(Effect)) RmErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         return; // missing -> no-op
     }
@@ -651,7 +652,7 @@ fn makeDirUnder(gpa: Allocator, base: []const u8, name: []const u8) !void {
 
 fn exists(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     return fstatat(AT_FDCWD, &z, &st, 0) == 0;
 }
 

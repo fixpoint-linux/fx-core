@@ -36,6 +36,7 @@
 // Honest cuts: no -Z (SELinux context), no -v.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_mkfifo = @import("cli-mkfifo");
@@ -59,7 +60,7 @@ const Effect = caslog.Effect;
 const AT_FDCWD: c_int = -100;
 const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
 
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn mkfifo(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
@@ -280,7 +281,7 @@ fn parseMode(s: []const u8) ?u32 {
 
 fn pathExists(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     return fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) == 0;
 }
 
@@ -532,7 +533,7 @@ test "mkfifoOne creates a fifo and records a .mkfifo effect (skipped if sandbox 
     try std.testing.expect(effects.items[0].op == .mkfifo);
     try std.testing.expect(effects.items[0].mode == 0o666);
     // Verify it is a fifo via stat (S_IFIFO).
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     _ = fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW);
     try std.testing.expect((st.st_mode & @as(c_uint, dl.S_IFMT)) == @as(c_uint, dl.S_IFIFO));
 }

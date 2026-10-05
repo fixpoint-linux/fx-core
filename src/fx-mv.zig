@@ -30,6 +30,7 @@
 // - idempotent no-op (src missing / src==dst) => zero effects => NO log entry.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_mv = @import("cli-mv");
@@ -57,7 +58,7 @@ const O_RDONLY: c_int = 0;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn rename(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
@@ -268,7 +269,7 @@ fn doMove(gpa: Allocator, state_dir: []const u8, src: []const u8, dst: []const u
     // for this resolution (GNU uses stat()).
     var dst_is_dir = false;
     {
-        var st: dl.struct_stat = undefined;
+        var st: fxstat.Stat = undefined;
         if (fstatat(AT_FDCWD, &zdst0, &st, 0) == 0 and
             (st.st_mode & @as(c_uint, dl.S_IFMT)) == @as(c_uint, dl.S_IFDIR)) dst_is_dir = true;
     }
@@ -282,7 +283,7 @@ fn doMove(gpa: Allocator, state_dir: []const u8, src: []const u8, dst: []const u
 
     // src must exist (missing -> no-op divergence).
     const zsrc = std.posix.toPosixPath(src) catch return error.BadPath;
-    var src_st: dl.struct_stat = undefined;
+    var src_st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &zsrc, &src_st, AT_SYMLINK_NOFOLLOW) != 0) return;
     const src_kind = caslog.kindFromMode(src_st.st_mode);
 
@@ -290,7 +291,7 @@ fn doMove(gpa: Allocator, state_dir: []const u8, src: []const u8, dst: []const u
     // them).  A non-empty dst dir + src dir errors 'not empty'.
     var prior_hash: ?[65]u8 = null;
     const zfinal = std.posix.toPosixPath(final_dst) catch return error.BadPath;
-    var dst_st: dl.struct_stat = undefined;
+    var dst_st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &zfinal, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
         const dt = dst_st.st_mode & @as(c_uint, dl.S_IFMT);
         if (dt == @as(c_uint, dl.S_IFREG)) {
@@ -433,7 +434,7 @@ fn writeFileUnder(gpa: Allocator, base: []const u8, name: []const u8, contents: 
 
 fn exists(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     return fstatat(AT_FDCWD, &z, &st, 0) == 0;
 }
 

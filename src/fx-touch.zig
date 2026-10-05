@@ -23,6 +23,7 @@
 // the hand parser could only blanket-reject every -token.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_touch = @import("cli-touch");
@@ -47,15 +48,12 @@ const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 
 // Local timespec shape (C ABI: two isize fields) — do NOT @cInclude time.h.
-const Timespec = extern struct {
-    sec: isize,
-    nsec: isize,
-};
+const Timespec = fxstat.Timespec;
 
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
-extern fn utimensat(dirfd: c_int, pathname: [*:0]const u8, times: ?[*]const Timespec, flags: c_int) c_int;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const utimensat = fxstat.utimensat; // time64-resolved on i386 (see fx-stat.zig)
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
@@ -266,7 +264,7 @@ fn buildCreatedEffect(gpa: Allocator, path: []const u8) Effect {
 /// The touch effect for an existing file: records the PRIOR mtime (before the
 /// bump) and created=false.  Kept separate from the mutation so the effect
 /// construction is testable independent of the utimensat syscall.
-fn buildExistingEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat) Effect {
+fn buildExistingEffect(gpa: Allocator, path: []const u8, st: *const fxstat.Stat) Effect {
     const prior_s: i64 = caslog.statMtimeSec(st);
     const prior_ns: i32 = caslog.statMtimeNsec(st);
     return Effect{
@@ -284,7 +282,7 @@ fn buildExistingEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_st
 /// Always produces an effect (touch intentionally moves mtime).
 fn walkTouch(gpa: Allocator, path: []const u8, effects: *std.ArrayList(Effect)) TouchErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) {
         // missing -> create empty file
         const fd = open(&z, O_WRONLY | O_CREAT, 0o666);
@@ -435,13 +433,13 @@ fn testTmpDir(gpa: Allocator) ![]const u8 {
 
 fn isFile(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return false;
     return (st.st_mode & @as(c_uint, dl.S_IFMT)) == @as(c_uint, dl.S_IFREG);
 }
 fn fileMtime(path: []const u8) i64 {
     const z = std.posix.toPosixPath(path) catch return -1;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return -1;
     return caslog.statMtimeSec(&st);
 }
@@ -511,7 +509,7 @@ test "touch existing file -> prior-mtime effect (created=false), without syscall
     // mtime changes with EPERM even for the system `touch`, so the mutation is
     // exercised separately in walkTouch; the effect construction is pure).
     const z = std.posix.toPosixPath(f) catch unreachable;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     try std.testing.expect(fstatat(AT_FDCWD, &z, &st, 0) == 0);
     const prior = fileMtime(f);
     const eff = buildExistingEffect(aa, f, &st);

@@ -23,6 +23,7 @@
 // - idempotent no-op (same relation) => zero effects => NO log entry.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_ln = @import("cli-ln");
@@ -54,7 +55,7 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
 extern fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 extern fn readlink(pathname: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
@@ -267,7 +268,7 @@ fn doLink(gpa: Allocator, src: []const u8, dst: []const u8, symbolic: bool, effe
 
     if (symbolic) {
         // same-relation: readlink(dst) == target (the `src` string).
-        var dst_st: dl.struct_stat = undefined;
+        var dst_st: fxstat.Stat = undefined;
         if (fstatat(AT_FDCWD, &zdst, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
             var lbuf: [std.posix.PATH_MAX]u8 = undefined;
             const n = readlink(&zdst, &lbuf, lbuf.len);
@@ -285,9 +286,9 @@ fn doLink(gpa: Allocator, src: []const u8, dst: []const u8, symbolic: bool, effe
     }
 
     // hard link
-    var src_st: dl.struct_stat = undefined;
+    var src_st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &zsrc, &src_st, AT_SYMLINK_NOFOLLOW) != 0) return error.Missing;
-    var dst_st: dl.struct_stat = undefined;
+    var dst_st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &zdst, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
         // same-relation: identical inode.
         if (src_st.st_dev == dst_st.st_dev and src_st.st_ino == dst_st.st_ino) return;
@@ -477,7 +478,7 @@ fn testRmTreeZ(zpath: [:0]const u8) void {
 
 fn fileExists(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     return fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) == 0;
 }
 

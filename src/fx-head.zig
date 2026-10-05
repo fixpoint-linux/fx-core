@@ -637,12 +637,18 @@ pub fn main(init: std.process.Init) !void {
         opts = try parsePosixArgs(args, opt_alloc);
     }
 
+    // The line count is a Natural in the schema, widened to usize by the
+    // generated parser; a JSON record can hand us a u64 that does not fit a
+    // 32-bit usize, so clamp rather than narrow (@intCast would be UB in
+    // ReleaseFast on i386).  "read every line" is the only usable reading of
+    // a count larger than addressable memory anyway.
+    const n: usize = std.math.cast(usize, opts.n) orelse std.math.maxInt(usize);
     const stdout_file = std.Io.File.stdout();
     // stdin is the schema's "" placeholder (no FILE operand / omitted field).
     if (opts.input.len > 0) {
-        try headPath(opt_alloc, opts.input, opts.n, stdout_file, init.io);
+        try headPath(opt_alloc, opts.input, n, stdout_file, init.io);
     } else {
         // stdin path: stream fd 0, early-exit at n lines.
-        try emitHeadFd(opt_alloc, 0, opts.n, stdout_file, init.io);
+        try emitHeadFd(opt_alloc, 0, n, stdout_file, init.io);
     }
 }

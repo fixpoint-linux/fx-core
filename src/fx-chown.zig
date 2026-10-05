@@ -36,6 +36,7 @@
 // only on the host.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_chown = @import("cli-chown");
@@ -60,7 +61,7 @@ const AT_FDCWD: c_int = -100;
 const AT_SYMLINK_FOLLOW: c_int = 0x400;
 
 extern fn fchownat(dirfd: c_int, pathname: [*:0]const u8, owner: c_uint, group: c_uint, flags: c_int) c_int;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
@@ -439,7 +440,7 @@ fn isNoOp(target_uid: ?u32, target_gid: ?u32, prior_uid: u32, prior_gid: u32) bo
 /// The .chown effect: records the PRIOR uid/gid (e.uid/e.gid = pre-mutation
 /// ownership) and the target's kind.  Separated from the mutation so the effect
 /// construction is testable independent of the fchownat syscall.
-fn buildChownEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat) Effect {
+fn buildChownEffect(gpa: Allocator, path: []const u8, st: *const fxstat.Stat) Effect {
     return Effect{
         .op = .chown,
         .path = gpa.dupe(u8, path) catch "",
@@ -459,7 +460,7 @@ fn buildChownEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat)
 /// mutation is HOST-ONLY; tests exercise the pure helpers above instead.
 fn walkChown(gpa: Allocator, path: []const u8, target_uid: ?u32, target_gid: ?u32, effects: *std.ArrayList(Effect)) ChownErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return error.StatFailed;
     const prior_uid: u32 = @intCast(st.st_uid);
     const prior_gid: u32 = @intCast(st.st_gid);
@@ -655,7 +656,7 @@ test "buildChownEffect records prior uid/gid (pure, no fchownat)" {
     // a no-op, so the effect construction is exercised in isolation (mirroring
     // fx-touch's buildExistingEffect test).
     const z = std.posix.toPosixPath(f) catch unreachable;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     try std.testing.expect(fstatat(AT_FDCWD, &z, &st, 0) == 0);
     const eff = buildChownEffect(aa, f, &st);
     try std.testing.expect(eff.op == .chown);

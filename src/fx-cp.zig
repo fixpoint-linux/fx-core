@@ -32,6 +32,7 @@
 // O_TRUNC copy; the log entry is appended after the copy.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_cp = @import("cli-cp");
@@ -64,7 +65,7 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
@@ -251,9 +252,9 @@ fn readFileFull(gpa: Allocator, path: []const u8) CopyErr![]u8 {
     return data.toOwnedSlice(gpa) catch return error.NoMem;
 }
 
-fn statPath(path: []const u8, flags: c_int) ?dl.struct_stat {
+fn statPath(path: []const u8, flags: c_int) ?fxstat.Stat {
     const z = std.posix.toPosixPath(path) catch return null;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, flags) != 0) return null;
     return st;
 }

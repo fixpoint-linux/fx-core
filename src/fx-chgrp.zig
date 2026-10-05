@@ -30,6 +30,7 @@
 // only on the host.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_chgrp = @import("cli-chgrp");
@@ -54,7 +55,7 @@ const AT_FDCWD: c_int = -100;
 const AT_SYMLINK_FOLLOW: c_int = 0x400;
 
 extern fn fchownat(dirfd: c_int, pathname: [*:0]const u8, owner: c_uint, group: c_uint, flags: c_int) c_int;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
@@ -317,7 +318,7 @@ fn evalDhallRecord(src: [:0]const u8, gpa: Allocator) !DhallArgs {
 /// The .chgrp effect: records the PRIOR gid (e.gid = pre-mutation gid) and the
 /// target's kind; e.uid stays null (uid not changed).  Separated from the
 /// mutation so the effect construction is testable independent of the fchownat.
-fn buildChgrpEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat) Effect {
+fn buildChgrpEffect(gpa: Allocator, path: []const u8, st: *const fxstat.Stat) Effect {
     return Effect{
         .op = .chown,
         .path = gpa.dupe(u8, path) catch "",
@@ -336,7 +337,7 @@ fn buildChgrpEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat)
 /// mutation is HOST-ONLY; tests exercise the pure helpers above instead.
 fn walkChgrp(gpa: Allocator, path: []const u8, target_gid: u32, effects: *std.ArrayList(Effect)) ChgrpErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return error.StatFailed;
     const prior_gid: u32 = @intCast(st.st_gid);
     if (prior_gid == target_gid) return; // idempotent
@@ -496,7 +497,7 @@ test "buildChgrpEffect records prior gid, uid null (pure, no fchownat)" {
     // the effect construction is exercised in isolation (mirroring fx-touch's
     // buildExistingEffect test).
     const z = std.posix.toPosixPath(f) catch unreachable;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     try std.testing.expect(fstatat(AT_FDCWD, &z, &st, 0) == 0);
     const eff = buildChgrpEffect(aa, f, &st);
     try std.testing.expect(eff.op == .chown);

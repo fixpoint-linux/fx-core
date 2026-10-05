@@ -94,13 +94,26 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // fx-stat: the ONE target-correct `struct stat` / `struct timespec` (its
+    // layout is MEASURED from the target's own headers and pinned by a comptime
+    // guard; on i386 musl the stat family is also bound to the time64 symbols —
+    // see the file).  A named module rather than a relative path import: a file
+    // reachable by path from two modules is a hard Zig error ("file exists in
+    // modules X and Y"), and every command that stats a path needs this one.
+    const fxstat_mod = b.createModule(.{
+        .root_source_file = b.path("src/fx-stat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const exe = b.addExecutable(.{
         .name = "fx-find",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/fx-find.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, "fx-find", &.{}),
+            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, "fx-find", &.{}),
         }),
     });
 
@@ -126,7 +139,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fx-grep.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, "fx-grep", &.{}),
+            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, "fx-grep", &.{}),
         }),
     });
     grep.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
@@ -165,7 +178,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fx-diff.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, "fx-diff", &.{}),
+            .imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, "fx-diff", &.{}),
         }),
     });
     diff.root_module.link_libc = true;
@@ -462,6 +475,7 @@ pub fn build(b: *std.Build) void {
             optimize,
             dhall_mod,
             cli_mod,
+            fxstat_mod,
             c.name,
             if (c.wire) &.{.{ .name = "fx-wire", .module = wire_mod }} else &.{},
         );
@@ -519,6 +533,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "fx-stat", .module = fxstat_mod },
         },
     });
 
@@ -538,6 +553,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "dhall", .module = dhall_mod },
             .{ .name = "caslog", .module = caslog_mod },
+            .{ .name = "fx-stat", .module = fxstat_mod },
             .{ .name = "fx-pipeline", .module = pipeline_mod },
             .{ .name = "fx-wire", .module = wire_mod },
         },
@@ -575,6 +591,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "fx-stat", .module = fxstat_mod },
             .{ .name = "fx-eval", .module = eval_mod },
         },
     });
@@ -596,6 +613,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "fx-stat", .module = fxstat_mod },
             .{ .name = "fx-eval", .module = eval_mod },
             .{ .name = "fx-pipeline", .module = pipeline_mod },
             .{ .name = "fx-caslog", .module = caslog_mod },
@@ -636,6 +654,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "dhall", .module = dhall_mod },
+                .{ .name = "fx-stat", .module = fxstat_mod },
                 .{ .name = "caslog", .module = caslog_mod },
                 .{ .name = "fx-pipeline", .module = pipeline_mod },
                 .{ .name = "fx-wire", .module = wire_mod },
@@ -671,6 +690,7 @@ pub fn build(b: *std.Build) void {
             optimize,
             dhall_mod,
             cli_mod,
+            fxstat_mod,
             name,
             &.{.{ .name = "caslog", .module = caslog_mod }},
         );
@@ -716,7 +736,7 @@ pub fn build(b: *std.Build) void {
     };
     inline for (check_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
-        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -755,7 +775,7 @@ pub fn build(b: *std.Build) void {
     };
     inline for (trivial_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
-        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -797,7 +817,7 @@ pub fn build(b: *std.Build) void {
     };
     inline for (system_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
-        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -833,7 +853,7 @@ pub fn build(b: *std.Build) void {
     };
     inline for (text_cmds) |name| {
         const src_path = std.fmt.comptimePrint("src/{s}.zig", .{name});
-        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, name, &.{});
+        const imports = cliImports(b, target, optimize, dhall_mod, cli_mod, fxstat_mod, name, &.{});
         const cmd_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -888,6 +908,7 @@ pub fn build(b: *std.Build) void {
             optimize,
             dhall_mod,
             cli_mod,
+            fxstat_mod,
             c.name,
             if (c.wire) &.{.{ .name = "fx-wire", .module = wire_mod }} else &.{},
         );
@@ -1039,6 +1060,7 @@ pub fn build(b: *std.Build) void {
             optimize,
             dhall_mod,
             cli_mod,
+            fxstat_mod,
             name,
             &.{
                 .{ .name = "provenance", .module = prov_mod },
@@ -1098,6 +1120,7 @@ fn cliImports(
     optimize: std.builtin.OptimizeMode,
     dhall_mod: *std.Build.Module,
     cli_mod: *std.Build.Module,
+    fxstat_mod: *std.Build.Module,
     name: []const u8,
     extra: []const std.Build.Module.Import,
 ) []const std.Build.Module.Import {
@@ -1118,16 +1141,19 @@ fn cliImports(
     // that way and `fx-cli` (the schema evaluator) is still provided by name.
     const uses_path = std.mem.eql(u8, bare, "find") or std.mem.eql(u8, bare, "grep");
 
-    const total = extra.len + 1 +
+    const total = extra.len + 2 +
         (if (gen_exists) @as(usize, if (uses_path) 1 else 2) else 0);
     const imports = b.allocator.alloc(std.Build.Module.Import, total) catch @panic("OOM");
     @memcpy(imports[0..extra.len], extra);
     imports[extra.len] = .{ .name = "dhall", .module = dhall_mod };
+    imports[extra.len + 1] = .{ .name = "fx-stat", .module = fxstat_mod };
     if (gen_exists) {
         if (uses_path) {
-            imports[extra.len + 1] = .{ .name = "fx-cli", .module = cli_mod };
+            imports[extra.len + 2] = .{ .name = "fx-cli", .module = cli_mod };
         } else {
-            imports[extra.len + 1] = .{
+            // note: TWO slots here (cli-<bare> + fx-cli), i.e. extra.len+2 and
+            // extra.len+3 — the count above reserves both.
+            imports[extra.len + 2] = .{
                 .name = std.fmt.allocPrint(b.allocator, "cli-{s}", .{bare}) catch @panic("OOM"),
                 .module = b.createModule(.{
                     .root_source_file = b.path(gen_path),
@@ -1136,7 +1162,7 @@ fn cliImports(
                     .link_libc = true,
                 }),
             };
-            imports[extra.len + 2] = .{ .name = "fx-cli", .module = cli_mod };
+            imports[extra.len + 3] = .{ .name = "fx-cli", .module = cli_mod };
         }
     }
     return imports;

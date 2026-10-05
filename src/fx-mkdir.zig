@@ -20,6 +20,7 @@
 // - idempotent no-op (nothing new) => zero effects => NO log entry.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_mkdir = @import("cli-mkdir");
@@ -46,7 +47,7 @@ const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn unlink(path: [*:0]const u8) c_int;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
@@ -305,7 +306,7 @@ const ExistKind = enum { dir, other };
 /// Stat `path` without following a final symlink.  Returns null if missing.
 fn pathKind(path: []const u8) ?ExistKind {
     const z = std.posix.toPosixPath(path) catch return null;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) != 0) return null;
     const mt = st.st_mode & @as(c_uint, dl.S_IFMT);
     if (mt == @as(c_uint, dl.S_IFDIR)) return .dir;
@@ -316,7 +317,7 @@ fn pathKind(path: []const u8) ?ExistKind {
 fn rawMkdir(prefix: []const u8) WalkErr!u32 {
     const z = std.posix.toPosixPath(prefix) catch return error.BadPath;
     if (mkdir(&z, 0o777) != 0) return error.MkdirFailed;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return error.StatFailed;
     return @intCast(st.st_mode & 0o7777);
 }

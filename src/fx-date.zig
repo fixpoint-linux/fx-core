@@ -38,6 +38,7 @@
 // with an optional strftime format.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // target-correct struct stat/timespec (see fx-stat.zig)
 const dh = @import("dhall");
 const cli_date = @import("cli-date");
 const cli = @import("fx-cli");
@@ -56,15 +57,20 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
-// Local timespec shape (C ABI: two isize fields) — musl time.h's struct
-// timespec does not survive Zig 0.16 translate-c (same class as the struct
-// stat blocker; see fx-caslog).  fx-touch.zig uses the same local shape.
-const Timespec = extern struct {
-    sec: isize,
-    nsec: isize,
-};
+// The target-correct struct timespec (fx-stat.zig).  Do NOT re-declare it as
+// two isize fields: on i386 that is 8 bytes where the real struct is 16
+// (tv_sec i64 @0, tv_nsec @8) and every value libc wrote would be misread.
+const Timespec = fxstat.Timespec;
 const CLOCK_REALTIME: c_int = 0;
-extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+// time64-resolved on i386 (`clock_gettime` is __REDIR'd to
+// __clock_gettime64 there; see fx-stat.zig).
+const clock_gettime = fxstat.clock_gettime;
+// localtime_r takes a *time_t and is __REDIR'd to __localtime64_r on i386
+// (musl time.h, under _POSIX_C_SOURCE, which is on by default) — declaring it
+// here would bind the OLD 32-bit-time symbol.  Route through the redirect.
+extern fn localtime_r(t: *const i64, tm: *c.struct_tm) ?*c.struct_tm;
+extern fn __localtime64_r(t: *const i64, tm: *c.struct_tm) ?*c.struct_tm;
+const localtime_r64 = if (fxstat.musl_ilp32) &__localtime64_r else &localtime_r;
 
 const Allocator = std.mem.Allocator;
 
@@ -371,10 +377,10 @@ fn formatNow(gpa: Allocator, out: *std.ArrayList(u8), format: []const u8, utc: b
         // get "UTC". With TZ=UTC the broken-down time equals the UTC time.
         _ = c.setenv("TZ", "UTC", 1);
         c.tzset();
-        _ = c.localtime_r(&ts.sec, &tmv);
+        _ = localtime_r64(&ts.tv_sec, &tmv);
     } else {
         // Leave TZ untouched; honor the ambient TZ / /etc/localtime.
-        _ = c.localtime_r(&ts.sec, &tmv);
+        _ = localtime_r64(&ts.tv_sec, &tmv);
     }
     const zfmt = try gpa.dupeZ(u8, format);
     var buf: [2048]u8 = undefined;

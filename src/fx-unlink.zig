@@ -44,6 +44,7 @@
 // from fx-rm) — fx-undo.zig is NOT touched.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_unlink = @import("cli-unlink");
@@ -72,7 +73,7 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn unlink(path: [*:0]const u8) c_int;
 extern fn readlink(path: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
@@ -336,7 +337,7 @@ fn readLinkTarget(gpa: Allocator, path: []const u8) UnlinkErr![]u8 {
 /// (UnsupportedType) so the path is left untouched and never logged.
 fn unlinkOne(gpa: Allocator, state_dir: []const u8, path: []const u8, effects: *std.ArrayList(Effect)) UnlinkErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         return; // missing -> no-op
     }
@@ -487,7 +488,7 @@ fn makeDirUnder(gpa: Allocator, base: []const u8, name: []const u8) !void {
 
 fn exists(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     return fstatat(AT_FDCWD, &z, &st, 0) == 0;
 }
 

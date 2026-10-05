@@ -21,6 +21,7 @@
 // - idempotent no-op (missing) => zero effects => NO log entry.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const dh = @import("dhall");
 const caslog = @import("caslog");
 const cli_rmdir = @import("cli-rmdir");
@@ -48,7 +49,7 @@ extern fn unlink(path: [*:0]const u8) c_int;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
@@ -267,7 +268,7 @@ fn evalDhallRecordFull(src: [:0]const u8, gpa: Allocator) !DhallArgs {
 /// non-directory is an error.
 fn walkRmdir(gpa: Allocator, path: []const u8, effects: *std.ArrayList(Effect)) RmdErr!void {
     const z = std.posix.toPosixPath(path) catch return error.BadPath;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         return; // missing -> no-op
     }
@@ -379,7 +380,7 @@ fn testTmpDir(gpa: Allocator) ![]const u8 {
 
 fn isDir(path: []const u8) bool {
     const z = std.posix.toPosixPath(path) catch return false;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) != 0) return false;
     return (st.st_mode & @as(c_uint, dl.S_IFMT)) == @as(c_uint, dl.S_IFDIR);
 }

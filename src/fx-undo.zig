@@ -63,6 +63,7 @@
 // caslog.  NO datalog linkage.
 
 const std = @import("std");
+const fxstat = @import("fx-stat"); // the target-correct struct stat (see fx-stat.zig)
 const caslog = @import("caslog");
 const dh = @import("dhall");
 const cli_undo = @import("cli-undo");
@@ -102,16 +103,13 @@ const O_TRUNC: c_int = 0o1000;
 const UTIME_OMIT: isize = 1073741822;
 
 // Local timespec shape (C ABI: two isize fields) — do NOT @cInclude time.h.
-const Timespec = extern struct {
-    sec: isize,
-    nsec: isize,
-};
+const Timespec = fxstat.Timespec;
 
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+const fstatat = fxstat.fstatat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn unlink(path: [*:0]const u8) c_int;
@@ -123,7 +121,7 @@ extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
 /// NOT follow symlinks; pass AT_SYMLINK_FOLLOW to operate on the target (GNU
 /// chown default).
 extern fn fchownat(dirfd: c_int, pathname: [*:0]const u8, owner: c_uint, group: c_uint, flags: c_int) c_int;
-extern fn utimensat(dirfd: c_int, pathname: [*:0]const u8, times: ?[*]const Timespec, flags: c_int) c_int;
+const utimensat = fxstat.utimensat; // time64-resolved on i386 (see fx-stat.zig)
 extern fn readlink(pathname: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
 extern fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
@@ -152,9 +150,9 @@ const UndoErr = error{
 // Small libc helpers
 // ---------------------------------------------------------------------------
 
-fn statNoFollow(path: []const u8) ?dl.struct_stat {
+fn statNoFollow(path: []const u8) ?fxstat.Stat {
     const z = std.posix.toPosixPath(path) catch return null;
-    var st: dl.struct_stat = undefined;
+    var st: fxstat.Stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, AT_SYMLINK_NOFOLLOW) != 0) return null;
     return st;
 }
@@ -479,8 +477,8 @@ fn applyInverse(gpa: Allocator, state_dir: []const u8, e: Effect) UndoErr!void {
                 // Restore the prior mtime (leave atime untouched via UTIME_OMIT).
                 const z = std.posix.toPosixPath(e.path) catch return error.BadPath;
                 const t: [2]Timespec = .{
-                    .{ .sec = 0, .nsec = UTIME_OMIT },
-                    .{ .sec = e.mtime_s, .nsec = e.mtime_ns },
+                    .{ .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+                    .{ .tv_sec = e.mtime_s, .tv_nsec = e.mtime_ns },
                 };
                 if (utimensat(AT_FDCWD, &z, &t, 0) != 0) return error.UtimeFailed;
             }
