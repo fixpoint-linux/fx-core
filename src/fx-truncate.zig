@@ -487,8 +487,8 @@ fn truncateOne(gpa: Allocator, state_dir: []const u8, path: []const u8, o: Optio
         .in = if (created) null else in_hash,
         .mode = @intCast(st.st_mode & 0o7777),
         .size = bytes.len,
-        .mtime_s = @intCast(st.st_mtim.tv_sec),
-        .mtime_ns = @intCast(st.st_mtim.tv_nsec),
+        .mtime_s = caslog.statMtimeSec(&st),
+        .mtime_ns = caslog.statMtimeNsec(&st),
         .created = created,
     }) catch return error.NoMem;
 }

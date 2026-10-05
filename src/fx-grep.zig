@@ -56,6 +56,7 @@
 // substring (the pattern is wrapped in `.*` — the DFA itself is anchored).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dh = @import("dhall");
 const cli_grep = @import("generated/cli_grep.zig");
 const cli = @import("fx-cli");
@@ -78,7 +79,19 @@ const dl = @cImport({
     @cInclude("dl.h");
     @cInclude("regexwalk.h"); // regex_compile / regex_dfa_free
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration
-    @cInclude("sys/stat.h"); // struct stat for fstatat
+    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
+    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
+    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
+    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
+    // glibc headers already define `struct stat` and asm/stat.h would be a
+    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
+    // (gnu gets them from sys/stat.h itself).
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+    } else {
+        @cInclude("sys/stat.h");
+    }
 });
 
 // libc mkdir/rmdir/close/mkdtemp (std.posix slimmed these out in 0.16).

@@ -43,6 +43,7 @@
 // single Zig module — no FFI).  Only datalog-dafsa remains C-FFI (libdatalog.so).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dh = @import("dhall");
 const cli_find = @import("generated/cli_find.zig");
 const cli = @import("fx-cli");
@@ -63,7 +64,19 @@ const import_mod = dh.import_mod;
 const dl = @cImport({
     @cInclude("dl.h");
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration (std.posix dir API removed in 0.16)
-    @cInclude("sys/stat.h"); // struct stat for fstatat (std.posix.Stat is void on linux in 0.16)
+    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
+    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
+    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
+    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
+    // glibc headers already define `struct stat` and asm/stat.h would be a
+    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
+    // (gnu gets them from sys/stat.h itself).
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+    } else {
+        @cInclude("sys/stat.h");
+    }
 });
 
 // libc mkdir/rmdir/close/mkdtemp (std.posix slimmed these out in 0.16; we link libc).
@@ -72,6 +85,18 @@ extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn close(fd: c_int) c_int;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+
+/// The mtime (i64 seconds) from either struct-stat shape: kernel (musl)
+/// `st_mtime` flat scalar vs glibc `st_mtim.tv_sec`.  Same offset (88) —
+/// the comptime guard in fx-caslog pins both; mirrored here because this
+/// file carries its own @cImport (a distinct translate-c type per file).
+fn statMtimeSec(st: *const dl.struct_stat) i64 {
+    if (builtin.target.abi.isMusl()) {
+        return @bitCast(st.st_mtime);
+    } else {
+        return st.st_mtim.tv_sec;
+    }
+}
 
 const Allocator = std.mem.Allocator;
 
@@ -856,7 +881,7 @@ fn rowsWalkDir(ctx: *RowsWalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, rel_
                 .path = dup,
                 .kind = if (is_dir) "Dir" else "File",
                 .size = clampSize(st.st_size),
-                .mtime = clampMtime(st.st_mtim.tv_sec),
+                .mtime = clampMtime(statMtimeSec(&st)),
             }) catch {
                 ctx.gpa.free(dup);
                 return error.Oom;
@@ -912,7 +937,7 @@ fn collectRowsEntries(gpa: Allocator, opts: Options) !std.ArrayList(RowEntry) {
                 .path = dup,
                 .kind = "Dir",
                 .size = clampSize(rst.st_size),
-                .mtime = clampMtime(rst.st_mtim.tv_sec),
+                .mtime = clampMtime(statMtimeSec(&rst)),
             });
         }
     }

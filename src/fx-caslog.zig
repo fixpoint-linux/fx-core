@@ -45,6 +45,7 @@
 // _FORTIFY_SOURCE (see fx-cat.zig:36-38).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dh = @import("dhall");
 
 // dirent.h (DIR/readdir — shared with mutators) + sys/stat.h (struct stat /
@@ -52,8 +53,86 @@ const dh = @import("dhall");
 // reuses the SAME struct_stat layout rather than carrying its own @cImport.
 pub const dl = @cImport({
     @cInclude("dirent.h");
-    @cInclude("sys/stat.h");
+    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
+    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
+    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
+    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
+    // glibc headers already define `struct stat` and asm/stat.h would be a
+    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
+    // (gnu gets them from sys/stat.h itself).
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+    } else {
+        @cInclude("sys/stat.h");
+    }
 });
+
+// ---------------------------------------------------------------------------
+/// The mtime as i64 seconds from either struct-stat shape: the kernel
+/// struct (musl path) names it `st_mtime` (flat scalar); glibc's names
+/// the embedded timespec `st_mtim` (`.tv_sec`).  Same offset (88), same
+/// bits — the guard above pins both.  A negative pre-1970 mtime survives
+/// via the same-bits bitCast both ways.
+pub fn statMtimeSec(st: *const dl.struct_stat) i64 {
+    if (builtin.target.abi.isMusl()) {
+        return @bitCast(st.st_mtime);
+    } else {
+        return st.st_mtim.tv_sec;
+    }
+}
+
+/// The mtime nanoseconds (clamped to i32 range; the effect record stores
+/// i32).  Same shape divergence as statMtimeSec.
+pub fn statMtimeNsec(st: *const dl.struct_stat) i32 {
+    if (builtin.target.abi.isMusl()) {
+        return @intCast(st.st_mtime_nsec & 0x7FFFFFFF);
+    } else {
+        return @intCast(st.st_mtim.tv_nsec & 0x7FFFFFFF);
+    }
+}
+
+// STAT LAYOUT GUARD (the silent-wrong-result seat).  The kernel <asm/stat.h>
+// struct stat is used as a DROP-IN for the libc struct stat when calling
+// fstatat/stat/lstat: on x86_64 the two layouts are byte-for-byte identical,
+// but a mismatch would NOT fail to compile — it would silently produce wrong
+// sizes/modes/dates.  This comptime block pins sizeof AND every field offset
+// against the x86_64 ABI (verified against glibc's struct stat and musl's
+// kernel header on this host; the differential musl-vs-glibc stdout test in
+// the repo's acceptance run is the runtime oracle).  Any drift — a target
+// whose kernel struct differs, a stdlib translate-c change — is a COMPILE
+// error, not a wrong number.
+// ---------------------------------------------------------------------------
+comptime {
+    const S = dl.struct_stat;
+    if (@sizeOf(S) != 144)
+        @compileError("struct stat layout drift: expected x86_64 sizeof 144");
+    // The kernel struct (musl path) names the timestamps st_atime/st_mtime/
+    // st_ctime as FLAT scalars; glibc's struct names the embedded timespecs
+    // st_atim/st_mtim/st_ctim (each .tv_sec at the same offset).  Pin the
+    // offsets under the target's own names.
+    const atime_off = if (builtin.target.abi.isMusl()) @offsetOf(S, "st_atime") else @offsetOf(S, "st_atim");
+    const mtime_off = if (builtin.target.abi.isMusl()) @offsetOf(S, "st_mtime") else @offsetOf(S, "st_mtim");
+    const ctime_off = if (builtin.target.abi.isMusl()) @offsetOf(S, "st_ctime") else @offsetOf(S, "st_ctim");
+    const expect = .{
+        .{ "st_dev", 0 },
+        .{ "st_ino", 8 },
+        .{ "st_nlink", 16 },
+        .{ "st_mode", 24 },
+        .{ "st_uid", 28 },
+        .{ "st_gid", 32 },
+        .{ "st_rdev", 40 },
+        .{ "st_size", 48 },
+        .{ "st_blksize", 56 },
+        .{ "st_blocks", 64 },
+    };
+    if (atime_off != 72 or mtime_off != 88 or ctime_off != 104)
+        @compileError("struct stat layout drift: timestamp offset mismatch");
+    for (expect) |e| {
+        if (@offsetOf(S, e[0]) != e[1])
+            @compileError("struct stat layout drift: " ++ e[0] ++ " offset mismatch");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Locally-defined constants (no @cInclude of fcntl.h / time.h).

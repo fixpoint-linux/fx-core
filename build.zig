@@ -9,6 +9,43 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // -----------------------------------------------------------------------
+    // libdatalog linkage (the still-Zig datalog core, C-FFI).
+    //
+    // NATIVE/gnu builds: EXACTLY as before — linkSystemLibrary("datalog")
+    // against the sibling datalog-dafsa/libdatalog.so (the prebuilt glibc
+    // shared object) + the src/ include path.
+    //
+    // MUSL builds: a glibc-built .so cannot serve a musl-static link (and a
+    // dynamic link would defeat the static goal entirely), so we instead link
+    // a STATIC libdatalog.a BUILT IN THIS BUILD GRAPH from the sibling's Zig
+    // sources (datalog-dafsa/zig/src/hybrid.zig + the vendored dafsa engine)
+    // for the same target.  In-graph (not a prebuilt path) because the
+    // artifact must be target-coupled to whatever -Dtarget the user passes.
+    // -----------------------------------------------------------------------
+    const datalog_mod = b.createModule(.{
+        .root_source_file = b.path("../datalog-dafsa/zig/src/hybrid.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dafsa_abi", .module = b.createModule(.{
+                .root_source_file = b.path("../datalog-dafsa/vendor/dafsa/zig/src/abi.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }) },
+        },
+    });
+    const is_musl = target.result.abi.isMusl();
+    const datalog_lib = b.addLibrary(.{
+        .name = "datalog",
+        .linkage = .static,
+        .root_module = datalog_mod,
+    });
+    datalog_lib.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
+    datalog_lib.root_module.addIncludePath(b.path("../datalog-dafsa/vendor/dafsa"));
+
     // dhall-c Zig core, imported as a single module via the facade file
     // (dhall_mod.zig lives in the dhall-c zig/src dir so the sibling modules'
     // bare-filename imports resolve with shared types).
@@ -70,8 +107,16 @@ pub fn build(b: *std.Build) void {
     // Link libdatalog.so (the still-C datalog core) via C-FFI.
     // Search path: /workspace/datalog-dafsa has libdatalog.so and src/dl.h.
     exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
-    exe.root_module.linkSystemLibrary("datalog", .{});
-    exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    if (is_musl) {
+
+        exe.root_module.linkLibrary(datalog_lib);
+    } else {
+        exe.root_module.linkSystemLibrary("datalog", .{});
+
+        exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    }
     exe.root_module.link_libc = true;
 
     // fx-grep: same dhall + libdatalog linkage, separate binary.
@@ -85,8 +130,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     grep.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
-    grep.root_module.linkSystemLibrary("datalog", .{});
-    grep.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    if (is_musl) {
+
+        grep.root_module.linkLibrary(datalog_lib);
+    } else {
+        grep.root_module.linkSystemLibrary("datalog", .{});
+
+        grep.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    }
     grep.root_module.link_libc = true;
     b.installArtifact(grep);
 
@@ -424,8 +477,16 @@ pub fn build(b: *std.Build) void {
         if (c.datalog) {
             // Link libdatalog.so (the still-C datalog core) via C-FFI.
             cmd_exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
-            cmd_exe.root_module.linkSystemLibrary("datalog", .{});
-            cmd_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+            if (is_musl) {
+
+                cmd_exe.root_module.linkLibrary(datalog_lib);
+            } else {
+                cmd_exe.root_module.linkSystemLibrary("datalog", .{});
+
+                cmd_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+            }
         }
         cmd_exe.root_module.link_libc = true;
         b.installArtifact(cmd_exe);
@@ -483,8 +544,16 @@ pub fn build(b: *std.Build) void {
     });
     // Native grep deepening (Lens-3): same libdatalog linkage fx-grep uses.
     eval_mod.addIncludePath(b.path("../datalog-dafsa/src"));
-    eval_mod.linkSystemLibrary("datalog", .{});
-    eval_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    if (is_musl) {
+
+        eval_mod.linkLibrary(datalog_lib);
+    } else {
+        eval_mod.linkSystemLibrary("datalog", .{});
+
+        eval_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    }
 
     // The fx-eval engine's test blocks (native find/grep, run/replay/converge).
     const eval_tests = b.addTest(.{ .root_module = eval_mod });
@@ -534,8 +603,16 @@ pub fn build(b: *std.Build) void {
     });
     const fxsh_exe = b.addExecutable(.{ .name = "fxsh", .root_module = fxsh_mod });
     fxsh_exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
-    fxsh_exe.root_module.linkSystemLibrary("datalog", .{});
-    fxsh_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    if (is_musl) {
+
+        fxsh_exe.root_module.linkLibrary(datalog_lib);
+    } else {
+        fxsh_exe.root_module.linkSystemLibrary("datalog", .{});
+
+        fxsh_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    }
     b.installArtifact(fxsh_exe);
     // fxsh's own test blocks (the usage surface + the mode dispatch).
     const fxsh_tests = b.addTest(.{ .root_module = fxsh_mod });
@@ -826,8 +903,16 @@ pub fn build(b: *std.Build) void {
         if (c.datalog) {
             // Link libdatalog.so (the still-C datalog core) via C-FFI.
             cmd_exe.root_module.addIncludePath(b.path("../datalog-dafsa/src"));
-            cmd_exe.root_module.linkSystemLibrary("datalog", .{});
-            cmd_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+            if (is_musl) {
+
+                cmd_exe.root_module.linkLibrary(datalog_lib);
+            } else {
+                cmd_exe.root_module.linkSystemLibrary("datalog", .{});
+
+                cmd_exe.root_module.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+            }
         }
         cmd_exe.root_module.link_libc = true;
         b.installArtifact(cmd_exe);
@@ -934,8 +1019,16 @@ pub fn build(b: *std.Build) void {
         },
     });
     prov_mod.addIncludePath(b.path("../datalog-dafsa/src"));
-    prov_mod.linkSystemLibrary("datalog", .{});
-    prov_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    if (is_musl) {
+
+        prov_mod.linkLibrary(datalog_lib);
+    } else {
+        prov_mod.linkSystemLibrary("datalog", .{});
+
+        prov_mod.addLibraryPath(.{ .cwd_relative = "../datalog-dafsa" });
+
+    }
 
     const prov_cmds = [_][]const u8{ "fx-what", "fx-why" };
     inline for (prov_cmds) |name| {

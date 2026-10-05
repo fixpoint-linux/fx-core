@@ -52,6 +52,7 @@
 // re-walks live and diverges loudly (fx-eval Diverged).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
 const cli_df = @import("cli-df");
@@ -67,9 +68,72 @@ const serialize = dh.serialize;
 const import_mod = dh.import_mod;
 
 const c = @cImport({
-    @cInclude("sys/statvfs.h");
-    @cInclude("sys/stat.h");
+    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
+    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
+    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
+    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
+    // glibc headers already define `struct stat` and asm/stat.h would be a
+    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
+    // (gnu gets them from sys/stat.h itself).
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+    } else {
+        @cInclude("sys/stat.h");
+    }
 });
+
+// ---------------------------------------------------------------------------
+// LOCAL struct statvfs (musl demotes the header's struct to opaque under
+// translate-c: its anonymous-bitfield padding member `unsigned :8*(...)`
+// cannot be expressed in Zig; see the comptime guard below).  The layout is
+// musl/glibc-identical on x86_64 (MEASURED on the host: sizeof=112,
+// fsblkcnt_t/fsfilcnt_t = unsigned long; the differential df run in the
+// acceptance test is the runtime oracle).  Hand externs for the libc calls.
+// ---------------------------------------------------------------------------
+pub const Statvfs = extern struct {
+    f_bsize: c_ulong,
+    f_frsize: c_ulong,
+    f_blocks: c_ulong,
+    f_bfree: c_ulong,
+    f_bavail: c_ulong,
+    f_files: c_ulong,
+    f_ffree: c_ulong,
+    f_favail: c_ulong,
+    f_fsid: c_ulong,
+    f_flag: c_ulong,
+    f_namemax: c_ulong,
+    f_type: c_uint,
+    __reserved: [5]c_int,
+};
+extern fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
+extern fn stat(path: [*:0]const u8, buf: *c.struct_stat) c_int;
+extern fn fstatvfs(fd: c_int, buf: *Statvfs) c_int;
+
+// STAT LAYOUT GUARD (same class as fx-caslog's): a drifted statvfs layout
+// would silently produce wrong df numbers, not a compile error.
+comptime {
+    if (@sizeOf(Statvfs) != 112)
+        @compileError("struct statvfs layout drift: expected x86_64 sizeof 112");
+    const expect = .{
+        .{ "f_bsize", 0 },
+        .{ "f_frsize", 8 },
+        .{ "f_blocks", 16 },
+        .{ "f_bfree", 24 },
+        .{ "f_bavail", 32 },
+        .{ "f_files", 40 },
+        .{ "f_ffree", 48 },
+        .{ "f_favail", 56 },
+        .{ "f_fsid", 64 },
+        .{ "f_flag", 72 },
+        .{ "f_namemax", 80 },
+        .{ "f_type", 88 },
+    };
+    for (expect) |e| {
+        if (@offsetOf(Statvfs, e[0]) != e[1])
+            @compileError("struct statvfs layout drift: " ++ e[0] ++ " offset mismatch");
+    }
+}
 
 const Allocator = std.mem.Allocator;
 
@@ -400,7 +464,7 @@ fn blocksToKb(blocks: u64, frsize: u64) u64 {
     return (blocks *| frsize) / 1024;
 }
 
-fn statvfsRow(fs: []const u8, mount: []const u8, st: *const c.struct_statvfs) FsRow {
+fn statvfsRow(fs: []const u8, mount: []const u8, st: *const Statvfs) FsRow {
     // Some filesystems leave f_frsize 0; POSIX says fall back to f_bsize.
     const frsize: u64 = if (st.f_frsize != 0) @intCast(st.f_frsize) else @intCast(st.f_bsize);
     const blocks: u64 = @intCast(st.f_blocks);
@@ -416,7 +480,7 @@ fn statvfsRow(fs: []const u8, mount: []const u8, st: *const c.struct_statvfs) Fs
 
 /// The mounts-sweep row filter: GNU df (without -a) hides filesystems that
 /// report zero total blocks (procfs, sysfs, devpts...).
-fn sweepRow(fs: []const u8, mount: []const u8, st: *const c.struct_statvfs) ?FsRow {
+fn sweepRow(fs: []const u8, mount: []const u8, st: *const Statvfs) ?FsRow {
     if (st.f_blocks == 0) return null;
     return statvfsRow(fs, mount, st);
 }
@@ -450,8 +514,8 @@ fn collectMountRows(gpa: Allocator, mounts_buf: []u8, out: *std.ArrayList(FsRow)
     for (mounts.items) |m| {
         const mz = try gpa.dupeZ(u8, m.mount);
         defer gpa.free(mz);
-        var st: c.struct_statvfs = undefined;
-        if (c.statvfs(mz.ptr, &st) != 0) continue; // unreadable mount: skip
+        var st: Statvfs = undefined;
+        if (statvfs(mz.ptr, &st) != 0) continue; // unreadable mount: skip
         const row = sweepRow(m.fs, m.mount, &st) orelse continue;
         try out.append(gpa, row);
     }
@@ -460,8 +524,8 @@ fn collectMountRows(gpa: Allocator, mounts_buf: []u8, out: *std.ArrayList(FsRow)
 fn collectPathRow(gpa: Allocator, path: []const u8, mounts_buf: []u8, out: *std.ArrayList(FsRow)) !void {
     const pz = try gpa.dupeZ(u8, path);
     defer gpa.free(pz);
-    var st: c.struct_statvfs = undefined;
-    if (c.statvfs(pz.ptr, &st) != 0) {
+    var st: Statvfs = undefined;
+    if (statvfs(pz.ptr, &st) != 0) {
         std.debug.print("fx-df: cannot access '{s}'\n", .{path});
         std.process.exit(1);
     }
@@ -471,7 +535,7 @@ fn collectPathRow(gpa: Allocator, path: []const u8, mounts_buf: []u8, out: *std.
     var fs: []const u8 = path;
     var mount: []const u8 = path;
     var sb: c.struct_stat = undefined;
-    if (c.stat(pz.ptr, &sb) == 0) {
+    if (stat(pz.ptr, &sb) == 0) {
         var raw = std.ArrayList(RawMount).empty;
         defer raw.deinit(gpa);
         try parseMounts(gpa, mounts_buf, &raw);
@@ -479,7 +543,7 @@ fn collectPathRow(gpa: Allocator, path: []const u8, mounts_buf: []u8, out: *std.
             const mz = try gpa.dupeZ(u8, m.mount);
             defer gpa.free(mz);
             var ms: c.struct_stat = undefined;
-            if (c.stat(mz.ptr, &ms) == 0 and ms.st_dev == sb.st_dev) {
+            if (stat(mz.ptr, &ms) == 0 and ms.st_dev == sb.st_dev) {
                 fs = m.fs;
                 mount = m.mount;
             }
@@ -632,11 +696,11 @@ test "sortedDedupMounts: keep-last duplicate + lex order" {
 }
 
 test "sweepRow: f_blocks==0 skipped; u64 math; GNU capacity" {
-    var dummy = std.mem.zeroes(c.struct_statvfs);
+    var dummy = std.mem.zeroes(Statvfs);
     try std.testing.expect(sweepRow("fs", "/mnt", &dummy) == null);
 
     // 2^48 blocks x 4096 = 2^60 bytes — far beyond u32 math.
-    var st = std.mem.zeroes(c.struct_statvfs);
+    var st = std.mem.zeroes(Statvfs);
     st.f_frsize = 4096;
     st.f_blocks = 1 << 48;
     st.f_bfree = 1 << 47;
@@ -747,8 +811,8 @@ test "generated parsePosix: --rows, operand, errors" {
 }
 
 test "statvfs('/'): structural sanity on the live root fs" {
-    var st: c.struct_statvfs = undefined;
-    if (c.statvfs("/", &st) != 0) return error.Statvfs;
+    var st: Statvfs = undefined;
+    if (statvfs("/", &st) != 0) return error.Statvfs;
     const row = sweepRow("/dev/test", "/", &st) orelse return error.ZeroBlocks;
     try std.testing.expect(row.total_kb > 0);
     try std.testing.expect(row.avail_kb <= row.total_kb);

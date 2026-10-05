@@ -67,6 +67,7 @@
 // a Lens-3 replay re-walks and diverges loudly via hash comparison.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
 const cli_tree = @import("cli-tree");
@@ -84,7 +85,19 @@ const import_mod = dh.import_mod;
 const dl = @cImport({
     @cInclude("dl.h");
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration
-    @cInclude("sys/stat.h"); // struct stat for fstatat
+    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
+    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
+    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
+    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
+    // glibc headers already define `struct stat` and asm/stat.h would be a
+    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
+    // (gnu gets them from sys/stat.h itself).
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+    } else {
+        @cInclude("sys/stat.h");
+    }
 });
 
 // O_*/AT_* values (bits/fcntl-linux.h + linux/fcntl.h) defined locally:
@@ -102,6 +115,18 @@ extern fn close(fd: c_int) c_int;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+
+/// The mtime (i64 seconds) from either struct-stat shape: kernel (musl)
+/// `st_mtime` flat scalar vs glibc `st_mtim.tv_sec`.  Same offset (88) —
+/// the comptime guard in fx-caslog pins both; mirrored here because this
+/// file carries its own @cImport (a distinct translate-c type per file).
+fn statMtimeSec(st: *const dl.struct_stat) i64 {
+    if (builtin.target.abi.isMusl()) {
+        return @bitCast(st.st_mtime);
+    } else {
+        return st.st_mtim.tv_sec;
+    }
+}
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
@@ -731,7 +756,7 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
                 @intCast(child_depth),
                 clampSize(st.st_size),
                 @intFromBool(is_dir),
-                clampMtime(st.st_mtim.tv_sec),
+                clampMtime(statMtimeSec(&st)),
             };
             _ = dl.dl_add_fact(ctx.db, "node", &cols, 6);
         }
@@ -747,7 +772,7 @@ fn walkDir(ctx: *WalkCtx, dir_fd: posix.fd_t, dir_path: []const u8, depth: usize
     }
 }
 
-/// st_size/st_mtim are signed; clamp negatives to 0 and saturate at u32
+/// st_size/st_mtime are signed; clamp negatives to 0 and saturate at u32
 /// (documented: 4GiB cap / post-2106 mtime truncation — ls's exact clamp,
 /// fx-ls.zig:598-604).
 fn clampSize(sz: i64) u32 {

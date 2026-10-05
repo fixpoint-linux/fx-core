@@ -267,8 +267,8 @@ fn buildCreatedEffect(gpa: Allocator, path: []const u8) Effect {
 /// bump) and created=false.  Kept separate from the mutation so the effect
 /// construction is testable independent of the utimensat syscall.
 fn buildExistingEffect(gpa: Allocator, path: []const u8, st: *const dl.struct_stat) Effect {
-    const prior_s: i64 = @intCast(st.st_mtim.tv_sec);
-    const prior_ns: i32 = @intCast(st.st_mtim.tv_nsec);
+    const prior_s: i64 = caslog.statMtimeSec(st);
+    const prior_ns: i32 = caslog.statMtimeNsec(st);
     return Effect{
         .op = .touch,
         .path = gpa.dupe(u8, path) catch "",
@@ -443,7 +443,7 @@ fn fileMtime(path: []const u8) i64 {
     const z = std.posix.toPosixPath(path) catch return -1;
     var st: dl.struct_stat = undefined;
     if (fstatat(AT_FDCWD, &z, &st, 0) != 0) return -1;
-    return @intCast(st.st_mtim.tv_sec);
+    return caslog.statMtimeSec(&st);
 }
 fn writeFileUnder(gpa: Allocator, base: []const u8, name: []const u8, contents: []const u8) !void {
     const p = try std.fs.path.join(gpa, &.{ base, name });

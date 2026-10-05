@@ -319,7 +319,7 @@ fn findWalkDir(ctx: *FindWalkCtx, dir_fd: std.posix.fd_t, rel_path: []const u8) 
             .path = try ctx.gpa.dupe(u8, disp),
             .kind = try ctx.gpa.dupe(u8, if (is_dir) "Dir" else "File"),
             .size = clampSize(st.st_size),
-            .mtime = clampMtime(st.st_mtim.tv_sec),
+            .mtime = clampMtime(caslog.statMtimeSec(&st)),
         });
     }
 
@@ -359,7 +359,7 @@ fn findWalkDir(ctx: *FindWalkCtx, dir_fd: std.posix.fd_t, rel_path: []const u8) 
                 .path = try ctx.gpa.dupe(u8, child_rel),
                 .kind = try ctx.gpa.dupe(u8, "File"),
                 .size = clampSize(st2.st_size),
-                .mtime = clampMtime(st2.st_mtim.tv_sec),
+                .mtime = clampMtime(caslog.statMtimeSec(&st2)),
             });
             ctx.gpa.free(child_rel);
         }

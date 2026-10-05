@@ -56,6 +56,16 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
+// Local timespec shape (C ABI: two isize fields) — musl time.h's struct
+// timespec does not survive Zig 0.16 translate-c (same class as the struct
+// stat blocker; see fx-caslog).  fx-touch.zig uses the same local shape.
+const Timespec = extern struct {
+    sec: isize,
+    nsec: isize,
+};
+const CLOCK_REALTIME: c_int = 0;
+extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+
 const Allocator = std.mem.Allocator;
 
 const DEFAULT_FORMAT = "%a %b %e %H:%M:%S %Z %Y";
@@ -350,8 +360,8 @@ test "DIFFERENTIAL: rejection parity — both arg forms fail loudly" {
 
 /// Format "now" per `format` in local time (or UTC when utc), into `out`.
 fn formatNow(gpa: Allocator, out: *std.ArrayList(u8), format: []const u8, utc: bool) !void {
-    var ts: c.struct_timespec = undefined;
-    if (c.clock_gettime(c.CLOCK_REALTIME, &ts) != 0) return error.ClockFailed;
+    var ts: Timespec = undefined;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return error.ClockFailed;
     var tmv: c.struct_tm = undefined;
     if (utc) {
         // Match GNU `date -u`: set TZ=UTC + tzset() before formatting so
@@ -361,10 +371,10 @@ fn formatNow(gpa: Allocator, out: *std.ArrayList(u8), format: []const u8, utc: b
         // get "UTC". With TZ=UTC the broken-down time equals the UTC time.
         _ = c.setenv("TZ", "UTC", 1);
         c.tzset();
-        _ = c.localtime_r(&ts.tv_sec, &tmv);
+        _ = c.localtime_r(&ts.sec, &tmv);
     } else {
         // Leave TZ untouched; honor the ambient TZ / /etc/localtime.
-        _ = c.localtime_r(&ts.tv_sec, &tmv);
+        _ = c.localtime_r(&ts.sec, &tmv);
     }
     const zfmt = try gpa.dupeZ(u8, format);
     var buf: [2048]u8 = undefined;

@@ -39,6 +39,7 @@
 // mode; all/sort still apply (default Name order = deterministic).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dh = @import("dhall");
 const wire = @import("fx-wire");
 const cli_ls = @import("cli-ls");
@@ -56,7 +57,19 @@ const import_mod = dh.import_mod;
 const dl = @cImport({
     @cInclude("dl.h");
     @cInclude("dirent.h"); // libc DIR/readdir for directory iteration
-    @cInclude("sys/stat.h"); // struct stat for fstatat
+    // TARGET-GATED struct stat: musl's sys/stat.h does not survive translate-c
+    // (struct timespec -> opaque), so on musl the KERNEL <asm/stat.h> is used —
+    // layout-identical to the libc struct on x86_64 (MEASURED; pinned by the
+    // comptime guard in fx-caslog).  On glibc the plain sys/stat.h is kept:
+    // glibc headers already define `struct stat` and asm/stat.h would be a
+    // redefinition.  S_IFMT/S_ISDIR come from linux/stat.h on musl only
+    // (gnu gets them from sys/stat.h itself).
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h"); // S_IFMT/S_IFDIR/... macros (asm/stat.h has the struct only)
+    } else {
+        @cInclude("sys/stat.h");
+    }
 });
 
 // libc close/mkdtemp/rmdir/fstatat (std.posix slimmed these out in 0.16).
@@ -65,6 +78,18 @@ extern fn close(fd: c_int) c_int;
 extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern fn rmdir(path: [*:0]const u8) c_int;
 extern fn fstatat(dirfd: c_int, pathname: [*:0]const u8, statbuf: *dl.struct_stat, flags: c_int) c_int;
+
+/// The mtime (i64 seconds) from either struct-stat shape: kernel (musl)
+/// `st_mtime` flat scalar vs glibc `st_mtim.tv_sec`.  Same offset (88) —
+/// the comptime guard in fx-caslog pins both; mirrored here because this
+/// file carries its own @cImport (a distinct translate-c type per file).
+fn statMtimeSec(st: *const dl.struct_stat) i64 {
+    if (builtin.target.abi.isMusl()) {
+        return @bitCast(st.st_mtime);
+    } else {
+        return st.st_mtim.tv_sec;
+    }
+}
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
 const Allocator = std.mem.Allocator;
@@ -703,9 +728,10 @@ fn buildFacts(db: *dl.dl_db, opts: Options, gpa: Allocator) !void {
         // u32 (documented: 4GiB cap / post-2106 mtime truncation).
         const sz: i64 = st.st_size;
         const size: u32 = if (sz < 0) 0 else @intCast(@min(sz, @as(i64, 0xFFFFFFFF)));
-        // glibc's struct stat carries the mtime in st_mtim.tv_sec (the
-        // st_mtime macro alias is not translated by @cImport).
-        const mt: i64 = st.st_mtim.tv_sec;
+        // the kernel struct stat carries the mtime as the flat scalar
+        // st_mtime (musl/glibc name it st_mtim.tv_sec — same offset; the
+        // layout is pinned by the comptime guard in fx-caslog).
+        const mt: i64 = statMtimeSec(&st);
         const mtime: u32 = if (mt < 0) 0 else @intCast(@min(mt, @as(i64, 0xFFFFFFFF)));
 
         const name_z = try gpa.dupeZ(u8, name);
